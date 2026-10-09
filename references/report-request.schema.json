@@ -1,0 +1,2028 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live Report Master Request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "templateId",
+    "title"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "reportId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+    },
+    "pageWidth": {
+      "description": "报告页面宽度档位(px)；缺省 1280，\"full\"=1920（fluid 封顶）。",
+      "anyOf": [
+        {
+          "type": "integer",
+          "enum": [
+            1280,
+            1440,
+            1600,
+            1920
+          ]
+        },
+        {
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
+    },
+    "dataSourceMode": {
+      "enum": [
+        "default",
+        "independent"
+      ],
+      "description": "数据源独立性硬控：independent = 数据源完全独立，禁止 relations 合并（与 relations 互斥，同现报错）；缺省 default。"
+    },
+    "templateId": {
+      "enum": [
+        "standard-bi-v1",
+        "free-v1"
+      ],
+      "description": "standard-bi-v1=固定骨架（封面→筛选→KPI→图表→洞察，缺省自动填充）；free-v1=自由模式，声明即全部（无自动填充，区块全声明制）。"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "subtitle": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "analysisGoal": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "columnRoles": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "time",
+          "dimension",
+          "measure",
+          "id",
+          "ignore"
+        ]
+      }
+    },
+    "measureTypes": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "enum": [
+              "currency",
+              "percent",
+              "count",
+              "duration",
+              "number",
+              "unitless"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "currency",
+                  "percent",
+                  "count",
+                  "duration",
+                  "number",
+                  "unitless"
+                ]
+              },
+              "divisor": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "unit": {
+                "type": "string",
+                "maxLength": 12
+              },
+              "decimals": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 6
+              },
+              "currency": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8,
+                "description": "ISO 货币代码，必须在内置币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND，22 币）。未知代码校验拒绝——自定义符号请改用 symbol。缺省 CNY（¥）。",
+                "pattern": "^[A-Za-z]{3}$"
+              },
+              "symbol": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4,
+                "description": "自定义货币符号（≤4 字符），优先于 currency 查表。两者都缺省 → ¥。"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "semantic_types": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "facts": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "$ref": "#/$defs/fact"
+      }
+    },
+    "kpis": {
+      "type": "array",
+      "maxItems": 12,
+      "description": "上限 12 为 free-v1 档（每行 4 张自动折行）；standard 档校验层维持 ≤4。",
+      "items": {
+        "type": "object"
+      }
+    },
+    "charts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 30,
+      "description": "上限 30 为 free-v1 档（可 0 张，键可省略）；standard 档校验层维持 1-12。",
+      "items": {
+        "$ref": "#/$defs/chart"
+      }
+    },
+    "insights": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "上限 10 为 free-v1 档；standard 档校验层维持 ≤3。",
+      "items": {
+        "type": [
+          "string",
+          "object"
+        ]
+      }
+    },
+    "texts": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "free-v1 独立文本块（2026-09-28 全部放开批）：{id?, title?, text, style?{textStyle,cardColor}, layout?{x,y,h}, after?}。整行宽卡、段模型；layout 钉位；after=图表 id 时紧随其后。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"},
+          "title": {"type": "string", "maxLength": 120},
+          "text": {"type": "string", "minLength": 1, "description": "正文（Markdown），必填"},
+          "style": {"type": "object"},
+          "layout": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "x": {"type": "integer", "minimum": 0},
+              "y": {"type": "integer", "minimum": 0},
+              "h": {"type": "integer", "minimum": 1}
+            }
+          },
+          "after": {"type": "string", "description": "图表 id：文本块插入该图表之后"}
+        },
+        "required": ["text"]
+      }
+    },
+    "kpiPosition": {
+      "enum": ["top", "bottom"],
+      "description": "KPI 条位置，仅 free-v1：top=封面/筛选之下（缺省）；bottom=图表/文本区与洞察卡之后。"
+    },
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "file": {
+            "description": "路径字符串，或 1-8 个路径的数组（构建期同构并集 UNION：列集一致、顺序无关，类型以合并后全集判定，如 W35+W36 两周数据）",
+            "oneOf": [
+              {"type": "string", "maxLength": 512},
+              {"type": "array", "items": {"type": "string", "maxLength": 512}, "minItems": 1, "maxItems": 8}
+            ]
+          },
+          "columnRoles": {
+            "type": "object"
+          },
+          "measureTypes": {
+            "type": "object"
+          },
+          "hierarchy": {
+            "type": "array"
+          },
+          "dimGroups": {
+            "type": "array",
+            "description": "维度值分组（对标 Quick BI 分组维度）：把一个维度字段的枚举值归并成大组，编译期物化成新维度列，之后处处当普通维度引用。未命中成员归入 other（未声明 other 则保留原值）；空值保持空。分组维度不进计算字段引用宇宙；删除定义不删已物化列。",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "source",
+                "groups"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "maxLength": 40,
+                  "description": "物化列名（同表内不得重复）"
+                },
+                "source": {
+                  "type": "string",
+                  "maxLength": 120,
+                  "description": "源维度列"
+                },
+                "groups": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "label",
+                      "members"
+                    ],
+                    "properties": {
+                      "label": {
+                        "type": "string",
+                        "maxLength": 60
+                      },
+                      "members": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                },
+                "other": {
+                  "type": "string",
+                  "maxLength": 60,
+                  "description": "未命中成员的归并桶名；缺省保留原值"
+                }
+              }
+            }
+          },
+          "role": {
+            "enum": [
+              "primary",
+              "lookup"
+            ]
+          },
+          "isDefault": {
+            "type": "boolean"
+          },
+          "derived": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "行级派生列（计算列）：每行 left op right 物化成真实数值列。singlefile 由编译器物化，server 由服务端按同一实现物化进 SQLite（声明写进注册表，重启/重载按表级并集重放）。仅支持单数据集。",
+            "properties": {
+              "columns": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "op",
+                    "left",
+                    "right"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 40
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "sub",
+                        "mul",
+                        "div"
+                      ]
+                    },
+                    "left": {
+                      "type": "string",
+                      "maxLength": 120
+                    },
+                    "right": {
+                      "type": "string",
+                      "maxLength": 120
+                    },
+                    "aggregation": {
+                      "enum": [
+                        "sum",
+                        "average",
+                        "count", "countd",
+                        "min",
+                        "max"
+                      ]
+                    },
+                    "decimals": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 6
+                    }
+                  }
+                }
+              },
+              "measures": {
+                "type": "array",
+                "maxItems": 16,
+                "description": "聚合级派生指标（聚合后求值，不是逐行）：formula = 聚合后公式（如 毛利率 = SUM(毛利额)/SUM(收入)）；window = 时间窗口（环比/同比/累计：fn+offset+grain+timeField）；share = 占比（BI-H2：scope all=占总计 / parent=占父级+parentField）。引用窗口指标的图表：维度必须是 timeField 且分桶 = grain；share 的值随当前聚合自动求值。`{agg,col}` 依赖由编译器/运行时自动补齐，空档保持 null。行级逐行计算请用 derived.columns。",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "kind",
+                        "expr"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "kind": {
+                          "const": "formula"
+                        },
+                        "expr": {
+                          "description": "表达式 AST：{const:1} / {ref:'派生指标名'} / {agg:'sum|average|count|min|max', col:'列名'} / {op:'add|sub|mul|div', left, right}",
+                          "oneOf": [
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "const"
+                              ],
+                              "properties": {
+                                "const": {
+                                  "type": "number"
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "ref"
+                              ],
+                              "properties": {
+                                "ref": {
+                                  "type": "string",
+                                  "maxLength": 40
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "agg",
+                                "col"
+                              ],
+                              "properties": {
+                                "agg": {
+                                  "$ref": "#/$defs/derivedAgg"
+                                },
+                                "col": {
+                                  "type": "string",
+                                  "maxLength": 120
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "op",
+                                "left",
+                                "right"
+                              ],
+                              "properties": {
+                                "op": {
+                                  "enum": [
+                                    "add",
+                                    "sub",
+                                    "mul",
+                                    "div"
+                                  ]
+                                },
+                                "left": {
+                                  "$ref": "#/properties/datasets/items/properties/derived/properties/measures/items/properties/expr"
+                                },
+                                "right": {
+                                  "$ref": "#/properties/datasets/items/properties/derived/properties/measures/items/properties/expr"
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "measureType": {
+                          "type": "object"
+                        },
+                        "additive": {
+                          "type": "boolean"
+                        },
+                        "decimals": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 6
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "kind",
+                        "input",
+                        "fn",
+                        "grain",
+                        "timeField"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "kind": {
+                          "const": "window"
+                        },
+                        "input": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 120
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "ref"
+                              ],
+                              "properties": {
+                                "ref": {
+                                  "type": "string",
+                                  "maxLength": 40
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "agg",
+                                "col"
+                              ],
+                              "properties": {
+                                "agg": {
+                                  "$ref": "#/$defs/derivedAgg"
+                                },
+                                "col": {
+                                  "type": "string",
+                                  "maxLength": 120
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "fn": {
+                          "enum": [
+                            "prev",
+                            "cum",
+                            "ytd"
+                          ],
+                          "description": "prev=与前期比较（环比/同比由 offset 决定）；cum=累计；ytd=年累计（cum 按年重置，grain/timeField 必填）"
+                        },
+                        "grain": {
+                          "enum": [
+                            "week",
+                            "month",
+                            "quarter",
+                            "year"
+                          ],
+                          "description": "基准粒度。声明在指标上（不跟随图表分桶），图表分桶不一致时该指标不可用"
+                        },
+                        "offset": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "description": "fn=prev 必填：向前推几期（环比=1；同比 月=12/季=4/年=1）"
+                        },
+                        "timeField": {
+                          "type": "string",
+                          "maxLength": 120,
+                          "description": "该指标依赖的时间列（必填）"
+                        },
+                        "output": {
+                          "enum": [
+                            "rate",
+                            "delta"
+                          ],
+                          "description": "rate=增长率(%) / delta=增量值；cum 恒为 delta"
+                        },
+                        "measureType": {
+                          "type": "object"
+                        },
+                        "additive": {
+                          "type": "boolean"
+                        },
+                        "decimals": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 6
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "kind",
+                        "input",
+                        "fn"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "kind": {
+                          "const": "window"
+                        },
+                        "input": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 120
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "ref"
+                              ],
+                              "properties": {
+                                "ref": {
+                                  "type": "string",
+                                  "maxLength": 40
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "agg",
+                                "col"
+                              ],
+                              "properties": {
+                                "agg": {
+                                  "$ref": "#/$defs/derivedAgg"
+                                },
+                                "col": {
+                                  "type": "string",
+                                  "maxLength": 120
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "fn": {
+                          "enum": [
+                            "rank",
+                            "dense_rank",
+                            "percent_rank"
+                          ],
+                          "description": "组内排名（按当前指标值降序；partition=当前聚合维度组合；无时间语义，不声明 grain/timeField）"
+                        },
+                        "output": {
+                          "enum": [
+                            "value",
+                            "rate"
+                          ],
+                          "description": "rank/dense_rank 缺省 value；percent_rank 缺省 rate（已 ×100 的百分数）"
+                        },
+                        "measureType": {
+                          "type": "object"
+                        },
+                        "additive": {
+                          "type": "boolean"
+                        },
+                        "decimals": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 6
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "name",
+                        "kind",
+                        "input",
+                        "scope"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "name": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "kind": {
+                          "const": "share"
+                        },
+                        "input": {
+                          "oneOf": [
+                            {
+                              "type": "string",
+                              "maxLength": 120
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "ref"
+                              ],
+                              "properties": {
+                                "ref": {
+                                  "type": "string",
+                                  "maxLength": 40
+                                }
+                              }
+                            },
+                            {
+                              "type": "object",
+                              "additionalProperties": false,
+                              "required": [
+                                "agg",
+                                "col"
+                              ],
+                              "properties": {
+                                "agg": {
+                                  "$ref": "#/$defs/derivedAgg"
+                                },
+                                "col": {
+                                  "type": "string",
+                                  "maxLength": 120
+                                }
+                              }
+                            }
+                          ]
+                        },
+                        "scope": {
+                          "enum": [
+                            "all",
+                            "parent"
+                          ],
+                          "description": "all=占总计（÷ 当前聚合全部值之和，与合计行同口径）；parent=占父级（÷ 同父级组内之和，需 parentField，图表维度应是它的子级）"
+                        },
+                        "parentField": {
+                          "type": "string",
+                          "maxLength": 120,
+                          "description": "scope=parent 必填：父级列（层级子级分组的分组列）"
+                        },
+                        "measureType": {
+                          "type": "object"
+                        },
+                        "additive": {
+                          "type": "boolean"
+                        },
+                        "decimals": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 6
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "primaryKey": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "增量合并（按主键 upsert）的主键列；列必须存在于本表（compile 期对真实表再校验）"
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "narrative": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "insight": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "textKind": {
+            "enum": [
+              "heading",
+              "paragraph",
+              "callout",
+              "quote",
+              "divider"
+            ]
+          },
+          "style": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "surface": {
+                "enum": [
+                  "default",
+                  "soft",
+                  "emphasized"
+                ]
+              },
+              "accent": {
+                "enum": [
+                  "blue",
+                  "teal",
+                  "orange",
+                  "purple"
+                ]
+              },
+              "radius": {
+                "enum": [
+                  "none",
+                  "small",
+                  "medium"
+                ]
+              },
+              "border": {
+                "enum": [
+                  "none",
+                  "hairline",
+                  "soft"
+                ]
+              }
+            }
+          },
+          "charts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "filters": {
+      "type": [
+        "array",
+        "object"
+      ]
+    },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "accent": {
+          "enum": [
+            "blue",
+            "teal",
+            "orange",
+            "purple"
+          ]
+        },
+        "density": {
+          "enum": [
+            "comfortable",
+            "compact"
+          ]
+        },
+        "radius": {
+          "enum": [
+            "none",
+            "small",
+            "medium"
+          ]
+        },
+        "fontScale": {
+          "enum": [
+            "sm",
+            "md",
+            "lg"
+          ]
+        },
+        "theme": {
+          "enum": [
+            "notion",
+            "default"
+          ],
+          "description": "报告外壳皮肤预设。默认 notion（Notion 设计令牌），不要主动改。"
+        },
+        "chartTheme": {
+          "type": "string",
+          "enum": [
+            "default",
+            "economist",
+            "nyt",
+            "swiss",
+            "nature",
+            "mckinsey",
+            "datawrapper",
+            "powerbi",
+            "powerbi-light",
+            "pop",
+            "cartoon",
+            "huawei"
+          ],
+          "default": "default",
+          "description": "报告主题（整报告 house：图表配色/字体/网格 + 壳令牌——封面渐变/KPI accent/表头/筛选 chip/涨跌色一并跟主题；docs/report-theme-convergence-design.md）。powerbi/pop 为深底档仅图表换肤（壳保持默认）。**默认 default：除非用户明确要求某种风格，请省略本键**（不要自作主张挑预设）。lint L19 对非默认主题告警。"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "auto",
+            "singlefile",
+            "server"
+          ]
+        },
+        "singlefileMaxRows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50000
+        },
+        "tabs": {
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ]
+        },
+        "serverUrl": {
+          "type": "string",
+          "pattern": "^https?://(localhost|127\\.0\\.0\\.1|\\[?::1\\]?)(:[0-9]{1,5})?(/.*)?$"
+        },
+        "editPassword": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "server 模式编辑口令：报告构建时设置后，局域网链接的编辑者点「完成编辑」需输入此口令才能把整份编辑结果覆盖保存回服务器（或另存为副本）。只读查看不受影响。"
+        }
+      }
+    },
+    "source": {
+      "type": "object"
+    },
+    "provenance": {
+      "type": "object"
+    },
+    "relations": {
+      "type": "array",
+      "maxItems": 16,
+      "description": "v4 single-mode：每个 relation 代表一次「合并为一张宽表」。N 张表 → 1 张宽表（链式合并，链间由 keys 连接）。运行时可选地重新物质化；构建期默认物质化，使 server 模式可走。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "tables",
+          "keys"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+          },
+          "name": {
+            "type": "string",
+            "description": "合并后宽表的展示名（可省略）"
+          },
+          "tables": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "string"
+            }
+          },
+          "keys": {
+            "type": "array",
+            "minItems": 1,
+            "description": "至少一个连接 keys 顺序合并链（A↔B、↔C …）。每个 key 代表两侧两列指向同一逻辑维度（dimensionKey），同时提供 per-key mode 控制键列在宽表的存留。",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "a",
+                "b"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "dimensionKey 名称；缺省 = a.col（与运行时过滤、跨表图对齐用）"
+                },
+                "a": {
+                  "type": "object",
+                  "required": [
+                    "ds",
+                    "col"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "ds": {
+                      "type": "string"
+                    },
+                    "col": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "b": {
+                  "type": "object",
+                  "required": [
+                    "ds",
+                    "col"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "ds": {
+                      "type": "string"
+                    },
+                    "col": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "mode": {
+                  "enum": [
+                    "a",
+                    "b",
+                    "both"
+                  ],
+                  "default": "both",
+                  "description": "键列在宽表的存留模式：a=仅留 a.col；b=仅留 b.col；both=都留（重名加 ds 后缀）"
+                }
+              }
+            }
+          },
+          "fields": {
+            "type": "object",
+            "description": "每个 dsId 需保留的字段列表；缺省 = 全字段",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "renames": {
+            "type": "object",
+            "description": "合并后列名的用户别名 {合并前列名: 新名}。在链式 join 之后应用，所以重新合并（表集合/键模式变化）仍能保留改过的名字；运行时「重命名」写这里。",
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "_chartWarnings": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "description": "Compiler-injected chart shape warnings; tolerated on re-validation of a compiled request."
+    },
+    "dataTable": {
+      "description": "Legacy top-level table slot (superseded by datasets[]).",
+      "additionalProperties": true
+    },
+    "fieldRoles": {
+      "type": "object",
+      "description": "Legacy top-level role map (superseded by datasets[].columnRoles); additionalProperties: string role.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "hierarchy": {
+      "type": "array",
+      "description": "Legacy top-level hierarchy edges (superseded by datasets[].hierarchy).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "parent": {
+            "type": "string"
+          },
+          "child": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "parent",
+          "child"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "cover": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "封面内容（title/meta/summary）。standard 档缺省自动组装；free-v1 档不声明则整张报告无封面。"
+    }
+  },
+  "$defs": {
+    "derivedAgg": {
+      "description": "聚合级派生指标允许的聚合（formula expr / window·cum·rank·share input 共用；countd = 去重计数，与 derived_model.AGG_FNS、server SUPPORTED_AGG 同一词汇）",
+      "enum": [
+        "sum",
+        "average",
+        "count",
+        "countd",
+        "min",
+        "max"
+      ]
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "type": {
+          "enum": [
+            "total",
+            "count",
+            "distinctCount",
+            "topN",
+            "shareOfTotal",
+            "trend",
+            "growthRate",
+            "rankChange",
+            "missingRate",
+            "min",
+            "max",
+            "average"
+          ]
+        },
+        "dimension": {
+          "type": "string"
+        },
+        "measure": {
+          "type": "string"
+        },
+        "aggregation": {
+          "enum": [
+            "sum",
+            "average",
+            "count", "countd",
+            "min",
+            "max"
+          ]
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        }
+      }
+    },
+    "chart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "chartSpec": {
+          "type": "object",
+          "properties": {
+            "chartType": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string",
+              "maxLength": 120
+            },
+            "aggregation": {
+              "enum": [
+                "sum",
+                "average",
+                "count", "countd",
+                "min",
+                "max"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "topK": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "sort": {
+              "enum": [
+                "asc",
+                "desc",
+                "time",
+                "none"
+              ]
+            },
+            "encodings": {
+              "type": "object"
+            }
+          }
+        },
+        "presetId": {
+          "enum": [
+            "kpi.metric",
+            "table.aggregate",
+            "table.detail",
+            "bar.rank",
+            "bar.stacked",
+            "line.trend",
+            "area.trend",
+            "scatter.correlation",
+            "pie.share",
+            "donut.share",
+            "funnel.stage"
+          ]
+        },
+        "datasetId": {
+          "type": "string"
+        },
+        "annotation": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "annotationPlacement": {
+          "enum": [
+            "below",
+            "right"
+          ]
+        },
+        "layout": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "y": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "w": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 12
+            },
+            "h": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "encoding": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "dimension": {
+              "type": "string"
+            },
+            "breakdown": {
+              "type": "string"
+            },
+            "breakdowns": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": {
+                "type": "string"
+              },
+              "description": "交叉列维列表（1-3 层，表格卡交叉矩阵）。与 breakdown 互斥（同现校验拒绝）。",
+              "$comment": "docs/multidim-table-and-currency-design-2026-09-28.md §一 拍板 4"
+            },
+            "measures": {
+              "description": "指标列名。合成标记 \"*\" 表示行数（记录数，COUNT(*)）：记录型数据每行一条记录、无独立数值指标列时使用，聚合自动为 count，显示名「记录数」。aggregation:\"count\" 恒为行数（编译/server/运行时三层 parity）。",
+              "type": "array",
+              "maxItems": 3,
+              "items": {
+                "type": "string"
+              }
+            },
+            "aggregation": {
+              "enum": [
+                "sum",
+                "average",
+                "count", "countd",
+                "min",
+                "max"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "topK": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "sort": {
+              "enum": [
+                "asc",
+                "desc",
+                "time",
+                "none"
+              ]
+            },
+            "roles": {
+              "type": "object"
+            },
+            "measureTypes": {
+              "type": "object"
+            }
+          }
+        },
+        "dimension": {
+          "type": "string"
+        },
+        "breakdown": {
+          "type": "string"
+        },
+        "breakdowns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+            "type": "string"
+          },
+          "description": "交叉列维列表（1-3 层，表格卡交叉矩阵）。与 breakdown 互斥（同现校验拒绝）；编译产物 roles.cols 数组 + breakdown=cols[0] 镜像。"
+        },
+        "measures": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "string"
+          }
+        },
+        "aggregation": {
+          "enum": [
+            "sum",
+            "average",
+            "count", "countd",
+            "min",
+            "max"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "topK 的别名（历史拼写）；两者同一槽位。"
+        },
+        "topK": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "TOP-N 取前 N 名（按首个数值列/堆叠总量）。bar/stackedBar/table 三个维度级视图生效；时间轴永不 Top-N。静态 option 与运行时重新聚合一致截断（三层 parity）。"
+        },
+        "topKOther": {
+          "type": "boolean",
+          "description": "TOP-N 截断时把长尾合并为一行「其他（N 项）」排最后（仅可加聚合 sum/count；average/min/max 回退纯截断）。静态编译 / 运行时本地聚合 / 服务端聚合三端一致。"
+        },
+        "sort": {
+          "enum": [
+            "desc",
+            "time",
+            "none",
+            "asc"
+          ],
+          "description": "排序语义：desc=首指标降序（比较图默认，R3）；time=时间升序（趋势默认）；none=保留原始顺序；asc=按维度名升序（R3 豁免）。编译为内部 sortOverride。"
+        },
+        "pagination": {
+          "type": "boolean",
+          "description": "table 专用：声明该表以分页展示（运行时每页 20 行 + 条数选择器）。当表格行数超过卡片容量时，R2 强制校验只放行 pagination:true / chart.topK 减行 / 更高的 layout.h。"
+        },
+        "table": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "表格卡作者设置（批次一 + WP-3 请求层契约，docs/product-iteration-plan.md §2.2）：编译原样落 chart.editor.table（运行时唯一消费口）。sessionView 刻意不在此声明——它是读者会话视图态（运行时 __sessionView），不进请求/manifest。align 的「键=真实列名」存在性校验在编译侧（canonical 表列）。",
+          "properties": {
+            "layout": {
+              "enum": [
+                "grouped",
+                "matrix",
+                "nd"
+              ],
+              "description": "分组布局 / 交叉矩阵 / 明细长表（批 A 拍板 2：ND 长表显式枚举）。"
+            },
+            "rowTotal": {
+              "type": "boolean"
+            },
+            "mergeSame": {
+              "type": "boolean",
+              "description": "合并同类单元格（渲染期对当前行集相邻同值 → rowspan）。与 treeView 互斥（WP-8）。"
+            },
+            "showBars": {
+              "type": "boolean"
+            },
+            "totalPos": {
+              "enum": [
+                "top",
+                "bottom"
+              ]
+            },
+            "totalLabel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 12
+            },
+            "subtotalLabel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 12
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "showTotal": {
+              "type": "boolean"
+            },
+            "showSubtotal": {
+              "type": "boolean"
+            },
+            "showRank": {
+              "type": "boolean"
+            },
+            "striped": {
+              "type": "boolean"
+            },
+            "sortLevels": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "col"
+                ],
+                "properties": {
+                  "col": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "dir": {
+                    "enum": [
+                      "asc",
+                      "desc"
+                    ]
+                  }
+                }
+              }
+            },
+            "dateScope": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "col",
+                "mode"
+              ],
+              "properties": {
+                "col": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "mode": {
+                  "enum": [
+                    "recent",
+                    "range"
+                  ]
+                },
+                "n": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                "unit": {
+                  "enum": [
+                    "month",
+                    "quarter",
+                    "year"
+                  ]
+                },
+                "anchor": {
+                  "enum": [
+                    "data",
+                    "today"
+                  ]
+                },
+                "min": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "max": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "dimScopes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "col"
+                ],
+                "properties": {
+                  "col": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "kind": {
+                    "enum": [
+                      "time",
+                      "values"
+                    ]
+                  },
+                  "mode": {
+                    "enum": [
+                      "recent",
+                      "range"
+                    ]
+                  },
+                  "n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "unit": {
+                    "enum": [
+                      "month",
+                      "quarter",
+                      "year"
+                    ]
+                  },
+                  "anchor": {
+                    "enum": [
+                      "data",
+                      "today"
+                    ]
+                  },
+                  "min": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "max": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "values": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": [
+                        "string",
+                        "number"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "rowDrill": {
+              "type": "boolean"
+            },
+            "columnFilters": {
+              "type": "object",
+              "minProperties": 1,
+              "description": "列筛选预声明（WP-14 过滤器字段区）：{列名: 条件 spec}，与运行时 tblFilters（editor.table.columnFilters）同一模型同一形状。values = 值域多选（not:true = 排除已选 NOT-IN，空白行不命中；'__blank__' 哨兵 = 空白行）；range = 数值开口区间（min/max 至少一端）。键必须是数据集真实列名（编译侧 _check_table_column_filters 核对，含物化计算列；过滤器字段不要求出现在行/列区——QBI「隐藏字段仍可过滤」的组件级声明位）。",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "values",
+                      "range"
+                    ]
+                  },
+                  "values": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": [
+                        "string",
+                        "number"
+                      ]
+                    }
+                  },
+                  "not": {
+                    "type": "boolean",
+                    "description": "排除（NOT-IN）：true = 排除已选、保留其余；空白行在排除语义下不命中（SQL NOT IN）。"
+                  },
+                  "min": {
+                    "type": "number"
+                  },
+                  "max": {
+                    "type": "number"
+                  }
+                }
+              }
+            },
+            "measureNameRow": {
+              "type": "boolean"
+            },
+            "groupTopN": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "density": {
+              "enum": [
+                "compact",
+                "standard",
+                "relaxed"
+              ],
+              "description": "密度档（WP-1）：行高 32/40/48。缺省 standard。"
+            },
+            "align": {
+              "type": "object",
+              "minProperties": 1,
+              "description": "每列对齐 {列名: {h?, v?}}；键必须是数据集真实列名（编译侧核对，含物化计算列）。",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "h": {
+                    "enum": [
+                      "left",
+                      "center",
+                      "right",
+                      "auto"
+                    ]
+                  },
+                  "v": {
+                    "enum": [
+                      "top",
+                      "middle",
+                      "bottom",
+                      "auto"
+                    ]
+                  }
+                }
+              }
+            },
+            "headStyle": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": false,
+              "description": "表头样式（WP-1）：卡级内联变量覆盖主题值。",
+              "properties": {
+                "bg": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "fg": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "align": {
+                  "enum": [
+                    "left",
+                    "center",
+                    "right"
+                  ]
+                },
+                "hideColHead": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "wrapText": {
+              "type": "boolean",
+              "description": "内容区换行（WP-1）：white-space:pre-wrap。缺省 false。"
+            },
+            "rankLabel": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 12,
+              "description": "序号列别名（WP-1）。缺省「序号」。"
+            },
+            "rankHideOnTotal": {
+              "type": "boolean",
+              "description": "合计行不显示序号（WP-1）。缺省 false。"
+            },
+            "pageBy": {
+              "enum": [
+                "group",
+                "row"
+              ],
+              "description": "分页单位（WP-2）：group=首维组原子（组永不跨页）；row=平铺切片。缺省 group。"
+            },
+            "pagerMode": {
+              "enum": [
+                "full",
+                "simple"
+              ],
+              "description": "分页器形态（WP-2）：simple 跳过总数计算。缺省 full。"
+            },
+            "pageSizeMax": {
+              "enum": [
+                10,
+                20,
+                30,
+                50,
+                80,
+                100,
+                200,
+                500
+              ],
+              "description": "页容量档（WP-2）：条数选择器上限档。缺省 20。"
+            },
+            "export": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": false,
+              "description": "导出包（WP-2）：卡头「导出」开关/命名 + XLSX 水印页眉文本。",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 40
+                },
+                "watermark": {
+                  "type": "string",
+                  "maxLength": 20
+                }
+              }
+            },
+            "condFormat": {
+              "type": "array",
+              "minItems": 1,
+              "description": "条件格式规则数组（WP-4 阶段二模型；请求层只锁结构，求值语义归 WP-4）。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "target",
+                  "basis"
+                ],
+                "properties": {
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "source": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "basis": {
+                    "enum": [
+                      "固定值",
+                      "百分比区间",
+                      "动态字段",
+                      "与0",
+                      "与均值"
+                    ]
+                  },
+                  "op": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "value": {},
+                  "actions": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "additionalProperties": false,
+                    "properties": {
+                      "text": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "bg": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "bold": {
+                        "type": "boolean"
+                      },
+                      "italic": {
+                        "type": "boolean"
+                      },
+                      "icon": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "scale": {
+                        "type": "number"
+                      },
+                      "bar": {
+                        "type": "boolean"
+                      },
+                      "hideText": {
+                        "type": "boolean"
+                      },
+                      "fullRow": {
+                        "type": "boolean"
+                      }
+                    }
+                  },
+                  "affectTotals": {
+                    "type": "boolean"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            },
+            "subMeasures": {
+              "type": "array",
+              "minItems": 1,
+              "description": "副指标（WP-5）：交叉表内嵌同/环比对比列；一期 pos 仅 right。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "measure",
+                  "offsetN",
+                  "grain",
+                  "show",
+                  "pos"
+                ],
+                "properties": {
+                  "measure": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "offsetN": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "grain": {
+                    "enum": [
+                      "year",
+                      "quarter",
+                      "month",
+                      "week",
+                      "day"
+                    ]
+                  },
+                  "show": {
+                    "enum": [
+                      "diff",
+                      "pct",
+                      "value"
+                    ]
+                  },
+                  "pos": {
+                    "enum": [
+                      "right"
+                    ]
+                  }
+                }
+              }
+            },
+            "heightMode": {
+              "description": "高度三态（WP-7）：grow 自适应生长（缺省）/ fixed（=manualH 既有语义）/ bounded 有界高度（maxPx 200..4000，冻结表头前置）。",
+              "anyOf": [
+                {
+                  "enum": [
+                    "grow",
+                    "fixed"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "bounded"
+                  ],
+                  "properties": {
+                    "bounded": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "maxPx"
+                      ],
+                      "properties": {
+                        "maxPx": {
+                          "type": "integer",
+                          "minimum": 200,
+                          "maximum": 4000
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "treeView": {
+              "type": "boolean",
+              "description": "行维树形展示（WP-8）；与 mergeSame 互斥。缺省 false。"
+            },
+            "mergeRowDims": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": false,
+              "description": "多行维合并一列（WP-8）：单元格内换行「A / B」。",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 40
+                },
+                "width": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              }
+            },
+            "sparkline": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": false,
+              "description": "迷你图趋势列（WP-9）：列区=时间维时行尾「趋势」列（纯 SVG）。",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 12
+                }
+              }
+            },
+            "totalCalc": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "enum": [
+                  "sum",
+                  "average",
+                  "count",
+                  "countd",
+                  "min",
+                  "max"
+                ]
+              },
+              "description": "总计计算方式（WP-11，对标 QBI）：{指标列名: 合计聚合方式}。合计回全量过滤原始行按指定聚合重算，不是对页面值二次聚合；键必须是数据集真实列名（编译侧核对，align 同款），派生指标与非数值列的声明在编译侧被静默忽略（不可加，占比/环比的合计无意义）。"
+            }
+          }
+        },
+        "axis": {
+          "type": "object",
+          "description": "Per-axis overrides (name/min/max/format), index-aligned; see authoring-feature-map.md."
+        },
+        "series": {
+          "type": "object",
+          "description": "Per-series overrides: seriesType/seriesAxis maps keyed by measure name (composite charts)."
+        },
+        "dimensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Multi-dimension (row nesting / crosstab rows) declaration; dimension is the first slot."
+        },
+        "dimensionBucket": {
+          "type": "object",
+          "description": "Time bucketing override {source,bucket} for the time axis.",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "bucket": {
+              "enum": [
+                "year",
+                "quarter",
+                "month",
+                "week",
+                "day",
+                "raw"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "style": {
+          "type": "object",
+          "description": "Chart-level style hints (annotation card type/colors).",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1024 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Live Report Master Manifest v3",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "reportId",
+    "title",
+    "blocks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 3
+    },
+    "reportId": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "templateId": {
+      "type": "string",
+      "enum": [
+        "standard-bi-v1",
+        "free-v1"
+      ],
+      "description": "编译档位：standard-bi-v1=固定骨架；free-v1=自由模式（声明即全部）。"
+    },
+    "cover": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "kpis": {
+      "type": "array",
+      "maxItems": 12,
+      "description": "free-v1 上限 12（每行 4 张折行）；standard 恒 ≤4。",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "insights": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "free-v1 上限 10；standard 恒 ≤3。",
+      "items": {
+        "type": [
+          "string",
+          "object"
+        ]
+      }
+    },
+    "texts": {
+      "type": "array",
+      "maxItems": 20,
+      "description": "free-v1 独立文本块声明（build_manifest 原样烘焙；server 重渲染据此重建伪卡）。",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "kpiPosition": {
+      "enum": ["top", "bottom"],
+      "description": "KPI 条位置（free-v1）：top=缺省；bottom=图表/文本区与洞察卡之后。"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "meta": {
+      "type": "object",
+      "description": "编译期系统元数据（请求层不声明，系统自动推断）。无内容时整个 meta 键省略，绝不写 null。",
+      "required": [
+        "dataAsOf"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "dataAsOf": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "数据截至日期（ISO YYYY-MM-DD）：编译期取主数据集时间列各列最大值的最晚者，经 scripts/date_parse.py（单一时间解析器）标准化。封面/阅读态徽章/汇报页脚三端读同一个字段。"
+        }
+      }
+    },
+    "filters": {
+      "type": [
+        "array",
+        "object"
+      ]
+    },
+    "filterMulti": {
+      "type": "object",
+      "description": "按列持久化的多选配置（filterMulti[col]=true → 该列筛选下拉变复选列表框）。运行时维护。",
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "filterHier": {
+      "type": "object",
+      "description": "按层级链根持久化的「层级筛选」配置（filterHier[root]=true → 该链在本卡合并成一个多层下钻控件）。运行时维护。",
+      "additionalProperties": {
+        "type": "boolean"
+      }
+    },
+    "filterCandidates": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "blocks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/block"
+      }
+    },
+    "charts": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/chart"
+      }
+    },
+    "datasets": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/dataset"
+      }
+    },
+    "theme": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "pageWidth": {
+      "title": "PageWidth",
+      "description": "报告页面宽度档位(px)；缺省 1280。允许 1280/1440/1600/1920。",
+      "type": "integer",
+      "enum": [
+        1280,
+        1440,
+        1600,
+        1920
+      ]
+    },
+    "dataSourceMode": {
+      "title": "DataSourceMode",
+      "description": "数据源独立性硬控（烘焙自请求）：independent = 数据源完全独立，未做任何 relations 合并；缺省 default。",
+      "type": "string",
+      "enum": [
+        "default",
+        "independent"
+      ]
+    },
+    "chartTheme": {
+      "enum": [
+        "default",
+        "economist",
+        "nyt",
+        "swiss",
+        "nature",
+        "mckinsey",
+        "datawrapper",
+        "powerbi",
+        "powerbi-light",
+        "pop",
+        "cartoon",
+        "huawei"
+      ]
+    },
+    "themeShells": {
+      "type": "object",
+      "description": "报告主题壳表（docs/report-theme-convergence-design.md）：id→{label, chartOnly?, tokens, vars, chart?}。编译期由 report_themes.shell_catalog 烘焙（id 与 chart-adapter CHART_THEMES 对齐）；vars 是可直接 setProperty 的 CSS 变量映射。chartTheme=default 的运行时切换也依赖本表。",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "chartOnly": {
+            "type": "boolean"
+          },
+          "tokens": {
+            "type": "object"
+          },
+          "vars": {
+            "type": "object"
+          },
+          "chart": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "columnRoles": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "time",
+          "dimension",
+          "measure",
+          "id",
+          "ignore"
+        ]
+      }
+    },
+    "mode": {
+      "enum": [
+        "singlefile",
+        "server"
+      ]
+    },
+    "serverBase": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "narrative": {
+            "type": "string"
+          },
+          "insight": {
+            "type": "string"
+          },
+          "chartIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "tabs": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "relations": {
+      "type": "array",
+      "default": [],
+      "description": "v4 single-mode：每个 relation 代表一次「合并为一张宽表」。N 张表 → 1 张宽表（链式合并，链间由 keys 连接）。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "tables",
+          "keys"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 2
+          },
+          "keys": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "a",
+                "b"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "a": {
+                  "type": "object",
+                  "required": [
+                    "ds",
+                    "col"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "ds": {
+                      "type": "string"
+                    },
+                    "col": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "b": {
+                  "type": "object",
+                  "required": [
+                    "ds",
+                    "col"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "ds": {
+                      "type": "string"
+                    },
+                    "col": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "a",
+                    "b",
+                    "both"
+                  ],
+                  "default": "both"
+                }
+              }
+            }
+          },
+          "fields": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "dsMapPos": {
+      "type": "object",
+      "description": "数据源配置 → 画布模式里每张表节点的摆放位置（x/y）。纯编辑视图的布局偏好，随报告保存，这样同事打开时看到的是同一个排布；节点拖拽后由运行时写回，未记录的节点走自动排布。",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "dimensionKeys": {
+      "type": "object",
+      "default": {},
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "tables"
+        ],
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "datasetId",
+                "column"
+              ],
+              "additionalProperties": true,
+              "properties": {
+                "datasetId": {
+                  "type": "string"
+                },
+                "column": {
+                  "type": "string"
+                },
+                "bucket": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "description": "Runtime config carried from the request (mode, editPassword for server 口令保存, …)."
+    },
+    "presentation": {
+      "type": "object",
+      "description": "汇报模式专用布局（与单页 block.layout 独立）。layout 是 blockId → {page,slot,x,w,h} 的行坐标（page=页码，slot=页内内容行偏移，x/w/h 同行/列语义），首次进入汇报模式时按「每页预留标题行 + 装不下顺延下一页」规则种子化，之后在汇报编辑里的调整只写这里。运行时维护，编译器不读。",
+      "properties": {
+        "layout": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "page": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "slot": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "x": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "w": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "h": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "seededAt": {
+          "type": "number"
+        }
+      }
+    },
+    "filterDefaults": {
+      "type": "object",
+      "description": "按筛选卡持久化的读者默认筛选（BI-H8）：filterDefaults[blockId]={filters:[谓词…]}，谓词形状与运行时 st.filters 同构（in/between/daterange）。作者在筛选卡「存为默认」写入；读者侧可一键恢复默认。",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "filters": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "filters"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "$defs": {
+    "dataset": {
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "columns"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "measureTypes": {
+          "type": "object",
+          "description": "Semantic types per dataset column; BI-inserted charts inherit these so self-service charts format like authored ones.",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "enum": [
+                  "currency",
+                  "percent",
+                  "count",
+                  "duration",
+                  "number",
+                  "unitless"
+                ]
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "currency",
+                      "percent",
+                      "count",
+                      "duration",
+                      "number",
+                      "unitless"
+                    ]
+                  },
+                  "divisor": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "unit": {
+                    "type": "string",
+                    "maxLength": 12
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 6
+                  },
+                  "currency": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8,
+                    "pattern": "^[A-Za-z]{3}$",
+                    "description": "ISO 货币代码，必须在内置币表内（22 币，见 validate_request/type_registry）。缺省 CNY（¥）。",
+                    "$comment": "docs/multidim-table-and-currency-design-2026-09-28.md §二 拍板 6/7"
+                  },
+                  "symbol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4,
+                    "description": "自定义货币符号（≤4 字符），优先于 currency 查表。"
+                  },
+                  "aggregation": {
+                    "enum": [
+                      "sum",
+                      "average",
+                      "count", "countd",
+                      "min",
+                      "max"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "additionalProperties": true,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array"
+          }
+        },
+        "primaryKey": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "增量合并（按主键 upsert）的主键列；替换数据端点持久化，刷新向导据此预填"
+        }
+      }
+    },
+    "block": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+        },
+        "kind": {
+          "enum": [
+            "text",
+            "kpi",
+            "chart",
+            "table",
+            "grid",
+            "group",
+            "media",
+            "divider",
+            "custom"
+          ]
+        },
+        "grid": {
+          "$ref": "#/$defs/grid"
+        },
+        "layout": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y",
+            "w",
+            "h"
+          ],
+          "properties": {
+            "x": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 11
+            },
+            "y": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "w": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 12
+            },
+            "h": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 40
+            }
+          }
+        }
+      }
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rows"
+      ],
+      "properties": {
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 40,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "merges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "r",
+              "c",
+              "rs",
+              "cs"
+            ],
+            "properties": {
+              "r": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "c": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rs": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "cs": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "colWidths": {
+          "type": "array",
+          "maxItems": 40,
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "rowHeights": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "styles": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/gridStyle"
+          }
+        }
+      }
+    },
+    "gridStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "b": {
+          "const": 1
+        },
+        "align": {
+          "enum": [
+            "left",
+            "center",
+            "right"
+          ]
+        },
+        "color": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$"
+        },
+        "bg": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$"
+        }
+      }
+    },
+    "chart": {
+      "type": "object",
+      "required": [
+        "id",
+        "blockId",
+        "elementId",
+        "viewType",
+        "option",
+        "editor"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+        },
+        "blockId": {
+          "type": "string"
+        },
+        "elementId": {
+          "type": "string"
+        },
+        "viewType": {
+          "enum": [
+            "bar",
+            "stackedBar",
+            "line",
+            "area",
+            "pie",
+            "donut",
+            "scatter",
+            "funnel",
+            "table"
+          ]
+        },
+        "option": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "editor": {
+          "$ref": "#/$defs/chartEditor"
+        },
+        "annotation": {
+          "type": "string"
+        },
+        "section": {
+          "type": "string"
+        }
+      }
+    },
+    "chartEditor": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "editable",
+            "data"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "editable": {
+              "const": true
+            },
+            "data": {
+              "$ref": "#/$defs/chartData"
+            },
+            "table": {
+              "type": "object",
+              "description": "表格卡作者设置（批次一 + WP-3 请求层契约，docs/product-iteration-plan.md §2.2）：请求层 chart.table 原样透传，运行时 showTableBody 唯一读取口。键集与形状的校验真源 = validate_request.TABLE_SETTING_KEYS + report-request.schema.json $defs.chart.properties.table（双 schema 声明，军规 3）；这里放行任意键是因为 manifest 还会承载运行时写回的同类设置（colWidths/sortOrder/drillSteps 等），请求侧白名单已在编译前把关。totalCalc（WP-11 总计计算方式）= {指标列名: sum|average|count|countd|min|max}，合计回全量过滤原始行重算；编译侧同时把覆盖指标的静态合计值烘进该表 option.totalRow（{列: 值}），服务端在线合计经 /aggregate 的 totalCalc 载荷返回 aggregates[col][聚合]。columnFilters（WP-14 过滤器字段区）= {列名: {type:'values',values[],not?}|{type:'range',min?,max?}}，与编辑器面板过滤器区/列头漏斗同一 tblFilters 模型（区=作者层、读者会话 __sessionView.filters 经 mergeTableFilters 同列覆盖/null 压制）；编译侧 _check_table_column_filters 对真实表列核对键存在性。",
+              "additionalProperties": true
+            },
+            "sort": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "flags": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "editable",
+            "reason"
+          ],
+          "additionalProperties": true,
+          "properties": {
+            "editable": {
+              "const": false
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          }
+        }
+      ]
+    },
+    "chartData": {
+      "type": "object",
+      "required": [
+        "dimension",
+        "measures",
+        "aggregation"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "datasetId": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "string"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array"
+          }
+        },
+        "dimension": {
+          "type": "string"
+        },
+        "measures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "aggregation": {
+          "enum": [
+            "none",
+            "sum",
+            "average",
+            "count", "countd",
+            "min",
+            "max"
+          ]
+        },
+        "measureTypes": {
+          "type": "object",
+          "description": "Semantic type per measure column that drives automatic axis/tooltip formatting and optional value scaling. String form: currency|percent|count|duration|number|unitless. Object form adds divisor (scale factor) and unit (display suffix) for compact units like 万.",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "enum": [
+                  "currency",
+                  "percent",
+                  "count",
+                  "duration",
+                  "number",
+                  "unitless"
+                ]
+              },
+              {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "currency",
+                      "percent",
+                      "count",
+                      "duration",
+                      "number",
+                      "unitless"
+                    ]
+                  },
+                  "divisor": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  },
+                  "unit": {
+                    "type": "string",
+                    "maxLength": 12
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 6
+                  },
+                  "currency": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8,
+                    "pattern": "^[A-Za-z]{3}$",
+                    "description": "ISO 货币代码，必须在内置币表内（22 币，见 validate_request/type_registry）。缺省 CNY（¥）。",
+                    "$comment": "docs/multidim-table-and-currency-design-2026-09-28.md §二 拍板 6/7"
+                  },
+                  "symbol": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4,
+                    "description": "自定义货币符号（≤4 字符），优先于 currency 查表。"
+                  },
+                  "aggregation": {
+                    "enum": [
+                      "sum",
+                      "average",
+                      "count", "countd",
+                      "min",
+                      "max"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "roles": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "breakdown": {
+              "type": "string"
+            },
+            "cols": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": {
+                "type": "string"
+              },
+              "description": "交叉列维数组（1-3 层，批 B 多维表格）。breakdown = cols[0] 镜像。",
+              "$comment": "docs/multidim-table-and-currency-design-2026-09-28.md §一 拍板 1/4"
+            },
+            "source": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}

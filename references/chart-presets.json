@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "note": "Whitelist of chart presets. Removed heatmap.matrix (v1 drop). TOP K is expressed per-chart as a `limit`/`topK` whose runtime control maps to ECharts official `dataset.transform` sort+filter, or a server LIMIT — never a model-written option. `bar.stacked`/`bar.rank` support an optional `breakdown` second dimension → 维度×维度 cross-tab (per-breakdown stacked/grouped series).",
+  "presets": {
+    "kpi.metric": {"viewType": "kpi", "family": "metric", "dimensions": 0, "measures": [1, 1], "defaultSort": "none"},
+    "table.aggregate": {"viewType": "table", "family": "table", "dimensions": 1, "measures": [1, 3], "defaultSort": "desc", "maxRows": 20},
+    "table.detail": {"viewType": "table", "family": "detail", "dimensions": 1, "measures": [1, 3], "readOnly": true, "maxRows": 50},
+    "bar.rank": {"viewType": "bar", "family": "comparison", "dimensions": [1, 2], "measures": [1, 3], "defaultSort": "desc", "supportsTopK": true},
+    "bar.stacked": {"viewType": "stackedBar", "family": "composition", "dimensions": [1, 2], "measures": [1, 3], "defaultSort": "desc", "supportsTopK": true},
+    "line.trend": {"viewType": "line", "family": "trend", "dimensions": 1, "measures": [1, 2], "requiresTimeOrOrdinal": true, "supportsTopK": false},
+    "area.trend": {"viewType": "area", "family": "trend", "dimensions": 1, "measures": [1, 2], "requiresTimeOrOrdinal": true, "supportsTopK": false},
+    "scatter.correlation": {"viewType": "scatter", "family": "relationship", "dimensions": [0, 1], "measures": [2, 3], "supportsTopK": false},
+    "pie.share": {"viewType": "pie", "family": "share", "dimensions": 1, "measures": [1, 1], "maxCategories": 8, "defaultSort": "desc", "supportsTopK": false},
+    "donut.share": {"viewType": "donut", "family": "share", "dimensions": 1, "measures": [1, 1], "maxCategories": 8, "defaultSort": "desc", "supportsTopK": false},
+    "funnel.stage": {"viewType": "funnel", "family": "stage", "dimensions": 1, "measures": [1, 1], "minStages": 3, "supportsTopK": false}
+  }
+}
