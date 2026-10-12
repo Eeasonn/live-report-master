@@ -193,7 +193,14 @@
 .ai-card-filter-toggle:hover{border-color:var(--accent)}
 .ai-card-filter-item{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .ai-card-filter-item .ai-card-filter-dim{font-size:11px;color:var(--ink2,#787671)}
-.ai-card-filter-item select{max-width:180px;border:1px solid var(--line-strong,#c8c4be);border-radius:var(--ctl-r,8px);background:#fff;color:var(--ink,#1a1a1a);font-size:12px;padding:3px 8px;height:var(--ctl-h-sm)}
+/* 值域按钮（2026-10-10 多选改造：常驻条每维一枚，点开勾选列表；不再是 select）。 */
+.ai-card-filter-item .ai-card-filter-val{flex:0 1 auto;max-width:180px;border:1px solid var(--line-strong,#c8c4be);border-radius:var(--ctl-r,8px);background:#fff;color:var(--ink,#1a1a1a);font-size:12px;padding:3px 8px;height:var(--ctl-h-sm);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:left}
+.ai-card-filter-item .ai-card-filter-val:hover{border-color:var(--accent)}
+/* 值域多选菜单（复用 .ai-report-filter-multimenu 骨架）：列表略宽、勾选行规整。 */
+.ai-card-filter-menu{min-width:240px;max-width:320px}
+.ai-card-filter-menu .ai-report-filter-multi-box label{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink,#1a1a1a);padding:3px 4px;border-radius:6px;cursor:pointer;white-space:nowrap}
+.ai-card-filter-menu .ai-report-filter-multi-box label:hover{background:var(--hover-accent-bg)}
+.ai-card-filter-menu input[type="checkbox"]{accent-color:var(--accent)}
 .ai-card-filter-item .ai-card-filter-rm{flex:none;width:18px;height:18px;border:0;background:transparent;color:var(--stone,#a4a097);font-size:13px;cursor:pointer;border-radius:4px;padding:0}
 .ai-card-filter-item .ai-card-filter-rm:hover{color:var(--semantic-error);background:var(--semantic-error-bg)}
 .ai-card-filter-pick{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink,#1a1a1a);padding:3px 2px;cursor:pointer}
@@ -799,7 +806,6 @@ th.ai-pb-col{color:var(--ink3,#787671);font-weight:600}
 .ai-col-fbtn.is-active{color:#fff;background:var(--accent)}
 .ai-table-tools .ai-tbl-tool{font-size:12px;padding:4px 10px}
 .ai-table-tools-sep{width:1px;height:16px;background:var(--hairline,#e5e3df);margin:0 2px}
-.ai-tbl-filter-chip{color:color-mix(in srgb,var(--accent) 85%,#000);border-color:color-mix(in srgb,var(--accent) 32%,var(--surface,#fff));background:var(--hover-accent-bg)}
 /* ---- TBL-H5 表内搜索 / TBL-H4 Σ 统计条 / TBL-H7 非法输入红框 ---- */
 .ai-tbl-search-wrap{display:inline-flex;align-items:center;gap:6px;flex:0 0 auto}
 .ai-tbl-search{height:var(--ctl-h);width:170px;padding:0 10px;border:1px solid var(--line,#e5e3df);border-radius:var(--ctl-r);font:12px/1.2 var(--font-ui,Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);color:var(--ink,#1a1a1a);background:#fff;box-sizing:border-box}
@@ -875,12 +881,7 @@ th.ai-pb-col{color:var(--ink3,#787671);font-weight:600}
 .ai-tbl-sortmode-label{font-size:11px;color:var(--ink3,#787671);font-weight:700}
 .ai-tbl-sortmode-btn{border:1px solid var(--line-strong,#c8c4be);border-radius:999px;background:#fff;color:var(--ink2,#5d5b54);font-size:11px;padding:3px 10px;cursor:pointer}
 .ai-tbl-sortmode-btn.is-active{background:var(--accent);border-color:var(--accent);color:#fff}
-.ai-flt-row{cursor:default}
-.ai-flt-col{flex:0 0 auto;font-weight:600;color:var(--ink,#1a1a1a)}
-.ai-flt-del{appearance:none;border:0;background:transparent;color:var(--ink3,#787671);font-size:14px;cursor:pointer;padding:2px 6px;border-radius:6px}
-.ai-flt-del:hover{background:var(--surface-soft,#fafaf9);color:var(--semantic-error-deep)}
-.ai-flt-add{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--hairline,#e5e3df)}
-.ai-flt-add select{flex:1;min-width:0;height:var(--ctl-h);border:1px solid var(--line-strong,#c8c4be);border-radius:var(--ctl-r,8px);background:#fff;padding:0 8px;font-size:12px;cursor:pointer}
+/* ai-flt-*（AND 多条件面板行样式）已随 openTableFiltersPanel 退役（2026-10-10）。 */
 th[data-detail-sort]{cursor:pointer}
 /* 语义配置表格 / 画布（3a）：行内下拉与 % 按钮贴齐筛选/面板 text-input 样式。 */
 .ai-report-table.ai-sem-table select,.ai-sem-node select,.ai-sem-agg,.ai-sem-dec{border:1px solid var(--line-strong,#c8c4be);border-radius:var(--ctl-r,8px);padding:3px 8px;height:var(--ctl-h-sm);background:#fff;color:var(--ink,#1a1a1a);font-size:12px;cursor:pointer}
@@ -2469,7 +2470,10 @@ tr.ai-sem-group-row.ai-sem-drop-root td{background:color-mix(in srgb,var(--accen
 .ai-calc-fields{display:flex;flex-direction:column;gap:2px;max-height:min(360px,36vh);overflow-y:auto;border:1px solid var(--line,#e5e3df);border-radius:8px;padding:4px;scrollbar-width:thin;scrollbar-color:var(--line,#d9d6d0) transparent}
 .ai-calc-fields::-webkit-scrollbar,.ai-calc-lib-items::-webkit-scrollbar{width:8px}
 .ai-calc-fields::-webkit-scrollbar-thumb,.ai-calc-lib-items::-webkit-scrollbar-thumb{background:var(--line,#d9d6d0);border-radius:4px}
-.ai-calc-field{display:flex;gap:6px;align-items:center;height:26px;padding:0 8px;border:0;background:transparent;border-radius:6px;font-size:12.5px;color:var(--ink,#1a1a1a);text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* flex:0 0 auto（2026-10-10 用户反馈：30+ 字段时行高被压扁、滚动条不出）——列向
+   flex 容器 + max-height 下，子项默认 flex-shrink:1 会被压到 min-content（overflow:hidden
+   使之为 0）而不是触发滚动；钉死主尺寸后 max-height 才真正转化为滚动。 */
+.ai-calc-field{display:flex;gap:6px;align-items:center;flex:0 0 auto;height:26px;padding:0 8px;border:0;background:transparent;border-radius:6px;font-size:12.5px;color:var(--ink,#1a1a1a);text-align:left;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ai-calc-field:hover{background:var(--hover-accent-bg);color:var(--accent)}
 .ai-calc-field-r{flex:0 0 auto;font-size:10.5px;color:var(--ink3,#a4a097);background:var(--surface,#f6f5f4);border-radius:999px;padding:1px 6px}
 /* 竖排清单自滚动（2026-09-22 字段过多反馈）：不再依赖祖先滚动兜底——
@@ -2479,7 +2483,7 @@ tr.ai-sem-group-row.ai-sem-drop-root td{background:color-mix(in srgb,var(--accen
    符号本身即说明，副标收进 title 悬停。 */
 .ai-calc-lib-items.is-inline{flex-direction:row;flex-wrap:wrap;gap:4px}
 .ai-calc-lib-item.is-inline{flex:1 1 auto;justify-content:center;height:24px;min-width:28px;padding:0 9px;border:1px solid var(--line,#e5e3df);background:#fff;border-radius:6px;font-size:12.5px;font-weight:600}
-.ai-calc-lib-item{display:flex;justify-content:space-between;gap:8px;align-items:baseline;height:28px;padding:0 8px;border:0;background:transparent;border-radius:6px;font-size:12.5px;cursor:pointer;text-align:left}
+.ai-calc-lib-item{display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex:0 0 auto;height:28px;padding:0 8px;border:0;background:transparent;border-radius:6px;font-size:12.5px;cursor:pointer;text-align:left}
 .ai-calc-lib-item b{font-weight:600;color:var(--ink,#1a1a1a)}
 .ai-calc-lib-item span{font-size:11px;color:var(--ink3,#a4a097)}
 .ai-calc-lib-item:hover{background:var(--hover-accent-bg)}

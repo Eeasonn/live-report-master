@@ -39,9 +39,12 @@
       else if(op==='eq'){if(!eq(v,fv))return false;}
       else if(op==='ne'){if(eq(v,fv))return false;}
       else if(op==='gt'){if(!(Number(v)>Number(fv)))return false;}
-      else if(op==='gte'){if(!(Number(v)>=Number(fv)))return false;}
+      else if(op==='gte'||op==='ge'){if(!(Number(v)>=Number(fv)))return false;}
       else if(op==='lt'){if(!(Number(v)<Number(fv)))return false;}
-      else if(op==='lte'){if(!(Number(v)<=Number(fv)))return false;}
+      else if(op==='lte'||op==='le'){if(!(Number(v)<=Number(fv)))return false;}
+      // ge/le 是筛选型派生指标的声明词汇（derived_model.FILTER_OPS / 弹窗 fmOps 都
+      // 认，PY _predicate_sql/_row_filter 映射 '>='/'<='）——JS 本地路径漏分支会被
+      // 静默跳过（不筛选=命中所有行），singlefile 交互重聚合与编译静态首屏翻值。
       // 数值区间 / 日期范围：两端可空 = 单边开口；两端都空 = 无约束（上面已 continue）。
       // 日期比较在**规范化后的 ISO**上做（parseDateValue = Python date_parse.iso），
       // 所以 2026/9/5 / 2026年9月5日 / 20260905 / 202501 都能落进正确区间 —— 与
@@ -224,7 +227,10 @@
       var entries=(payload.rows||[]).map(function(row){
         var baseVals=row.slice(valSlice);
         var values=measures.map(function(m,idx){var vi=reqIndex[aggColumn(m)];return vi==null?0:Number(baseVals[vi]);});
-        return {label:String(row[0]!=null?row[0]:''), breakdown:matrix?String(row[1]!=null?row[1]:null):null, values:values};
+        // breakdown 空组（SQL NULL 在 GROUP BY 下自成一组，JSON 里就是 null）必须
+      // 归一成 ''——String(null) 是字面量 'null'，图例/系列名会真的显示「null」，
+      // 且与本地路径（String(row[bi] ?? '')）三端漂移（2026-10-11 审视）。
+      return {label:String(row[0]!=null?row[0]:''), breakdown:matrix?String(row[1]!=null?row[1]:''):null, values:values};
       });
       if(plan){
         // helper series come after the visible base columns in the response
@@ -234,7 +240,12 @@
             var v=row.slice(valSlice)[vi];return v==null?null:Number(v);
           });
         });
-        applyDerivedNodes(entries,data,plan,dimension);
+        // 指标名称占维度槽位（_grpDim 顶替）时跳过派生求值：窗口闸门拿虚拟列
+        // '__measures__' 比对 timeField 恒抛「依赖时间列…」，整张表格卡在分支路由
+        // 之前死进错误态——而 mm/nf/ND 表格分支自按真实维度 aggregateTable 重取
+        // 重算，主管道的派生槽本来就不会被消费（主管道对表格卡只要求不崩；
+        // 本地路径 ci<0 早退本就跳过，这里对齐，2026-10-11 审视）。
+        if(_grpDim===dimension)applyDerivedNodes(entries,data,plan,dimension);
         // 「其他（N 项）」行的派生指标与编译侧同口径：share / window-rate 的值
         // 已 ×100（不可加），静态首屏该格为空缺（mergedPartial）——运行时重聚合
         // 也要置空，否则首屏空缺、编辑态却出现一个「尾组合计占比」的幽灵值。

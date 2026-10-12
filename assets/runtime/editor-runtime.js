@@ -1387,16 +1387,11 @@
       if(so){var sctx=chart.__tblCtx||{};
         openTableSortPop(so,chart,{cols:sctx.sortCols||[],current:effectiveSortLevels(tableSortLevelsOf((chart.editor&&chart.editor.table)||{},null),sessionViewOf(chart)),sortMode:{mode:tableSortModeOf(chart),available:sortModeAvailable(chart),onCommit:function(m){commitTableSortMode(chart,m);}},onCommit:function(levels){commitTableSortLevels(chart,levels);}});
         return;}
-      // ②快捷过滤面板（WP-10）：多条件 AND 组合的可视化管理入口。
-      var fo=ev.target.closest('[data-tbl-filters-open]');
-      if(fo){openTableFiltersPanel(fo,chart);return;}
       // ①读者字段自选（WP-10）：预览/阅读态的「字段」面板（勾选 + 拖拽排序）。
       var flo=ev.target.closest('[data-tbl-fields-open]');
       if(flo){openFieldPickerPop(flo,chart);return;}
-      var cf=ev.target.closest('[data-tbl-clear-filters]');
-      if(cf){
-        if(readerMode()){var svC=ensureSessionView(chart);if(svC)delete svC.filters;renderChart(chart);return;}
-        chart.editor=chart.editor||{};chart.editor.table=chart.editor.table||{};chart.editor.table.columnFilters={};chart.editor.table.page=0;syncManifest();renderChart(chart);return;}
+      // 筛选通道收敛（2026-10-10）：旧工具条「筛选」按钮/多条件面板/一键清除芯片
+      // 一并退役——读者筛选走卡头「筛选 ▾」，列级限制走编辑态漏斗/面板。
       var xx=ev.target.closest('[data-export-menu]');
       if(xx){openTableExportPop(xx,function(){exportTableXlsx(chart,data);},function(){exportTableCsv(chart,data);});return;}
       // 聚合表头 ◎：切换该指标的「目标数据条」显隐（editor.table.fieldCfg[m].target.showBar）。
@@ -2167,12 +2162,14 @@
         out=out.filter(function(r){return set[String(valOf(r,sc.col))];});
         return;
       }
-      var maxK=null;
+      // 直传最大期部件对象（带 prec）——月空间键往返 {y:⌊k/12⌋,mo:k%12+1} 读不回
+      // 周部件（周号 >12 必错），maxParts 同时供 resolveDateScopeKeys 核对单位形状。
+      var maxP=null;
       out.forEach(function(r){
         var p=null;try{p=partsFn(valOf(r,sc.col));}catch(e){}
-        if(p){var k=partsKey(p);if(maxK==null||k>maxK)maxK=k;}
+        if(p&&(!maxP||partsKey(p)>partsKey(maxP)))maxP=p;
       });
-      var keys=resolveDateScopeKeys(sc,{maxParts:(maxK!=null?{y:Math.floor(maxK/12),mo:maxK%12+1}:null),todayParts:todayParts||null,partsFn:partsFn});
+      var keys=resolveDateScopeKeys(sc,{maxParts:maxP,todayParts:todayParts||null,partsFn:partsFn});
       if(keys)out=applyDateScopeRows(out,keys,function(r){return valOf(r,sc.col);},partsFn);
     });
     return out;
@@ -2382,15 +2379,36 @@
     return orig.map(function(o){return o.k;});
   }
   // 相对日期范围（P1.5）：比较在 dateParts 部件空间（{y,mo}），与桶值标签形
-  // （YYYYMM / YYYY-MM / YYYY-Qn）解耦。unit: month|quarter|year。
-  function partsKey(p){return p.y*12+(p.mo-1);}
+  // （YYYYMM / YYYY-MM / YYYY-Qn）解耦。unit: week|month|quarter|year。
+  // 值级周字段（2026-10-09）的部件把周号装进 mo 槽位（1–53）——月空间 y*12 会让
+  // W13-W53 溢进「下一年」（2025-W50 的键反而大于 2026-W02），周走独立键空间
+  // y*53+(周-1)：53 是 ISO 年周数上限，跨年序关系恒正确。
+  function partsKey(p){return p.prec==='week'?p.y*53+(p.mo-1):p.y*12+(p.mo-1);}
+  // ISO 年周数 52/53 不等，周不能用定基数算术——「12-28 恒在 ISO 末周」求年周数，
+  // while 循环精确跨年步进（星期数学 = chart-adapter.isoWeek 的逐字镜像）。
+  function isoWeeksInYear(y){
+    var d=new Date(y,11,28);
+    var day=(d.getDay()+6)%7;d.setDate(d.getDate()-day+3);
+    var ft=new Date(d.getFullYear(),0,4);var fd=(ft.getDay()+6)%7;ft.setDate(ft.getDate()-fd+3);
+    return 1+Math.round((d-ft)/(7*86400000));
+  }
+  function shiftWeekParts(p,n){
+    var w=p.mo+n,y=p.y;
+    if(!(y>=1))return {y:y,mo:Math.min(53,Math.max(1,w)),d:0,prec:'week'}; // 裸周无年：夹回 1..53（跨年无真值，保守不越界）
+    while(w<1){y-=1;w+=isoWeeksInYear(y);}
+    while(w>isoWeeksInYear(y)){w-=isoWeeksInYear(y);y+=1;}
+    return {y:y,mo:w,d:0,prec:'week'};
+  }
   function shiftParts(p,n,unit){
+    if(unit==='week')return shiftWeekParts(p,n);
     var step=(unit==='quarter')?3*n:((unit==='year')?12*n:n);
     var total=p.y*12+(p.mo-1)+step;
     return {y:Math.floor(total/12),mo:total%12+1};
   }
   // scope:{mode:'recent'|'range'|'all', n, unit, anchor:'data'|'today', min, max}
-  // ctx:{maxParts(数据最大期部件), todayParts, partsFn(桶值→部件)} → {min,max} 部件键 | null
+  // ctx:{maxParts(数据最大期部件，带 prec), todayParts({y,mo,d}), partsFn(桶值→部件)}
+  //   → {min,max} 部件键 | null
+  var __scopeUnitWarned=false;
   function resolveDateScopeKeys(scope,ctx){
     if(!scope||scope.mode==='all')return null;
     ctx=ctx||{};
@@ -2402,6 +2420,23 @@
     }
     var mp=(scope.anchor==='today')?(ctx.todayParts||ctx.maxParts):ctx.maxParts;
     if(!mp)return null;
+    if(scope.unit==='week'&&scope.anchor==='today'&&ctx.todayParts){
+      // 周的自然今天锚 = 今天的 ISO 周（不是「本月」）；todayParts 必须带 d。
+      var dt=new Date(ctx.todayParts.y,(ctx.todayParts.mo||1)-1,ctx.todayParts.d||1);
+      var day=(dt.getDay()+6)%7;dt.setDate(dt.getDate()-day+3);
+      var ft=new Date(dt.getFullYear(),0,4);var fd=(ft.getDay()+6)%7;ft.setDate(ft.getDate()-fd+3);
+      mp={y:dt.getFullYear(),mo:1+Math.round((dt-ft)/(7*86400000)),d:0,prec:'week'};
+    }
+    // 单位错配守卫：ctx.maxParts 恒是数据本身的部件（今天锚也用它核对形状）——
+    // 月列声明 unit:week（或周列声明 month）时键空间不可比，宁可整段不裁 + 告警
+    // 一次，也绝不悄悄裁没整列。裸周列（无年份，y=0）+ 自然今天锚同闸：今天锚的
+    // 周键带真实年份（2026-W41），裸周键全在 y=0 空间——k<min 恒成立会把整列
+    // 悄悄裁空（2026-10-11 审视；数据锚不受影响，裸周在 y=0 空间内自洽）。
+    if(ctx.maxParts&&((scope.unit==='week')!==(ctx.maxParts.prec==='week')
+      ||(scope.unit==='week'&&scope.anchor==='today'&&!(ctx.maxParts.y>=1)))){
+      if(!__scopeUnitWarned){__scopeUnitWarned=true;console.warn('[ai-report] 展示范围单位与该列时间形状不一致，范围未生效（unit='+scope.unit+'，列='+((scope&&scope.col)||'')+'）');}
+      return null;
+    }
     var n=Math.max(1,Number(scope.n)||1);
     return {min:partsKey(shiftParts(mp,-(n-1),scope.unit)),max:null};
   }
@@ -2970,6 +3005,18 @@
     if((Number(rowDims)||1)>1)return '趋势列只支持单行维的交叉矩阵/分组表：多行维（3D/嵌套/ND）行尾趋势的分组口径未定义，暂不提供。';
     return '';
   }
+  // 列历序比较器（单一实现，2026-10-11 收敛 mmChrono/timeCmp3/timeCmp/spark 四份
+  // 内联副本）：dateParts 部件序（年月 → 日），周部件走 partsKey 周键空间——月空间
+  // y*12 会让 2026-W01 排到 2025-W52 前（真机：周交叉表清除范围后列序跨年乱序）。
+  function dateChronoCmp(a,b){
+    var pa=null,pb=null;
+    try{pa=adapter.dateParts(a);}catch(e){pa=null;}
+    try{pb=adapter.dateParts(b);}catch(e){pb=null;}
+    if(!pa&&!pb)return 0;
+    if(!pa)return 1;
+    if(!pb)return -1;
+    return partsKey(pa)-partsKey(pb)||((pa.d||0)-(pb.d||0));
+  }
   // 列历序比较器（分组布局用）：dateParts 部件序（年月 → 日），与矩阵分支 timeCmp
   // 同式；解析失败的值排最后（保持数据，绝不丢弃）。
   function sparkChronoCmp(partsFn){
@@ -2980,7 +3027,7 @@
       if(!pa&&!pb)return 0;
       if(!pa)return 1;
       if(!pb)return -1;
-      return (pa.y*12+(pa.mo-1))-(pb.y*12+(pb.mo-1))||((pa.d||0)-(pb.d||0));
+      return partsKey(pa)-partsKey(pb)||((pa.d||0)-(pb.d||0));
     };
   }
   // 值序列消毒：非有限值（null/''/脏串）→ null（断线点）。
@@ -3310,10 +3357,9 @@
     if(snap&&snap.rows&&snap.rows.length){snap.filename='明细数据.'+fmt;write();return;}
     finish(dataset.rows||[]);
   }
-  // ---- 表格工具条（阅读态可交互）：分页 / 排序 / 筛选摘要 / 导出下拉 ----------
+  // ---- 表格工具条（阅读态可交互）：分页 / 排序 / 导出下拉 --------------------
   // 用户决策：分页与导出同一行（工具条内）；导出合并成一个下拉（Excel / CSV）；
-  // 聚合表不再有「筛选 Dimension」输入框（筛选只在表头漏斗里）。
-  function tableFilterCount(filters){return Object.keys(filters||{}).length;}
+  // 筛选入口收敛后工具条不再有筛选类按钮（2026-10-10）。
   // 导出下拉：一个按钮弹出两项。onXlsx/onCsv 由调用方按当前模式（聚合/明细）注入。
   function openTableExportPop(anchor,onXlsx,onCsv){
     if(!anchor)return;
@@ -3327,20 +3373,19 @@
   }
   function exportMenuBtnHtml(){return '<button type="button" class="ai-report-secondary ai-tbl-tool" data-export-menu title="导出当前视图（筛选+排序后）">导出 ▾</button>';}
   function tableToolsBar(chart,settings,filters,pagerHtml){
-    var n=tableFilterCount(filters);
     var levels=effectiveSortLevels(tableSortLevelsOf(settings,null),sessionViewOf(chart));
     // 可发现性（P3 §3.4）：勾了明细视图的聚合表卡头常驻「点击行看明细」徽标，
     // 首次使用（drillToDetailPairs）后本会话淡出。
     var jumpNote=(chart&&chart.viewType==='table'&&tableModeOf(chart)==='aggregate'&&tblJumpEnabled(chart)&&!chart.__drillNoteOff)
       ?'<span class="ai-row-drill-note" title="该卡勾选了明细视图：点击任意数据行，可按该行的维度值筛选查看明细">⤵ 点击行看明细</span>':'';
-    // WP-10 会话视图态：「筛选」= 多条件 AND 管理面板（编辑/读者都给——提交按状态
-    // 分流）；「字段」= 读者字段自选面板（仅预览/阅读态；编辑态作者走设置面板）。
+    // 筛选通道收敛（2026-10-10 用户裁决）：表格工具条不再提供「筛选」入口——读者
+    // 筛选只有卡头「筛选 ▾」常驻条（多选）；列级数据范围限制 = 作者在配置面
+    // （面板筛选区 / 编辑态列头漏斗）写 columnFilters/dimScopes。旧 AND 多条件
+    // 面板（openTableFiltersPanel）整体退役。
     return '<div class="ai-table-tools">'
       +(pagerHtml||'')
       +(pagerHtml?'<span class="ai-table-tools-sep"></span>':'')
       +'<button type="button" class="ai-report-secondary ai-tbl-tool" data-tbl-sort-open title="排序">排序'+(levels.length>1?' · '+levels.length:'')+'</button>'
-      +'<button type="button" class="ai-report-secondary ai-tbl-tool'+(n?' ai-tbl-filter-chip is-active':'')+'" data-tbl-filters-open title="筛选条件（多条件 AND 组合）">筛选'+(n?' · '+n:'')+'</button>'
-      +(n?('<button type="button" class="ai-report-secondary ai-tbl-tool ai-tbl-filter-chip is-active" data-tbl-clear-filters title="清除全部列筛选（'+n+' 个生效）">✕</button>'):'')
       +(readerMode()?'<button type="button" class="ai-report-secondary ai-tbl-tool" data-tbl-fields-open title="选择显示的字段与顺序（仅本次查看生效，不保存）">字段</button>':'')
       +jumpNote
       // WP-2：export.enabled=false → 「导出」入口整体隐藏（含前置分隔线）。
@@ -3407,11 +3452,10 @@
     return '<div class="ai-report-table-bar">'+(modeBar||'')+(toolsHtml||'')+'</div>';
   }
   // 明细工具条（用户决策）：「搜索框 / 按 X 排序 / 升降序按钮」全部删掉——
-  // 排序 = 点表头（单级快捷，带 ▲▼ 指示），筛选 = 点表头漏斗（值域/区间）；
+  // 排序 = 点表头（单级快捷，带 ▲▼ 指示），筛选 = 编辑态点表头漏斗（值域/区间）；
   // 分页与导出同一行；导出是一个下拉（Excel / CSV）；本地可编辑数据源额外给「＋ 新增行」。
   function detailToolbarHtml(opts){
     opts=opts||{};
-    var n=tableFilterCount(opts.filters||{});
     var levels=opts.levels||[];
     var pager=opts.pager||'';
     // WP-2：export.enabled=false → 卡头「导出」入口整体隐藏（含前置分隔线）。
@@ -3433,14 +3477,17 @@
       +(pager?'<span class="ai-table-tools-sep"></span>':'')
       +addBtn
       +'<button type="button" class="ai-report-secondary ai-tbl-tool" data-tbl-sort-open title="多级排序（点表头 = 单级快捷排序）">排序'+(levels.length>1?' · '+levels.length:'')+'</button>'
-      +(n?('<button type="button" class="ai-report-secondary ai-tbl-tool ai-tbl-filter-chip is-active" data-tbl-clear-filters title="清除全部列筛选（'+n+' 个生效）">筛选 · '+n+' ✕</button>'):'')
       +statsBtn
       +fieldsBtn
       +(canExport?'<span class="ai-table-tools-sep"></span>'+exportMenuBtnHtml():'')
       +'</div>';
   }
   // 列头漏斗按钮：无筛选常显（暗示可点），有筛选高亮 accent。
+  // 筛选通道收敛（2026-10-10）：漏斗是**作者配置数据范围**的入口（写 columnFilters，
+  // 对整卡生效）——只在实际可落盘的编辑/预览编辑态渲染；读者态不出现（读者筛选
+  // 走卡头「筛选 ▾」常驻条，多选）。
   function colFilterBtnHtml(col,filters,ctx){
+    if(readerMode())return '';
     var on=filters&&filters[col];
     var lb=escapeHtml(ctx?colAliasOf(ctx,col):col);
     return '<button type="button" class="ai-col-fbtn'+(on?' is-active':'')+'" data-col-filter="'+escapeHtml(col)+'" title="筛选「'+lb+'」" aria-label="筛选「'+lb+'」">▾</button>';
@@ -3760,56 +3807,11 @@
     var body=vs.length>3?(head+' 等 '+vs.length+' 项'):head;
     return spec.not===true?('排除 '+body):body;
   }
-  function openTableFiltersPanel(anchor,chart){
-    if(!anchor||!chart)return;
-    // renderChart 是异步的（server 模式必现）：删/增条件后按钮随卡片重渲染被拆，
-    // 立即 reopen 会查不到按钮、面板静默不重开 —— 有界重试等重渲染完成。
-    function reopen(tries){
-      var block=document.querySelector('[data-report-block-id="'+CSS.escape(chart.blockId)+'"]');
-      var btn=block?block.querySelector('[data-tbl-filters-open]'):null;
-      if(btn){openTableFiltersPanel(btn,chart);return;}
-      if((tries||0)<40)setTimeout(function(){reopen((tries||0)+1);},50);
-    }
-    var settings=(chart.editor&&chart.editor.table)||{};
-    var eff=mergeTableFilters(tableColumnFiltersOf(settings),sessionFiltersOf(chart));
-    var ctx=chart.__tblCtx||{};
-    var cols=(ctx.sortCols||[]).map(function(c){return c.col;});
-    var ds=datasetById(chart.editor&&chart.editor.data&&chart.editor.data.datasetId);
-    var n=tableFilterCount(eff);
-    var activeCols=Object.keys(eff).filter(function(c){return !!eff[c];});
-    var items=activeCols.map(function(col){
-      return '<div class="ai-tbl-pop-item ai-flt-row"><span class="ai-flt-col">'+escapeHtml(colAliasOf(ds,col))+'</span>'
-        +'<span class="v">'+escapeHtml(filterSummaryText(eff[col]))+'</span>'
-        +'<button type="button" class="ai-flt-del" data-flt-del="'+escapeHtml(col)+'" title="移除该条件（读者态仅移除自己的条件）">×</button></div>';
-    }).join('');
-    var rest=cols.filter(function(c){return activeCols.indexOf(c)<0;});
-    var addRow=rest.length?('<div class="ai-flt-add"><select data-flt-col>'+rest.map(function(c){return '<option value="'+escapeHtml(c)+'">'+escapeHtml(colAliasOf(ds,c))+'</option>';}).join('')+'</select>'
-      +'<button type="button" class="ai-report-secondary" data-flt-add>＋ 添加条件</button></div>'):'<div class="ai-tbl-pop-hint">所有字段都已有条件</div>';
-    var pop=mountTablePop(anchor,'<div class="ai-tbl-pop-head"><span>筛选'+(n?' · '+n+' 个条件':'')+'</span><button type="button" class="ai-detail-style-close" data-tbl-pop-close title="关闭">×</button></div>'
-      +'<div class="ai-tbl-pop-hint">多个条件同时生效（AND 组合）'+(readerMode()?'；仅本次查看生效，不保存到报告。':'。')+'</div>'
-      +'<div class="ai-tbl-pop-body"><div class="ai-tbl-pop-list">'+(items||'<div class="ai-tbl-pop-hint">暂无条件</div>')+'</div>'+addRow+'</div>'
-      +'<div class="ai-tbl-pop-foot"><button type="button" class="ai-report-secondary" data-flt-clearall'+(n?'':' disabled')+'>清除全部</button><button type="button" class="ai-report-primary" data-tbl-pop-close2>完成</button></div>');
-    bindPopClose(pop);
-    pop.querySelector('[data-tbl-pop-close2]').addEventListener('click',closeTablePop);
-    pop.addEventListener('click',function(ev){
-      var del=ev.target.closest?ev.target.closest('[data-flt-del]'):null;
-      if(del){commitTableColumnFilter(chart,del.getAttribute('data-flt-del'),null);closeTablePop();reopen();return;}
-      var add=ev.target.closest?ev.target.closest('[data-flt-add]'):null;
-      if(add){
-        var col=pop.querySelector('[data-flt-col]').value;
-        if(!col)return;
-        openTableFilterPop(add,chart,{col:col,kind:ctx.colKind?ctx.colKind(col):'values',getDomain:function(){return ctx.colDomain?ctx.colDomain(col):[];},onCommit:function(spec){commitTableColumnFilter(chart,col,spec);reopen();}});
-        return;
-      }
-      var ca=ev.target.closest?ev.target.closest('[data-flt-clearall]'):null;
-      if(ca&&!ca.disabled){
-        if(readerMode()){var svC=ensureSessionView(chart);if(svC)delete svC.filters;}
-        else{chart.editor=chart.editor||{};chart.editor.table=chart.editor.table||{};chart.editor.table.columnFilters={};chart.editor.table.page=0;syncManifest();}
-        renderChart(chart);closeTablePop();reopen();
-      }
-    });
-  }
   // ---- BI-H5：维度自定义顺序弹层 ------------------------------------------
+  // openTableFiltersPanel（WP-10 多条件 AND 面板）已随表格工具条「筛选」按钮退役
+  // （2026-10-10 筛选通道收敛）：读者筛选只有卡头「筛选 ▾」常驻条；列级数据范围
+  // 限制 = 作者配置（columnFilters/dimScopes，编辑态漏斗/面板筛选区）。
+  // 列头漏斗弹层 openTableFilterPop 保留——它是配置面的值域/区间编辑器。
   // 列出该维度值域（既有自定义顺序优先，其后接值域剩余项），↑/↓ 调整；「确定」
   // 写 editor.data.sortOrder[dim]（chart-adapter.sortEntries 的最优先通道，
   // 聚合表经 applyCustomSortOrder 同语义）；「恢复默认」删键。
@@ -4080,6 +4082,10 @@
   function renderTableError(chart,version,error){renderDataError(chart,version,error,'表格数据加载失败');}
   async function showTableBody(chart,version){
     var host=document.getElementById(chart.elementId);if(!host)return;
+    // 常驻筛选条挂点（表格路径专属）：renderCardFilterBar 原先只在 echarts 分支
+    // （6243）与 renderAll 调用——表格卡经 renderChart 直入本函数，外部触发的
+    // 重渲（探针/撤销/面板提交）不会刷新常驻条。空 columns 时它自己负责摘除。
+    renderCardFilterBar(chart.blockId);
     var data=ensureEditorData(chart);
     if(!data){if(renderVersions.get(chart)===version)host.innerHTML='<div class="ai-report-empty">此图表没有可用于表格展示的数据</div>';return;}
     var measures=data.measures||[],settings=chart.editor.table||{};
@@ -4326,7 +4332,7 @@
         return true;
       });
       var pipeToday=new Date();
-      rows=applyDimScopes(rows,dimScopes.filter(function(sc){var sc0=sc&&sc.col;return sc0===bd||sc0===data.dimension;}),pipeVal,pipeParts,{y:pipeToday.getFullYear(),mo:pipeToday.getMonth()+1});
+      rows=applyDimScopes(rows,dimScopes.filter(function(sc){var sc0=sc&&sc.col;return sc0===bd||sc0===data.dimension;}),pipeVal,pipeParts,{y:pipeToday.getFullYear(),mo:pipeToday.getMonth()+1,d:pipeToday.getDate()});
     }
     // Excel 式阅读态：先列筛选（值域/区间），再多级排序，最后 TOP-N（与 Excel 语义一致）。
     // ②读者快捷过滤（WP-10）：会话过滤与作者 columnFilters 逐列合并（同列读者覆盖）。
@@ -4400,7 +4406,7 @@
       });
       var pfnN=function(v){try{return adapter.dateParts(v);}catch(e){return null;}};
       var tdN=new Date();
-      ndRows=applyDimScopes(ndRows,dimScopes,ndColValOf,pfnN,{y:tdN.getFullYear(),mo:tdN.getMonth()+1});
+      ndRows=applyDimScopes(ndRows,dimScopes,ndColValOf,pfnN,{y:tdN.getFullYear(),mo:tdN.getMonth()+1,d:tdN.getDate()});
       if(Object.keys(tblClientFilters).length)ndRows=ndRows.filter(function(r){return tableRowMatchesFilters(r,tblClientFilters,ndColValOf);});
       if(data&&data.topK>0&&ndRows&&ndRows.length>data.topK)ndRows=applyTableTopN(ndRows,data.topK,true);
       ndRows=sortRowsByLevels(ndRows,effectiveSortLevels(tableSortLevelsOf(tbl,measures[0]||_tblDims[0]),sessionViewOf(chart)),ndColValOf);
@@ -4513,7 +4519,7 @@
         return true;
       });
       var nfToday=new Date();
-      nfRows=applyDimScopes(nfRows,dimScopes,nfColVal,nfParts,{y:nfToday.getFullYear(),mo:nfToday.getMonth()+1});
+      nfRows=applyDimScopes(nfRows,dimScopes,nfColVal,nfParts,{y:nfToday.getFullYear(),mo:nfToday.getMonth()+1,d:nfToday.getDate()});
       if(Object.keys(tblClientFilters).length)nfRows=nfRows.filter(function(r){return tableRowMatchesFilters(r,tblClientFilters,nfColVal);});
       // 行序：d1 恒为主键；3 维时 d2/d3 也升序前置（组合相邻、d2 run 合并不散段），
       // 作者 sortLevels 仍可覆盖段内次序。
@@ -4916,6 +4922,8 @@
         // 函数作用域绑定要到声明语句被执行才赋值，3D 路径提前 return，
         // 放在后面会让 mThCell 在 3D 渲染时是 undefined（真机：table-render-error）。
         function mBdBtn(c){
+          // 筛选通道收敛：漏斗是作者配置入口，读者态不出（与 colFilterBtnHtml 同一门控）。
+          if(readerMode())return '';
           var _bk=c;
           var _on=tblFilters[bd]&&tblFilters[bd].type==='values'&&tblFilters[bd].values.indexOf(_bk)>=0;
           return '<button type="button" class="ai-col-fbtn'+(_on?' is-active':'')+'" data-col-filter="'+escapeHtml(bd)+'" data-bd-value="'+escapeHtml(c)+'" title="筛选「'+escapeHtml(colAliasOf(data,bd))+' = '+(c===''?'(空白)':escapeHtml(valDisp(ds2,bd,c)))+'」" aria-label="筛选「'+escapeHtml(colAliasOf(data,bd))+' = '+(c===''?'(空白)':escapeHtml(valDisp(ds2,bd,c)))+'」">▾</button>';
@@ -5064,7 +5072,7 @@
           });
           var pfnM=function(v){try{return adapter.dateParts(v);}catch(e){return null;}};
           var tdM=new Date();
-          rowsM=applyDimScopes(rowsM,dimScopes,colValM,pfnM,{y:tdM.getFullYear(),mo:tdM.getMonth()+1});
+          rowsM=applyDimScopes(rowsM,dimScopes,colValM,pfnM,{y:tdM.getFullYear(),mo:tdM.getMonth()+1,d:tdM.getDate()});
           if(Object.keys(tblClientFilters).length)rowsM=rowsM.filter(function(r){return tableRowMatchesFilters(r,tblClientFilters,colValM);});
           // 行序：d1 恒为主键（组合连续、合并格不错位），段内按 sortLevels/自定义顺序。
           // 列维的取值序不在行集上排（旧 mmBd 行排序已删）——统一走下方
@@ -5091,14 +5099,14 @@
           var nonAddM=function(m){return adapter.nonAdditiveMeasure(data,m);};
           var mtmM=matrixTableModelMulti(rowsM,measures,{pageRows:pageRowsM,nonAdditive:nonAddM});
           // 列序管道·嵌套泛化（§3.4）：每层列维独立排序——sortOrder 自定义 > 时间
-          // chrono（dateParts 部件序）> 行序首现；外层优先分组、内层在外层段内排序。
-          // 单列维时与 orderMatrixCols 同语义（bdCols 为组合键，split 恒按层拆）。
-          var mmChrono=function(a,b){var pa=adapter.dateParts(a),pb=adapter.dateParts(b);if(!pa&&!pb)return 0;if(!pa)return 1;if(!pb)return -1;return (pa.y*12+(pa.mo-1))-(pb.y*12+(pb.mo-1))||((pa.d||0)-(pb.d||0));};
+          // chrono（dateChronoCmp 部件序，周安全）> 行序首现；外层优先分组、内层在
+          // 外层段内排序。单列维时与 orderMatrixCols 同语义（bdCols 为组合键，split
+          // 恒按层拆）。
           var mmLayers=mmColDims.map(function(c){
             var _rk=((data&&data.sortOrder)||{})[c];
             var _kind=adapter.dimensionKind(data,c);
             return {rank:(_rk&&_rk.length)?(function(l){var r={};l.forEach(function(v,i){r[String(v)]=i;});return r;})(_rk):null,
-                    timeCmp:(_kind==='time'||_kind==='ordinal')?mmChrono:null};
+                    timeCmp:dateChronoCmp};
           });
           mtmM.bdCols=orderMatrixColsNested(mtmM.bdCols,{layers:mmLayers,split:function(k){return bdComboSplit(k,mmColDims.length);}});
           var mhpM=matrixHeaderPlan(mtmM.bdCols,measures,{rank:!!settings.showRank,rowTotal:mmRowTotal,totalLabel:mmTotalLabel,rankText:rankLabelOf(settings),dim2:mmRowN>1,dim3:mmRowN>2,dimText:colAliasOf(data,_mmRows[0]),dim2Text:mmRowN>1?colAliasOf(data,_mmRows[1]):undefined,dim3Text:mmRowN>2?colAliasOf(data,_mmRows[2]):undefined,bdDims:mmColDims.length,bdDimCols:mmColDims,mnValuesDim:mmHasMNRow,mnMounted:mmMnMounted,measureNameRow:(settings.measureNameRow!==false),measureText:function(m){return colAliasOf(data,m);},subs:subPlan});
@@ -5274,7 +5282,7 @@
           });
           var pfn3=function(v){try{return adapter.dateParts(v);}catch(e){return null;}};
           var td3=new Date();
-          rows3=applyDimScopes(rows3,dimScopes,colVal3,pfn3,{y:td3.getFullYear(),mo:td3.getMonth()+1});
+          rows3=applyDimScopes(rows3,dimScopes,colVal3,pfn3,{y:td3.getFullYear(),mo:td3.getMonth()+1,d:td3.getDate()});
           if(Object.keys(tblClientFilters).length)rows3=rows3.filter(function(r){return tableRowMatchesFilters(r,tblClientFilters,colVal3);});
           // 行序：d1 恒为主键（保证区域分组连续、合并格不错位），段内按 sortLevels/
           // 自定义顺序排；sortOrder 对 d1/d2/列维各自同权。
@@ -5305,7 +5313,7 @@
           var timeCmp3=null;
           var bdKind3=adapter.dimensionKind(data,bd);
           if(bdKind3==='time'||bdKind3==='ordinal'){
-            timeCmp3=function(a,b){var pa=adapter.dateParts(a),pb=adapter.dateParts(b);if(!pa&&!pb)return 0;if(!pa)return 1;if(!pb)return -1;return (pa.y*12+(pa.mo-1))-(pb.y*12+(pb.mo-1))||((pa.d||0)-(pb.d||0));};
+            timeCmp3=dateChronoCmp;
           }
           mtm.bdCols=orderMatrixCols(mtm.bdCols,{rank:(bdRank3&&bdRank3.length)?(function(l){var r={};l.forEach(function(v,i){r[String(v)]=i;});return r;})(bdRank3):null,timeCmp:timeCmp3});
           var mhp=matrixHeaderPlan(mtm.bdCols,measures,{rank:!!settings.showRank,rowTotal:mRowTotal,totalLabel:mTotalLabel,rankText:rankLabelOf(settings),dim2:true,dimText:colAliasOf(data,data.dimension),dim2Text:colAliasOf(data,d2Dim),measureNameRow:(settings.measureNameRow!==false),mnMounted:mnMountedOf(data),measureText:function(m){return colAliasOf(data,m);},subs:subPlan});
@@ -5413,7 +5421,7 @@
         // 列序管道（P1）：sortOrder[bd] 自定义 > 时间 chrono > 行序首现。
         var bdRank=((data&&data.sortOrder)||{})[bd];
         var bdKind=adapter.dimensionKind(data,bd);
-        var timeCmp=(bdKind==='time'||bdKind==='ordinal')?function(a,b){var pa=adapter.dateParts(a),pb=adapter.dateParts(b);if(!pa&&!pb)return 0;if(!pa)return 1;if(!pb)return -1;return (pa.y*12+(pa.mo-1))-(pb.y*12+(pb.mo-1))||((pa.d||0)-(pb.d||0));}:null;
+        var timeCmp=(bdKind==='time'||bdKind==='ordinal')?dateChronoCmp:null;
         mtm.bdCols=orderMatrixCols(mtm.bdCols,{rank:(bdRank&&bdRank.length)?(function(l){var r={};l.forEach(function(v,i){r[String(v)]=i;});return r;})(bdRank):null,timeCmp:timeCmp});
         // WP-9 迷你图趋势列（1D 矩阵）：门 = 列区是时间维（tblColIsTime：值探针 +
         // dataset 列类型双判据）+ 单行维（此分支恒 1，3D 已在上方 return）。
@@ -7108,10 +7116,6 @@
           refetch();
         }});
         return;}
-      var cf=ev.target.closest('[data-tbl-clear-filters]');
-      if(cf){
-        if(readerMode()){var svCd=ensureSessionView(chart);if(svCd)delete svCd.filters;refetch();return;}
-        chart.editor=chart.editor||{};chart.editor.table=chart.editor.table||{};chart.editor.table.columnFilters={};syncManifest();refetch();return;}
       var xx=ev.target.closest('[data-export-menu]');
       if(xx){openTableExportPop(xx,function(){exportDetailData(chart,dataset,cols,numSet,'xlsx');},function(){exportDetailData(chart,dataset,cols,numSet,'csv');});return;}
       var dsh=ev.target.closest?ev.target.closest('th[data-detail-sort]'):null;
@@ -7209,10 +7213,6 @@
           rerenderDetail(host,chart,dataset,cols);
         }});
         return;}
-      var cf=ev.target.closest('[data-tbl-clear-filters]');
-      if(cf){
-        if(readerMode()){var svCl=ensureSessionView(chart);if(svCl)delete svCl.filters;rerenderDetail(host,chart,dataset,cols);return;}
-        chart.editor=chart.editor||{};chart.editor.table=chart.editor.table||{};chart.editor.table.columnFilters={};syncManifest();rerenderDetail(host,chart,dataset,cols);return;}
       var xx=ev.target.closest('[data-export-menu]');
       if(xx){openTableExportPop(xx,function(){exportDetailData(chart,dataset,cols,numSet,'xlsx');},function(){exportDetailData(chart,dataset,cols,numSet,'csv');});return;}
       var dsh=ev.target.closest?ev.target.closest('th[data-detail-sort]'):null;
@@ -9624,6 +9624,7 @@
     var ds=data&&data.datasetId?datasets.get(data.datasetId):null;
     return ds?(adapter.dimensionColumns(ds)||[]):[];
   }
+  // 候选值域（未收窄）：singlefile 内存去重 / server fetchColumnValues。截断在收窄之后。
   function cardFilterValues(data,col){
     var ds=data&&data.datasetId?datasets.get(data.datasetId):null;
     if(!ds)return Promise.resolve([]);
@@ -9631,20 +9632,67 @@
       var cols=(ds.columns||[]).map(function(c){return typeof c==='object'?c.name:c;});
       var i=cols.indexOf(col),seen={},out=[];
       ds.rows.forEach(function(r){var v=r[i];var k=String(v==null?'':v);if(v!=null&&v!==''&&!seen[k]){seen[k]=1;out.push(v);}});
-      return Promise.resolve(out.slice(0,300));
+      return Promise.resolve(out);
     }
     return adapter.fetchColumnValues(ds.id||ds.datasetId,col).catch(function(){return [];});
   }
+  // 内层限制（2026-10-10 筛选通道收敛）：配置级的数据范围限制——被它排除的值，
+  // 外层（卡头筛选条）不得再提供。三层：①声明 filters（请求/编译烘进 editor.data.filter；
+  // KPI 无 editor.data，走 manifest.filters）②作者列筛选 columnFilters（编辑态漏斗/面板）
+  // ③维度取值范围 dimScopes（值域/时间范围）。只取**同列**条目（跨列级联是筛选卡的
+  // 既有能力，这里不做——外层自身的选择也不收窄自己的选项，facet 语义）。
+  function cardFilterRestrictions(tgt,col){
+    var data=tgt.data;
+    var declaredSrc=tgt.chart?((data&&data.filter)||[]):kpiDeclaredFilters();
+    var declared=(declaredSrc||[]).filter(function(f){return f&&!f.dimensionKey&&f.column===col;});
+    var t=(tgt.chart&&tgt.chart.editor&&tgt.chart.editor.table)||{};
+    var cf=tableColumnFiltersOf(t)[col]||null;
+    var scope=null;
+    tableDimScopesOf(t).some(function(s){if(s.col===col){scope=s;return true;}return false;});
+    return {declared:declared,colFilter:cf,scope:scope};
+  }
+  // 应用内层限制到候选值域：声明谓词走 adapter.filteredRows（matchFilter 单源语义，
+  // 与服务端 _filter_clause 三端一致）；列筛选走 matchColumnFilter（排除/空白哨兵同源）；
+  // 时间范围走 resolveDateScopeKeys 部件空间（与 showTableBody 的 applyDimScopes 同一份）。
+  function cardFilterApplyInner(values,restr){
+    var out=(values||[]).slice();
+    var d=(restr&&restr.declared)||[];
+    if(d.length&&out.length&&typeof adapter.filteredRows==='function'){
+      var kept=adapter.filteredRows({rows:out.map(function(v){return [v];}),columns:['__cf_val__'],
+        filter:d.map(function(f){return {column:'__cf_val__',op:f.op,value:f.value};})});
+      out=kept.map(function(r){return r[0];});
+    }
+    if(restr&&restr.colFilter)out=out.filter(function(v){return matchColumnFilter(restr.colFilter,v);});
+    var sc=restr&&restr.scope;
+    if(sc){
+      if(sc.kind==='values'){
+        var set={};(sc.values||[]).forEach(function(v){set[String(v)]=1;});
+        if(Object.keys(set).length)out=out.filter(function(v){return set[String(v)];});
+      }else{
+        var partsFn=function(v){try{return adapter.dateParts?adapter.dateParts(v):null;}catch(e){return null;}};
+        var maxP=null;
+        out.forEach(function(v){var p=partsFn(v);if(p&&(!maxP||partsKey(p)>partsKey(maxP)))maxP=p;});
+        var td=new Date();
+        var keys=resolveDateScopeKeys(sc,{maxParts:maxP,todayParts:{y:td.getFullYear(),mo:td.getMonth()+1,d:td.getDate()},partsFn:partsFn});
+        if(keys)out=applyDateScopeRows(out,keys,function(v){return v;},partsFn);
+      }
+    }
+    return out;
+  }
   var __cardFilterValsCache={};
-  function cardFilterVals(data,col){
-    var key=(data&&data.datasetId||'x')+'|'+col;
+  // 缓存键带内层限制签名：漏斗/dimScopes/声明 filters 一变，同一列的收窄值域必须失效。
+  function cardFilterVals(tgt,col){
+    var restr=cardFilterRestrictions(tgt,col);
+    var key=(tgt.data&&tgt.data.datasetId||'x')+'|'+col+'|'+JSON.stringify(restr);
     if(__cardFilterValsCache[key])return Promise.resolve(__cardFilterValsCache[key]);
-    return cardFilterValues(data,col).then(function(vs){__cardFilterValsCache[key]=vs||[];return vs||[];});
+    return cardFilterValues(tgt.data,col).then(function(vs){
+      var narrowed=cardFilterApplyInner(vs||[],restr).slice(0,300);
+      __cardFilterValsCache[key]=narrowed;return narrowed;});
   }
   function cardFilterTarget(blockId){
     var ch=chartForBlock(blockId);
-    if(ch){ch.editor=ch.editor||{};if(!ch.editor.data)ch.editor.data=(adapter.inferEditorData?adapter.inferEditorData(ch)||{}:{});var d=ch.editor.data;if(!d.cardFilter)d.cardFilter={columns:[],filters:[]};return {el:document.querySelector('[data-report-block-id="'+CSS.escape(blockId)+'"]'),data:d};}
-    var mi=kpiIndexForBlock(blockId);if(mi>=0){var kp=(manifest.kpis||[])[mi];if(kp){if(!kp.cardFilter)kp.cardFilter={columns:[],filters:[]};return {el:document.querySelector('[data-report-block-id="'+CSS.escape(blockId)+'"]'),data:kp};}}
+    if(ch){ch.editor=ch.editor||{};if(!ch.editor.data)ch.editor.data=(adapter.inferEditorData?adapter.inferEditorData(ch)||{}:{});var d=ch.editor.data;if(!d.cardFilter)d.cardFilter={columns:[],filters:[]};return {el:document.querySelector('[data-report-block-id="'+CSS.escape(blockId)+'"]'),data:d,chart:ch};}
+    var mi=kpiIndexForBlock(blockId);if(mi>=0){var kp=(manifest.kpis||[])[mi];if(kp){if(!kp.cardFilter)kp.cardFilter={columns:[],filters:[]};return {el:document.querySelector('[data-report-block-id="'+CSS.escape(blockId)+'"]'),data:kp,chart:null};}}
     return null;
   }
   function afterCardFilterChange(blockId){syncManifest();if(kpiIndexForBlock(blockId)>=0){refreshKPIs();}else{var ch=chartForBlock(blockId);if(ch)renderChart(ch);}renderCardFilterBar(blockId);}
@@ -9702,6 +9750,23 @@
       var st=global.__AI_REPORT_FILTERS__[id];
       if(st){st.filters=[];touched[id]=1;}
     });
+    // 卡头常驻条的值选择（2026-10-10 双层模型的外层）写在各卡 data.cardFilter.filters
+    // ——activeFilterCount 把它计入「已生效 N 个筛选条件」，这里不清空的话，空态卡上的
+    // 「清除筛选」点了没反应（同一张卡死在空态，2026-10-11 审视；与上方区间控件
+    // 「清值留框被 collectAndApply 装回去」是同一类读者逃生门失灵）。columns 保留
+    // （维度常驻是作者的配置，值选择才是读者的会话态）。渲染由下方 renderAll/
+    // refreshKPIs 统一接手（常驻条随 renderCardFilterBar 重挂）。
+    (manifest.charts||[]).forEach(function(ch){
+      var d=ch&&ch.editor&&ch.editor.data;
+      if(d&&d.cardFilter&&Array.isArray(d.cardFilter.filters)&&d.cardFilter.filters.length&&ch.blockId){
+        d.cardFilter.filters=[];touched[ch.blockId]=1;
+      }
+    });
+    (manifest.kpis||[]).forEach(function(kp){
+      if(kp&&kp.cardFilter&&Array.isArray(kp.cardFilter.filters)&&kp.cardFilter.filters.length&&kp.blockId){
+        kp.cardFilter.filters=[];touched[kp.blockId]=1;
+      }
+    });
     // 每张卡各自 apply（collectAndApply 读的是隐藏 select，所以先把 DOM 复位再做）。
     Object.keys(touched).forEach(function(bid){
       try{
@@ -9748,6 +9813,62 @@
       +escapeHtml(txt)+'</span>';
     host.parentNode.insertBefore(note,host.nextSibling);
   }
+  // 多选弹层（每卡每维一个打开实例）：外点关闭。勾选即提交（改值即时重聚合，
+  // 与筛选卡多选菜单同一交互）。提交形状 {column,op:'in',value:[原值…]}——空选 =
+  // 移除该列条件（= 全部）。
+  function closeCardFilterMenus(){document.querySelectorAll('.ai-card-filter-menu').forEach(function(m){if(m.parentNode)m.parentNode.removeChild(m);});}
+  function commitCardFilterCol(tgt,blockId,col,vals){
+    var data=tgt.data;
+    var nf=(data.cardFilter.filters||[]).filter(function(x){return x.column!==col;});
+    if(vals&&vals.length)nf.push({column:col,op:'in',value:vals});
+    data.cardFilter.filters=nf;afterCardFilterChange(blockId);
+  }
+  function openCardFilterMenu(blockId,col,btn,curVals){
+    var tgt=cardFilterTarget(blockId);if(!tgt)return;
+    var old=document.querySelector('.ai-card-filter-menu[data-cf-menu-for="'+CSS.escape(col)+'"]');
+    if(old&&old.parentNode){old.parentNode.removeChild(old);return;} // toggle
+    closeCardFilterMenus();
+    var fds=datasetById(tgt.data.datasetId)||tgt.data;
+    var menu=document.createElement('div');menu.className='ai-report-filter-multimenu ai-card-filter-menu';
+    menu.setAttribute('data-cf-menu-for',col);
+    menu.setAttribute('data-ai-runtime-transient','true');
+    var r=btn.getBoundingClientRect();menu.style.top=(r.bottom+4)+'px';menu.style.left=Math.max(0,Math.min(r.left,global.innerWidth-260))+'px';
+    var box=document.createElement('div');box.className='ai-report-filter-multi-box';
+    var searchRow=document.createElement('div');searchRow.className='ai-scope-search-row';
+    var searchInp=document.createElement('input');searchInp.type='text';searchInp.className='ai-scope-search';
+    searchInp.placeholder='搜索值…';searchInp.setAttribute('aria-label','搜索值');
+    searchInp.addEventListener('input',function(){
+      var q=String(searchInp.value||'').trim().toLowerCase();
+      box.querySelectorAll('label').forEach(function(lab){lab.style.display=(!q||String(lab.textContent||'').toLowerCase().indexOf(q)>=0)?'':'none';});
+    });
+    searchRow.appendChild(searchInp);box.appendChild(searchRow);
+    var head=document.createElement('div');head.className='ai-report-filter-multi-head';
+    function checkedVals(){return Array.prototype.slice.call(box.querySelectorAll('input[type="checkbox"]:checked')).map(function(x){return x.__cfVal;});}
+    function setLabel(){var v=checkedVals();btn.textContent=v.length?(v.length===1?valDisp(fds,col,v[0]):('已选 '+v.length+' 项')):'全部';}
+    var allBtn=document.createElement('button');allBtn.type='button';allBtn.className='ai-report-filter-multi-all';allBtn.textContent='全选';
+    allBtn.addEventListener('click',function(){box.querySelectorAll('input[type="checkbox"]').forEach(function(cb){cb.checked=true;});setLabel();commitCardFilterCol(tgt,blockId,col,checkedVals());});
+    var resetBtn=document.createElement('button');resetBtn.type='button';resetBtn.className='ai-report-filter-multi-reset';resetBtn.textContent='清空';
+    resetBtn.addEventListener('click',function(){box.querySelectorAll('input[type="checkbox"]').forEach(function(cb){cb.checked=false;});setLabel();commitCardFilterCol(tgt,blockId,col,[]);});
+    head.appendChild(allBtn);head.appendChild(resetBtn);box.appendChild(head);
+    var none=document.createElement('span');none.className='ai-report-filter-multi-none';none.textContent='加载值域…';box.appendChild(none);
+    menu.appendChild(box);
+    cardFilterVals(tgt,col).then(function(vs){
+      if(!menu.parentNode)return;
+      if(none.parentNode)none.parentNode.removeChild(none);
+      if(!vs.length){var n0=document.createElement('span');n0.className='ai-report-filter-multi-none';n0.textContent='（无可选值）';box.appendChild(n0);}
+      var curSet={};(curVals||[]).forEach(function(v){curSet[String(v)]=1;});
+      vs.forEach(function(v){
+        var lab=document.createElement('label');
+        var cb=document.createElement('input');cb.type='checkbox';cb.__cfVal=v;cb.checked=!!curSet[String(v)];
+        cb.addEventListener('change',function(){setLabel();commitCardFilterCol(tgt,blockId,col,checkedVals());});
+        lab.appendChild(cb);lab.appendChild(document.createTextNode(' '+valDisp(fds,col,v)));box.appendChild(lab);
+      });
+      setLabel();
+    });
+    var onDoc=function(ev){if(menu&&!menu.contains(ev.target)&&!btn.contains(ev.target)){if(onDoc){document.removeEventListener('mousedown',onDoc,true);onDoc=null;}if(menu.parentNode)menu.parentNode.removeChild(menu);}};
+    document.addEventListener('mousedown',onDoc,true);
+    document.body.appendChild(menu);
+  }
   function renderCardFilterBar(blockId){
     var tgt=cardFilterTarget(blockId);if(!tgt)return;
     var outer=tgt.el;if(!outer)return;
@@ -9761,26 +9882,28 @@
     var box=el.querySelector(':scope > .ai-card-filter-bar');
     if(!cols.length){if(box&&box.parentNode)box.parentNode.removeChild(box);return;}
     if(!box){box=document.createElement('div');box.className='ai-card-filter-bar';if(titleEl&&titleEl.parentNode===el)el.insertBefore(box,titleEl.nextSibling);else el.insertBefore(box,el.firstChild);try{if(typeof resizeCharts==='function')resizeCharts();}catch(e){}}
-    box.innerHTML='<span class="ai-card-filter-toggle" data-card-filter-open="1" title="配置本卡筛选">筛选 ▾</span>'
+    // 多选（2026-10-10 用户反馈：只有单选不够）：每个常驻维度一枚「值域按钮」，
+    // 点开 = 勾选列表（搜索/全选/清空），选项 = **内层限制收窄后的值域**——配置级
+    // 数据范围限制排除掉的值，读者在这里选不到。选项异步到达后按钮标签按已选刷新。
+    var fdsLbl=datasetById(data.datasetId)||data;
+    // 「筛选 ▾」= 勾选常驻维度的**作者配置入口**（双层模型：作者勾选常驻维度、
+    // 读者勾选值域）——与列头漏斗同一条 readerMode 门控（colFilterBtnHtml），
+    // 读者态不渲染：否则只读页读者可改写 cardFilter.columns（配置级状态）。
+    box.innerHTML=(editing?'<span class="ai-card-filter-toggle" data-card-filter-open="1" title="配置本卡筛选">筛选 ▾</span>':'')
       +cols.map(function(c){
-        var f=null;for(var i=0;i<fs.length;i++){if(fs[i].column===c){f=fs[i];break;}}
-        var cur=(f&&f.value&&f.value[0])||'';
-        return '<label class="ai-card-filter-item"><span class="ai-card-filter-dim">'+escapeHtml(filterDimLabel(c))+'</span><select data-card-filter-col="'+escapeHtml(c)+'"><option value="">全部</option></select>'
+        var f=null;for(var i=0;i<fs.length;i++){if(fs[i]&&fs[i].column===c){f=fs[i];break;}}
+        var n=(f&&Array.isArray(f.value))?f.value.length:0;
+        // 初始标签：无选=全部；单值=值文案（valDisp 同步）；多值=已选 N 项。
+        var lbl=n?(n===1?escapeHtml(valDisp(fdsLbl,c,f.value[0])):('已选 '+n+' 项')):'全部';
+        return '<label class="ai-card-filter-item"><span class="ai-card-filter-dim">'+escapeHtml(filterDimLabel(c))+'</span>'
+          +'<button type="button" class="ai-card-filter-val" data-card-filter-col="'+escapeHtml(c)+'">'+lbl+'</button>'
           +(editing?'<button type="button" class="ai-card-filter-rm" data-cf-rm="'+escapeHtml(c)+'" title="移除">×</button>':'')+'</label>';
       }).join('');
     cols.forEach(function(c){
-      var sel=box.querySelector('[data-card-filter-col="'+CSS.escape(c)+'"]');if(!sel)return;
-      var f=null;for(var i=0;i<fs.length;i++){if(fs[i].column===c){f=fs[i];break;}}
-      var cur=(f&&f.value&&f.value[0])||'';
-      // 选项文案走 valDisp（值别名/空值'-' 的唯一显示出口）：全局筛选卡与筛选条
-      // 都显示别名，唯独这个常驻下拉曾显示原始码值。
-      var fds=datasetById(data.datasetId)||data;
-      cardFilterVals(data,c).then(function(vs){if(!vs.length)return;vs.forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=valDisp(fds,c,v);sel.appendChild(o);});if(cur)sel.value=cur;});
-      sel.addEventListener('change',function(){
-        var nf=(data.cardFilter.filters||[]).filter(function(x){return x.column!==c;});
-        if(sel.value)nf.push({column:c,op:'in',value:[sel.value]});
-        data.cardFilter.filters=nf;afterCardFilterChange(blockId);
-      });
+      var btn=box.querySelector('[data-card-filter-col="'+CSS.escape(c)+'"]');if(!btn)return;
+      var f=null;for(var i=0;i<fs.length;i++){if(fs[i]&&fs[i].column===c){f=fs[i];break;}}
+      var cur=(f&&Array.isArray(f.value))?f.value.slice():[];
+      btn.addEventListener('click',function(e){e.stopPropagation();openCardFilterMenu(blockId,c,btn,cur);});
     });
     box.querySelectorAll('[data-cf-rm]').forEach(function(btn){btn.addEventListener('click',function(){var cc=btn.getAttribute('data-cf-rm');data.cardFilter.columns=(data.cardFilter.columns||[]).filter(function(x){return x!==cc;});data.cardFilter.filters=(data.cardFilter.filters||[]).filter(function(x){return x.column!==cc;});afterCardFilterChange(blockId);});});
     var tog=box.querySelector('[data-card-filter-open]');
@@ -11069,7 +11192,7 @@
   // 迁移，写回只写新形状）。消费方 = showTableBody 的 applyDimScopes 统一管道。
   function scopeScopeText(sc){
     if(!sc||sc.mode==='all')return '范围';
-    if(sc.mode==='recent')return '近'+(Number(sc.n)||1)+({month:'月',quarter:'季',year:'年'}[sc.unit]||'期');
+    if(sc.mode==='recent')return '近'+(Number(sc.n)||1)+({week:'周',month:'月',quarter:'季',year:'年'}[sc.unit]||'期');
     if(sc.mode==='range')return '区间';
     return '范围';
   }
@@ -11093,10 +11216,23 @@
     var t=chart.editor=chart.editor||{};t.table=t.table||{};
     var active=chipScopeOf(t.table,col);
     var sc=(active&&active.kind==='time')?active:{col:col,mode:'all',n:6,unit:'month',anchor:'data'};
+    // 「周」单位只在周形列出现（值级周字段，2026-10-09）：月列选周会因键空间
+    // 错配被 resolveDateScopeKeys 守卫整段忽略，入口直接不给。采样列值域判周形；
+    // 已声明的 unit:week 恒视为周形（采样失败也不丢当前选择）。
+    var weekish=(sc.unit==='week');
+    if(!weekish){
+      try{
+        var dom=(chart.__tblCtx&&chart.__tblCtx.colDomain)?(chart.__tblCtx.colDomain(col)||[]):[];
+        for(var wi=0;wi<dom.length&&wi<80;wi+=1){
+          var dp=null;try{dp=adapter.dateParts?adapter.dateParts(dom[wi]):null;}catch(e){}
+          if(dp&&dp.prec==='week'){weekish=true;break;}
+        }
+      }catch(e){}
+    }
     var pop=mountTablePop(anchor,'<div class="ai-scope-pop">'
       +'<label class="ai-scope-row"><input type="radio" name="ai-scope-mode" value="all" '+((sc.mode!=='recent'&&sc.mode!=='range')?'checked':'')+'> 全部期次</label>'
-      +'<label class="ai-scope-row"><input type="radio" name="ai-scope-mode" value="recent" '+(sc.mode==='recent'?'checked':'')+'> 近 <input type="number" class="ai-scope-n" min="1" max="100" value="'+(Number(sc.n)||6)+'"> <select class="ai-scope-unit"><option value="month"'+(sc.unit==='month'?' selected':'')+'>月</option><option value="quarter"'+(sc.unit==='quarter'?' selected':'')+'>季</option><option value="year"'+(sc.unit==='year'?' selected':'')+'>年</option></select></label>'
-      +'<label class="ai-scope-row"><input type="radio" name="ai-scope-mode" value="range" '+(sc.mode==='range'?'checked':'')+'> 起止 <input type="text" class="ai-scope-min" placeholder="起（如 202501）" value="'+escapeHtml(sc.min||'')+'"> <input type="text" class="ai-scope-max" placeholder="止" value="'+escapeHtml(sc.max||'')+'"></label>'
+      +'<label class="ai-scope-row"><input type="radio" name="ai-scope-mode" value="recent" '+(sc.mode==='recent'?'checked':'')+'> 近 <input type="number" class="ai-scope-n" min="1" max="100" value="'+(Number(sc.n)||6)+'"> <select class="ai-scope-unit">'+(weekish?'<option value="week"'+(sc.unit==='week'?' selected':'')+'>周</option>':'')+'<option value="month"'+(sc.unit==='month'?' selected':'')+'>月</option><option value="quarter"'+(sc.unit==='quarter'?' selected':'')+'>季</option><option value="year"'+(sc.unit==='year'?' selected':'')+'>年</option></select></label>'
+      +'<label class="ai-scope-row"><input type="radio" name="ai-scope-mode" value="range" '+(sc.mode==='range'?'checked':'')+'> 起止 <input type="text" class="ai-scope-min" placeholder="起（如 '+(weekish?'2026-W35':'202501')+'）" value="'+escapeHtml(sc.min||'')+'"> <input type="text" class="ai-scope-max" placeholder="止" value="'+escapeHtml(sc.max||'')+'"></label>'
       +'<label class="ai-scope-row">锚点 <select class="ai-scope-anchor"><option value="data"'+(sc.anchor!=='today'?' selected':'')+'>数据最新期</option><option value="today"'+(sc.anchor==='today'?' selected':'')+'>自然今天</option></select></label>'
       +'<div class="ai-scope-foot"><button type="button" class="ai-tbl-pop-menu-item" data-scope-clear>清除范围</button><button type="button" class="ai-tbl-pop-menu-item ai-scope-apply" data-scope-apply>应用</button></div></div>');
     function commit(scope){
@@ -11908,7 +12044,9 @@
   function filterScopeCondText(scope){
     if(!scope)return '';
     if(scope.kind==='values')return '范围 '+(scope.values||[]).length+' 值';
-    if(scope.mode==='recent')return '近'+(Number(scope.n)||1)+({month:'月',quarter:'季',year:'年'}[scope.unit]||'期');
+    // 单位词与 scopeScopeText 同表（week:'周'）——这里是过滤器区摘要的第二份
+    // 消费点，漏了周词会把「近7周」显示成「近7期」（真机截图实锤）。
+    if(scope.mode==='recent')return '近'+(Number(scope.n)||1)+({week:'周',month:'月',quarter:'季',year:'年'}[scope.unit]||'期');
     if(scope.mode==='range')return '区间';
     return '';
   }
@@ -11923,7 +12061,7 @@
     if(!entry)return '';
     var parts=[];
     if(entry.filter)parts.push(filterSummaryText(entry.filter));
-    if(entry.scope)parts.push(entry.scope.kind==='values'?('值域：'+(entry.scope.values||[]).join(' / ')):(entry.scope.mode==='recent'?('近 '+(Number(entry.scope.n)||1)+' 期'):(('起止 '+(entry.scope.min||'…')+' ~ '+(entry.scope.max||'…')))));
+    if(entry.scope)parts.push(entry.scope.kind==='values'?('值域：'+(entry.scope.values||[]).join(' / ')):(entry.scope.mode==='recent'?('近 '+((Number(entry.scope.n)||1)+({week:'周',month:'月',quarter:'季',year:'年'}[entry.scope.unit]||'期'))):(('起止 '+(entry.scope.min||'…')+' ~ '+(entry.scope.max||'…')))));
     return (colAliasOf(ds,entry.col)||entry.col)+'：'+(parts.join('；')||'未设置');
   }
   // ＋ 菜单候选：数据集可用字段（availableColumns 已排除隐藏/ID/忽略）− 已有条件 −
@@ -14684,13 +14822,15 @@
   // 行级计算列与聚合级派生指标是**同一个用户概念**（「我要造一个新字段」）：所以只有
   // 一个弹窗、一套预设/字段库/运算库/校验/预览，区别只在顶部两个 tab。
   // 运算库里每一项都标出它**展开成什么**，并且只列求值器真的能算的东西
-  // （四则 + 常量 + 求和/平均/计数/最大/最小 + 时间窗口 prev/cum）——不假装有一个
+  // （四则 + 常量 + 求和/平均/计数/去重计数/最大/最小 + 时间窗口 prev/cum）——不假装有一个
   // 公式语言，也不给不可用的配置（占比需要跨维度窗口，模型里没有，就明说不支持）。
   // #region FORMULA_PARSER —— 公式表达式编辑器的解析/序列化（唯一文本↔AST 边界）
   // Python 编译侧只见 AST 不见文本，所以解析器只有这一份（无 parity 负担）。
   // 文法与边界见 docs/formula-editor-design.md：白名单聚合 + 四则 + 括号 + 数字常量
   // + [列]/[派生指标] 引用；裸普通列报错（与 derivedValidate 同一条 bare-col 规则）。
-  var FPARSER_AGGS={SUM:'sum',AVG:'average',AVERAGE:'average',COUNT:'count',MAX:'max',MIN:'min'};
+  // COUNTD（去重计数）与 PY derived_model.AGG_FNS / server SUPPORTED_AGG / 本地聚合
+  // 同一套（2026-10-10 用户反馈：运算库给了 COUNTD 按钮、解析器却报「未知函数」）。
+  var FPARSER_AGGS={SUM:'sum',AVG:'average',AVERAGE:'average',COUNT:'count',COUNTD:'countd',MAX:'max',MIN:'min'};
   function parseFormula(text,opts){
     opts=opts||{};
     var src=String(text==null?'':text).replace(/^\s+|\s+$/g,'');
@@ -14714,7 +14854,7 @@
       var id=/^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
       if(id){
         var up=id[0].toUpperCase();
-        if(!FPARSER_AGGS[up])return errAt(i,'未知函数 '+id[0]+'；可用：SUM / AVG / COUNT / MAX / MIN');
+        if(!FPARSER_AGGS[up])return errAt(i,'未知函数 '+id[0]+'；可用：SUM / AVG / COUNT / COUNTD / MAX / MIN');
         toks.push({t:'fn',agg:FPARSER_AGGS[up],p:i});
         i+=id[0].length;continue;
       }
@@ -14794,7 +14934,7 @@
   function exprAstToText(ast){
     var PREC={add:1,sub:1,mul:2,div:2};
     var OP={add:' + ',sub:' - ',mul:' * ',div:' / '};
-    var FN={sum:'SUM',average:'AVG',count:'COUNT',max:'MAX',min:'MIN'};
+    var FN={sum:'SUM',average:'AVG',count:'COUNT',countd:'COUNTD',max:'MAX',min:'MIN'};
     function go(node,parentPrec,side){
       if(!node)return '';
       if(node.const!==undefined)return String(node.const);
@@ -20584,9 +20724,10 @@
     renderFilterBar();
     // 卡片常驻筛选条同样随编辑态切换（read 只显示下拉，edit 多出移除 ×）。
     (manifest.charts||[]).forEach(function(ch){renderCardFilterBar(ch.blockId);});(manifest.kpis||[]).forEach(function(kp,i){renderCardFilterBar('block-kpi-'+i);});
-    // 明细表的「可编辑格子 ⇄ 只读文本」随编辑态切换（B3 只读门控）：只重渲染
-    // 明细视图的表格卡与独立明细网格，不动其它图表。
-    (manifest.charts||[]).forEach(function(ch){if(ch.viewType==='table'&&tableModeOf(ch)==='detail')renderChart(ch);});
+    // 表格卡（聚合+明细）随编辑态切换必须重渲：列头漏斗是作者配置入口（readerMode
+    // 门控，2026-10-10），页面常以阅读态 boot——漏斗的有无随编辑态变化，DOM 不重渲
+    // 就会停留在旧形态（编辑态进来看不到漏斗 = 配置入口丢失）。
+    (manifest.charts||[]).forEach(function(ch){if(ch.viewType==='table')renderChart(ch);});
     renderFixedTables();
     // Cover card lives in the unified paragraph model too: make sure its
     // paragraph rows exist before row grips/drop bind (no 元数据 chip chrome).
@@ -22789,6 +22930,10 @@ if(rfEl){
   // 逐位同构（JS 镜像，单一实现被 applyDerivedToDataset 与计算字段预览共用）。
   function datediffFullParts(a,b,unit){
     if(!a||!b)return null;
+    // 周值（w35/2026-W35）没有单一日期：PY date_parse.parts() 对周值恒 None →
+    // datediff 恒 null。JS dateParts 把周号装 mo 槽位照样返回部件——不在这里拒绝，
+    // singlefile 物化会算出数字而编译侧 None（同一计算列两端翻值，2026-10-11）。
+    if(a.prec==='week'||b.prec==='week')return null;
     function utc(y,mo,d){return Date.UTC(y,(mo||1)-1,d||1);}
     var days=Math.round((utc(a.y,a.mo,a.d)-utc(b.y,b.mo,b.d))/86400000);
     if(!isFinite(days))return null;

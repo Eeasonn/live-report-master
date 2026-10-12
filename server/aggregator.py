@@ -270,7 +270,12 @@ def _predicate_sql(f: dict[str, Any], available_columns: set[str] | None, engine
         raise AggregationError(f"filter column {f['column']!r} not found")
     col = _quote(f["column"])
     op = str(f.get("op", "=")).lower()
-    op = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
+    # ge/le：derived_model.FILTER_OPS（筛选型派生指标的声明词汇，UI 下拉同款）
+    # 接受它们，而本管道的规范词汇是 gte/lte（ALLOWED_FILTER_OPS / matchFilter 同款）
+    # ——不收别名时，合法声明直接落「unsupported filter op」400（compile 侧
+    # _row_filter 同一缺口，2026-10-11 第 13 轮审视实锤）。
+    op = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "ge": ">=",
+          "lt": "<", "lte": "<=", "le": "<="}.get(op, op)
     val = f.get("value")
     if op == "is null":
         return f"{col} IS NULL", []

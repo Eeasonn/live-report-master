@@ -664,8 +664,8 @@ def _validate_chart_table(tbl: Any) -> None:
             n = ds.get("n")
             if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 100:
                 raise RequestValidationError("chart.table.dateScope.n must be an integer 1-100")
-            if ds.get("unit") not in ("month", "quarter", "year"):
-                raise RequestValidationError("chart.table.dateScope.unit must be month/quarter/year")
+            if ds.get("unit") not in ("week", "month", "quarter", "year"):
+                raise RequestValidationError("chart.table.dateScope.unit must be week/month/quarter/year")
         else:
             mn, mx = ds.get("min"), ds.get("max")
             if (not isinstance(mn, str) or not mn) and (not isinstance(mx, str) or not mx):
@@ -697,8 +697,8 @@ def _validate_chart_table(tbl: Any) -> None:
                     n = sc.get("n")
                     if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 100:
                         raise RequestValidationError("chart.table.dimScopes[].n must be an integer 1-100")
-                    if sc.get("unit") not in ("month", "quarter", "year"):
-                        raise RequestValidationError("chart.table.dimScopes[].unit must be month/quarter/year")
+                    if sc.get("unit") not in ("week", "month", "quarter", "year"):
+                        raise RequestValidationError("chart.table.dimScopes[].unit must be week/month/quarter/year")
                 else:
                     mn, mx = sc.get("min"), sc.get("max")
                     if (not isinstance(mn, str) or not mn) and (not isinstance(mx, str) or not mx):

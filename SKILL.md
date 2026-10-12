@@ -62,7 +62,7 @@ Agent 只写 `report_request.json`，需通过 `scripts/validate_request.py`：
 完整四元组表（业务问法 → 声明键 → 值域 → 缺省）见 `references/authoring-feature-map.md`，速查：
 
 - 页面更宽/大屏 → `pageWidth`；换品牌风格 → `style.chartTheme`（**仅用户明确点名才写**）；主色 → `style.accent`。
-- 表格「只看近 N 期/某时间段」→ `chart.table.dateScope`；每个维度各限取值 → `dimScopes`；预置列筛选 → `columnFilters`。
+- 表格「只看近 N 期/某时间段」（周/月/季/年；周列恒看近 N 周）→ `chart.table.dateScope`；每个维度各限取值 → `dimScopes`；预置列筛选 → `columnFilters`。
 - 「组内前 N / 区域内排名」→ `chart.table.groupTopN`；柱图 Top-K → `chart.topK`；表格只显示前 N 行 → `chart.table.limit`。
 - 「达标标红/异常高亮」→ `chart.table.condFormat`（阈值向业务要，不要用 与均值/与0 凭空造阈值）；「合计应为平均/去重」→ `chart.table.totalCalc`。
 - 指标旁同比/环比副列 → `chart.table.subMeasures`；行尾趋势列 → `sparkline`；行总计列 → `rowTotal`；段尾小计 → `showSubtotal`（以上缺省全关，点名才开）。

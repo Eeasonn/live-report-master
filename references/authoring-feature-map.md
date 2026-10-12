@@ -96,7 +96,9 @@
 |---|---|---|---|
 | 只看近 N 期 / 某时间段（时间维） | `dateScope` | `{col, mode: recent\|range, n?, unit?: month\|quarter\|year, anchor?: data\|today, min?, max?}` | 全史；anchor 默认 `data`（数据最新期，经营月报口径） |
 | 每个维度各限取值范围 | `dimScopes[]` | `{col, kind: time\|values, …time 同上 / values: [...标量]}`（每维一条） | 不限 |
-| 预置列筛选（读者可改） | `columnFilters` | `{列名: {type: values, values[], not?} \| {type: range, min?, max?}}`（`not:true`=排除；`values` 含 `__blank__` 哨兵=空白行） | 无 |
+| 预置列筛选（卡级数据范围限制） | `columnFilters` | `{列名: {type: values, values[], not?} \| {type: range, min?, max?}}`（`not:true`=排除；`values` 含 `__blank__` 哨兵=空白行） | 无 |
+
+> 筛选双层模型（2026-10-10 收敛）：`columnFilters`/`dimScopes`/声明 `filters` 是**配置级数据范围限制**——对整卡生效、读者不可改；被它们排除的值，读者筛选器（报告级筛选卡 / 卡头「筛选 ▾」常驻条，多选）的选项里**不再出现**。表格工具条不再提供筛选入口（AND 面板已退役）。
 
 ### 3.5 单元格强化
 
@@ -133,5 +135,5 @@
 - 业务给了**编码值**要求中文显示 → 显示层值别名（编辑器配，请求层不收；见文首说明）。
 - **多级维度 + 多指标 + 时间列** → 默认 3D 交叉表已合适；除非业务点名平表/树形，不要乱写 `layout`。
 - 提示词点名的每一个**非基础度量**（比率/均值/占比/同环比/累计/店均/去重计数，如 WOS=Stock/Sales）→ `derived.measures` / `derived.columns` 各一条显式声明；交付前逐个对账，不许静默降级成「只有基础 SUM」。
-- 提示词明说「**筛选/过滤/只看 X**」的维度值条件 → `filters`（报告级）或 `chart.table.columnFilters`（卡级，表格卡）；禁止改道维度/breakdown/交叉列「顺便」实现。
+- 提示词明说「**筛选/过滤/只看 X**」的维度值条件 → 区分两层：给**读者**的可交互筛选 → `filters`（报告级筛选卡）；**卡内数据范围限制**（作者定死、读者不可改）→ `chart.table.columnFilters` / `dimScopes`；禁止改道维度/breakdown/交叉列「顺便」实现。
 - 提示词出现「**数据源独立/不要合并/各自来源**」→ `dataSourceMode:"independent"` 且不声明 `relations`（互斥词汇，同现报错）；未强调时默认不合并，某张卡确实需要跨源字段才声明 relation。

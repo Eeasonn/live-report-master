@@ -4404,7 +4404,12 @@ def _row_filter(row: list[Any], columns: list[str], filters: Any) -> bool:
         if expected is None or expected == "" or (isinstance(expected, (list, tuple, set)) and not expected):
             if op not in ("is null", "is not null"):
                 return True
-        op = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}.get(op, op)
+        # ge/le 别名与 server/aggregator._predicate_sql 同批（derived_model.FILTER_OPS
+        # 的声明词汇、UI 下拉同款 → 本管道规范词汇 gte/lte）：缺别名时筛选型派生
+        # 指标的 ge/le 谓词走到底部 .get(op, False) 把整组行全部筛空（静态首屏
+        # 全 None 假数；服务端则是 400，2026-10-11 第 13 轮审视实锤）。
+        op = {"eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "ge": ">=",
+              "lt": "<", "lte": "<=", "le": "<="}.get(op, op)
         if op == "is null": return value is None or value == ""
         if op == "is not null": return value is not None and value != ""
         if op in {"in", "not in"}:

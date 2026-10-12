@@ -1509,6 +1509,7 @@
                 },
                 "unit": {
                   "enum": [
+                    "week",
                     "month",
                     "quarter",
                     "year"
@@ -1562,6 +1563,7 @@
                   },
                   "unit": {
                     "enum": [
+                      "week",
                       "month",
                       "quarter",
                       "year"
