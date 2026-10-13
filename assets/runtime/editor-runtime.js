@@ -4795,9 +4795,13 @@
       var isPct=/percent|百分比|Percentage/i.test(String(type||''));
       // 派生 share/window.rate 的值已是百分数单位（adapter.derivedPercentUnits 唯一
       // 判据）——不再二次 ×100，否则 1.6% 显示成 160%（真机 2026-09-15）。
+      // 表示检测（2026-10-13 批 A2，Flint §3.4）：0–100 存值的 percent 列
+      // （type:'percent' 的「raw 0-100 列」本意）同样豁免 ×100——旧约定恒 ×100
+      // 会把 45 显示成 4500%。server 报告无行数据 → rep 回退 fraction（零漂移）。
       var pctUnits=isPct&&adapter.derivedPercentUnits&&adapter.derivedPercentUnits(data,measure);
+      var pctWhole=isPct&&!pctUnits&&adapter.percentRepOf&&adapter.percentRepOf(data,measure)==='whole';
       var numStr;
-      if(isPct){numStr=((pctUnits?vv:vv*100)).toFixed(2).replace(/\.?0+$/,'')+'%';}
+      if(isPct){numStr=(((pctUnits||pctWhole))?vv:vv*100).toFixed(2).replace(/\.?0+$/,'')+'%';}
       else if(dec!=null&&dec>0){var fixed=vv.toFixed(dec),parts=fixed.split('.');numStr=Number(parts[0]).toLocaleString('zh-CN')+(parts.length>1?'.'+parts[1]:'');}
       else{numStr=Math.round(vv).toLocaleString('zh-CN');}
       var prefix=fmt?fmt.prefix:'';var suffix=fmt&&!isPct?fmt.suffix:'';
@@ -4862,14 +4866,18 @@
       // 豁免判据）——旧版再 ×100 把 1.6% 导出成 160%，Excel pct numFmt 还会
       // 对 num 再乘一次（三重复利）。豁免列：文本直出、num 落回比率。
       var pctUnits=isPct&&adapter.derivedPercentUnits&&adapter.derivedPercentUnits(data,m);
+      // 表示检测（A2）：0–100 存值列与派生百分数同闸——文本直出，Excel num 槽
+      // 落 vv/100（Excel pct numFmt 会再 ×100，两侧一致才显示 45% 而非 4500%）。
+      var pctWhole=isPct&&!pctUnits&&adapter.percentRepOf&&adapter.percentRepOf(data,m)==='whole';
+      var pctDirect=pctUnits||pctWhole;
       var num=Number(v);
       if(!Number.isFinite(num))return Object.assign({text:''},opts||{});
       var vv=num/div;
-      // 豁免列（share/window rate）存的是已 ×100 的百分数（vv=7.3 即 7.3%）——
+      // 豁免列（share/window rate / 0-100 存值）存的是百分数（vv=7.3 即 7.3%）——
       // CSV 文本必须按存值直出（保留 1 位小数），旧版再 ×100 写成 73%。
-      // 非豁免列（比率存值）维持 ×100→1 位百分小数；XLSX num 槽（下方）口径不变。
-      var text=isPct?((pctUnits?Math.round(vv*10)/10:Math.round(vv*1000)/10)+'%'):String(dec!=null&&dec>0?Number(vv.toFixed(dec)):Math.round(vv));
-      return Object.assign({num:pctUnits?vv/100:vv,fmt:{kind:isPct?'pct':'num',dec:dec==null?0:dec},text:text},opts||{});
+      // 比率存值列维持 ×100→1 位百分小数；XLSX num 槽对应 vv/100（pctDirect）。
+      var text=isPct?((pctDirect?Math.round(vv*10)/10:Math.round(vv*1000)/10)+'%'):String(dec!=null&&dec>0?Number(vv.toFixed(dec)):Math.round(vv));
+      return Object.assign({num:pctDirect?vv/100:vv,fmt:{kind:isPct?'pct':'num',dec:dec==null?0:dec},text:text},opts||{});
     }
     function aggUnitSuffix(m){var us=((settings.fieldCfg&&settings.fieldCfg[m])||{}).unitScale;return (us&&us!=='raw'&&DETAIL_UNIT_LABEL[us])?('（'+DETAIL_UNIT_LABEL[us]+'）'):'';}
     // 分组行（维度1 组头自动合并）：when a second dimension (roles.breakdown) is
@@ -12793,7 +12801,14 @@
   // 指标「格式」= measureTypes[col].type（显示口径，消费侧齐全：MEASURE_TYPE_FORMATS /
   // MEASURE_TYPE_DECIMALS / 单位缩放）。与「默认聚合」一起构成数据集级默认值：
   // 新建图表 / 新拖入指标时套用，图表内可再单独覆盖（对齐 Power BI 的默认汇总/格式）。
-  var SEM_FORMAT_OPTIONS=[['number','常规'],['percent','百分比'],['currency','货币'],['count','整数'],['duration','时长'],['unitless','纯数']];
+  // 'price 价格'（2026-10-13 语义批）：与请求层 measureTypes.type:"price" 同词汇
+  //（Flint Price intensive——¥ 格式化 + 不可加 + 缺省 average）。Python 镜像 =
+  // semantics/type_registry.py CANONICAL。
+  var SEM_FORMAT_OPTIONS=[['number','常规'],['percent','百分比'],['currency','货币'],['price','价格'],['count','整数'],['duration','时长'],['unitless','纯数']];
+  // Flint T2 语义注解（批次 2，design-semantics.md §2.7）的编辑面：写
+  // measureTypes[col].semantic（''=自动 = 名称推断/type 兜底）。受控词汇 =
+  // flint_core 注册表的度量侧子集。
+  var SEM_SEMANTIC_OPTIONS=[['Price','单价 · 售价（不可加·均值）'],['Revenue','收入金额'],['Cost','成本'],['Amount','金额'],['Profit','利润（正负）'],['Percentage','占比'],['Score','评分'],['Rating','评分'],['Temperature','温度'],['Sentiment','情感'],['Correlation','相关'],['Rank','排名']];
   // 内置币表下拉（拍板 6）：与 adapter.currencySymbols 同一份 23 币（镜像
   // scripts/semantics/type_registry.CURRENCY_SYMBOLS，parity 守卫钉死）。
   // UI 只提供内置表；symbol（自定义符号）是请求层/作者级声明，画布不编辑。
@@ -12922,12 +12937,27 @@
     if(Object.keys(kept).length)semCanvas.ds.measureTypes[col]=kept;
     else delete semCanvas.ds.measureTypes[col];
   }
+  // 语义批 helpers（2026-10-13）：数据源配置暂存/写回与编译缺省同源。
+  // 名称→语义标签（子串），镜像 measure_semantics.semantic_label_of 的名称路径
+  //（率族/量词族刻意不收——P1 百分比退役 + 显示漂移，见 infer_measure_types 注）。
+  function semInferredTypeOf(col){
+    var n=String(col||'');if(!n)return null;
+    if(/售价|单价|价格|标价|原价|现价|均价|price/i.test(n))return 'price';
+    if(/金额|销售额|收入|营收|营业额|利润|成本|费用|额/.test(n))return 'currency';
+    return null;
+  }
+  // 类型 → aggRole 缺省聚合（Flint resolveAggregationDefault）：intensive→average。
+  function semDefaultAggOf(type){
+    if(!type||!adapter||!adapter.flintFieldSemantics)return null;
+    var fs=adapter.flintFieldSemantics(adapter.flintCanonicalAlias?adapter.flintCanonicalAlias(type):type);
+    return (fs&&fs.aggregationDefault==='average')?'average':null;
+  }
   function _semChangeRole(col,fromRole,toRole){
     semCanvas.roles[col]=toRole;
     if(semNormRole(toRole)==='ignore'){
       // 「不参与分析」的列：清掉指标默认（type/聚合/小数位/币种）与该列的时间分桶。
       _semClearMeasureDefaults(col);
-      delete semCanvas.aggs[col];delete semCanvas.decs[col];delete semCanvas.ftypes[col];delete semCanvas.curs[col];
+      delete semCanvas.aggs[col];delete semCanvas.decs[col];delete semCanvas.ftypes[col];delete semCanvas.curs[col];delete semCanvas.sems[col];
       var chartsI=(manifest&&manifest.charts)||[];
       for(var i2=0;i2<chartsI.length;i2+=1){
         var dI=(chartsI[i2].editor&&chartsI[i2].editor.data)||null;
@@ -12954,9 +12984,11 @@
       // Re-resolve measure defaults (mirror the old ai-sem-role change handler).
       var mt=semCanvas.ds.measureTypes&&semCanvas.ds.measureTypes[col];
       var mtObj=(mt&&typeof mt==='object')?Object.assign({},mt):((mt&&typeof mt==='string')?{type:mt}:{});
-      semCanvas.aggs[col]=semCanvas.aggs[col]||mtObj.aggregation||'sum';
       semCanvas.ftypes=semCanvas.ftypes||{};
-      semCanvas.ftypes[col]=mtObj.type||'number';
+      semCanvas.ftypes[col]=mtObj.type||semInferredTypeOf(col)||'number';
+      semCanvas.aggs[col]=semCanvas.aggs[col]||mtObj.aggregation||semDefaultAggOf(mtObj.type||semCanvas.ftypes[col])||'sum';
+      semCanvas.sems=semCanvas.sems||{};
+      semCanvas.sems[col]=mtObj.semantic||'';
       // 币种暂存回填（拍板 6）：数据集声明里带 currency 键就先展示出来。
       semCanvas.curs=semCanvas.curs||{};
       semCanvas.curs[col]=mtObj.currency||'';
@@ -13930,8 +13962,13 @@
       var decOpts='';for(var d=0;d<=6;d+=1)decOpts+='<option value="'+d+'"'+(String(semCanvas.decs[col])===String(d)?' selected':'')+'>'+d+' 位</option>';
       // 货币下拉（拍板 6）：格式=货币时旁现，23 币 + 中文标签；暂存 curs 优先，
       // 未暂存回落数据集声明的 currency。''=缺省 ¥（不写 currency 键）。
+      var semVal=(semCanvas.sems&&semCanvas.sems[col]!=null)?semCanvas.sems[col]:((mt&&typeof mt==='object'&&mt.semantic)||'');
+      var semSel='<select class="ai-sem-row-sem" data-col="'+escapeHtml(col)+'" aria-label="语义注解" title="语义注解（Flint T2）：声明后按该类型聚合角色执行——如 单价=不可加、缺省聚合平均。自动 = 按名称推断/type 兜底">'
+        +'<option value=""'+(semVal===''?' selected':'')+'>语义：自动</option>'
+        +SEM_SEMANTIC_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(semVal===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')
+        +'</select>';
       var curSel='';
-      if(curType==='currency'){
+      if(curType==='currency'||curType==='price'){
         var curVal=(semCanvas.curs&&semCanvas.curs[col]!=null)?semCanvas.curs[col]:((mt&&typeof mt==='object'&&mt.currency)||'');
         var curOpts=SEM_CURRENCY_OPTIONS.map(function(o){return '<option value="'+o[0]+'"'+(String(curVal)===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
         curSel='<select class="ai-sem-row-cur" data-col="'+escapeHtml(col)+'" aria-label="币种" title="币种：内置 23 币，缺省 ¥（人民币）。自定义符号请在请求层用 symbol 声明">'+curOpts+'</select>';
@@ -13939,6 +13976,7 @@
       defaultCell='<td><span class="ai-sem-agg-pair">'
         +'<select class="ai-sem-row-agg" data-col="'+escapeHtml(col)+'" aria-label="默认聚合" title="默认聚合：新建图表 / 新拖入该指标时套用">'+aggOpts+'</select>'
         +'<select class="ai-sem-row-ftype" data-col="'+escapeHtml(col)+'" aria-label="格式" title="格式：新建图表 / 新拖入该指标时套用">'+typeOpts+'</select>'
+        +semSel
         +curSel
         +'<select class="ai-sem-row-dec" data-col="'+escapeHtml(col)+'" aria-label="小数位" title="小数位">'+decOpts+'</select></span></td>';
     }
@@ -16443,6 +16481,13 @@
         var fc=t.getAttribute('data-col');
         semCanvas.ftypes[fc]=t.value;
         semCommitLive();renderSemTable(stage);
+      }else if(t.classList&&t.classList.contains('ai-sem-row-sem')){
+        // 语义注解暂存（批次 2）：''=自动（写回时剥除 semantic 键）。值变化不改
+        // 变行结构，无需重绘表格。
+        var sc=t.getAttribute('data-col');
+        semCanvas.sems=semCanvas.sems||{};
+        semCanvas.sems[sc]=t.value;
+        semCommitLive();
       }
     });
     stage.addEventListener('click',function(ev){
@@ -16690,8 +16735,13 @@
         // 币种没动 → 原样保留；换了币种 → 剥除（否则旧 symbol 静默压过新选择——
         // chart-adapter.currencyPrefixOf 里 symbol 优先于查表）。
         var prevMt=(mt&&typeof mt==='object')?mt:{};
+        // 语义注解写回（批次 2）：''=自动 → 剥除 semantic 键；选了标签 → 写入
+        //（validate 受控词汇闸在请求层，这里只写编辑器产物）。
+        var stagedSem=(semCanvas.sems&&semCanvas.sems[col]!=null)?semCanvas.sems[col]:'';
+        if(stagedSem){obj.semantic=stagedSem;}else{delete obj.semantic;}
+        var prevMt=(mt&&typeof mt==='object')?mt:{};
         var stagedCur=(semCanvas.curs&&semCanvas.curs[col]!=null)?semCanvas.curs[col]:'';
-        if(obj.type==='currency'){
+        if(obj.type==='currency'||obj.type==='price'){
           if(stagedCur){obj.currency=stagedCur;}else{delete obj.currency;}
           var prevSym=(typeof prevMt.symbol==='string')?prevMt.symbol:'';
           var curChanged=String(stagedCur||'')!==String(prevMt.currency||'');
@@ -16939,13 +16989,16 @@
     cats0.forEach(function(c){if(ord0.indexOf(c)<0)ord0.push(c);});
     semCanvas.catOrder=ord0;
     semCanvas.hint='';
-    semCanvas.aggs={};semCanvas.decs={};semCanvas.ftypes={};semCanvas.curs={};
+    semCanvas.aggs={};semCanvas.decs={};semCanvas.ftypes={};semCanvas.curs={};semCanvas.sems={};
     semCanvas.extraChains=[];semCanvas.catChainSeq=0;
     cols.forEach(function(col){
       var mt=ds.measureTypes&&ds.measureTypes[col];
       var mtObj=(mt&&typeof mt==='object')?mt:((mt&&typeof mt==='string')?{type:mt}:{});
-      semCanvas.aggs[col]=mtObj.aggregation||'sum';
-      semCanvas.ftypes[col]=mtObj.type||'number';
+      // 语义批（2026-10-13）：暂存兜底接语义推断（与编译 infer_measure_types /
+      // 缺省聚合同一源）——裸「完成」不再把 price 列显式钉成 number+sum 洗掉语义缺省。
+      semCanvas.ftypes[col]=mtObj.type||semInferredTypeOf(col)||'number';
+      semCanvas.aggs[col]=mtObj.aggregation||semDefaultAggOf(mtObj.type||semCanvas.ftypes[col])||'sum';
+      semCanvas.sems[col]=mtObj.semantic||'';
       semCanvas.curs[col]=mtObj.currency||'';
       var shim=Object.assign({},ds,{measureTypes:Object.assign({},ds.measureTypes||{})});
       shim.measureTypes[col]=Object.assign({},mtObj,{type:mtObj.type||'number'});

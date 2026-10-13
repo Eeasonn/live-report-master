@@ -102,6 +102,66 @@ def default_aggregation(entry: Any, name: str = "") -> str | None:
     return None
 
 
+# ---- percent 表示检测 + diverging 颜色决策（2026-10-13 批 A1/A2） ----------------
+# JS 镜像 = chart-adapter.percentRepresentation / flintDivergingDecision（parity
+# 由 tests/test_semantic_aggregation 双端钉）。
+
+
+def percent_representation(values: list | None) -> str:
+    """Flint §3.4 representation detection：同一 percent 语义列的两种存值——
+    比率（0–1，显示 ×100）vs 百分数（0–100，直显）。判据 = ≥80% 非空值
+    |v|≤1 → ``fraction``；样本不足（<2 个有限值）→ ``fraction``（旧表格约定
+    恒 ×100，零漂移回退）。"""
+    nums: list[float] = []
+    for v in (values or []):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        nums.append(n)
+    if len(nums) < 2:
+        return "fraction"
+    small = sum(1 for n in nums if abs(n) <= 1)
+    return "fraction" if small / len(nums) >= 0.8 else "whole"
+
+
+_DIVERGING_INTRINSIC_ZERO = {"Profit", "PercentageChange", "Sentiment",
+                             "Correlation", "Temperature"}
+
+
+def diverging_decision(label: str | None, values: list | None = None) -> dict[str, Any]:
+    """Flint design-semantics.md §5.5 颜色方案提示。
+
+    diverging ∈ {inherent, conditional} 的类型才有中点；优先级（技能注解面只到
+    类型内在，unit/intrinsicDomain 注解未接）：类型内在 0（Profit/Percentage
+    Change/Sentiment/Correlation/Temperature °C 缺省）→ Score 有界域中点
+    （0–100 → 50）→ 数据范围中点。conditional 还要数据**跨越中点**才发散，
+    单侧退 sequential（「全为正时用 sequential」）。返回
+    ``{"type": "diverging"|"sequential", "midpoint": float|None}``。
+    """
+    lab = _fc.canonical_alias(label or "")
+    t = _fc.get_type(lab)
+    if not t or t.get("diverging") == "none":
+        return {"type": "sequential", "midpoint": None}
+    nums = sorted(float(v) for v in (values or [])
+                  if v is not None and str(v).strip() != "")
+    dmin = nums[0] if nums else None
+    dmax = nums[-1] if nums else None
+    if lab == "Score":
+        mid = 50.0 if (nums and dmin >= 0 and dmax <= 100) else ((dmin + dmax) / 2 if nums else 0.0)
+    elif lab in _DIVERGING_INTRINSIC_ZERO:
+        mid = 0.0
+    else:
+        mid = 0.0 if (nums and dmin < 0 < dmax) else ((dmin + dmax) / 2 if nums else 0.0)
+    if not nums:
+        return {"type": "diverging" if t["diverging"] == "inherent" else "sequential",
+                "midpoint": mid if t["diverging"] == "inherent" else None}
+    if t["diverging"] == "inherent":
+        return {"type": "diverging", "midpoint": mid}
+    spans = dmin < mid < dmax
+    return {"type": "diverging" if spans else "sequential", "midpoint": mid if spans else None}
+
+
 def lookahead_col_semantics(col: str, values: list[str] | None = None) -> dict[str, Any]:
     """Best-effort field semantics from a column name + optional sampled values.
 

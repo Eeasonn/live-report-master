@@ -4210,16 +4210,32 @@ def infer_measure_types(columns):
     """Heuristic semantic types from column names, so BI-inserted charts and
     authored charts share formatting. Authors may override in the spec's
     dataset.measureTypes. Reuses the family->canonical map from
-    ``measure_semantics`` so every path (validate, compile, runtime) agrees."""
-    from measure_semantics import normalize_measure_type
+    ``measure_semantics`` so every path (validate, compile, runtime) agrees.
+
+    2026-10-13 批（B2 双轨合一）：整词匹配（resolve_t2）之外补**子串**推断
+    （semantic_label_of——与缺省聚合/编译闸同一推断源）。此前『订单金额』
+    『官方售价』这类真实列名整词匹配不中，类型永缺席（L14 提示兜底），编辑器
+    侧格式化/不可加保护全盲。子串档只收 **Price/Revenue/Cost**（可加性语义
+    修正 + ¥ 格式化）；两个家族刻意不收——率族（P1 裁决：百分比是显示格式
+    不是类型，test_keyword_heuristic_retired 钉着）与量词族（『数』太泛，
+    自动 typing 会造成显示漂移）。
+    """
+    from measure_semantics import normalize_measure_type, semantic_label_of
     types = {}
     for col in columns:
         canon = normalize_measure_type(col or "")
         if canon is None:
-            # A name gives no signal; leave to the storage-type fallback (number).
-            continue
-        if isinstance(canon, dict):
-            types[col] = canon
+            label = semantic_label_of(None, col)
+            entry = {
+                "Price": {"type": "price", "divisor": 10000, "unit": "万"},
+                "Revenue": {"type": "currency", "divisor": 10000, "unit": "万"},
+                "Cost": {"type": "currency", "divisor": 10000, "unit": "万"},
+            }.get(label)
+            if entry is None:
+                # A name gives no signal (or a deliberately retired family);
+                # leave to the storage-type fallback (number).
+                continue
+            types[col] = entry
         else:
             types[col] = canon
     return types

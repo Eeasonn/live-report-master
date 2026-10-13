@@ -134,6 +134,11 @@ def build_profile(table: dict[str, Any], source: str) -> dict[str, Any]:
                        "Cost", "Profit", "Score", "Temperature", "Sentiment",
                        "Correlation"):
                 item["semanticHint"] = sem
+                if sem == "Percentage":
+                    # 表示检测（A2，Flint §3.4）：同一 percent 语义列的两种存值
+                    #（0–1 比率 vs 0–100 百分数）——声明 measureTypes 时一并注明。
+                    from measure_semantics import percent_representation
+                    item["percentRepresentation"] = percent_representation(non_null)
         elif types[name] == "time" and non_null:
             ordered = sorted(str(value) for value in non_null)
             item.update({"min": ordered[0], "max": ordered[-1]})

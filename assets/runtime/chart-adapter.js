@@ -1400,6 +1400,35 @@
     var legacy=data&&data.derived?data.derived[measure]:null;
     return !!(legacy&&legacy.kind==='share');
   }
+  // ---- percent 表示检测（2026-10-13 批 A2，Flint §3.4 representation detection）----
+  // 同一个「percent 语义列」有两种存值表示：比率（0–1，显示需 ×100）与百分数
+  // （0–100，直显）。旧表格约定恒 ×100——对 0–100 存值列把 45 显示成 4500%
+  //（与 160% 同族的反向事故）。判据 = Flint「≥80% 非空值 |v|≤1 → fractional」；
+  // 样本不足（<2 个有限值）/ 无行数据（server schema-only）→ 'fraction' =
+  // 旧约定（零漂移）。**Python 镜像** = measure_semantics.percent_representation。
+  function percentRepresentation(values){
+    var nums=[],arr=values||[];
+    for(var i=0;i<arr.length;i+=1){var n=Number(arr[i]);if(Number.isFinite(n))nums.push(n);}
+    if(nums.length<2)return 'fraction';
+    var small=0;
+    for(var j=0;j<nums.length;j+=1){if(Math.abs(nums[j])<=1)small+=1;}
+    return (small/nums.length>=0.8)?'fraction':'whole';
+  }
+  var _pctRepMemo=new WeakMap();
+  function percentRepOf(data,measure){
+    if(!data||!measure)return 'fraction';
+    var m=_pctRepMemo.get(data);
+    if(!m){m={};_pctRepMemo.set(data,m);}
+    if(m[measure])return m[measure];
+    var vals=null,ci=(data.columns||[]).indexOf(measure);
+    if(ci>=0&&Array.isArray(data.rows)){
+      vals=[];
+      for(var i=0;i<data.rows.length;i+=1){var r=data.rows[i];vals.push(r?r[ci]:null);}
+    }
+    var rep=vals?percentRepresentation(vals):'fraction';
+    m[measure]=rep;
+    return rep;
+  }
   function derivedPlanOf(data){
     var nodes=data&&data.derivedMeasures;
     if(!nodes)return null;
@@ -3540,6 +3569,34 @@
     var vis=flintInferVisCategory(values);
     return {type:name,encoding:vis,additive:vis==='quantitative',aggregationDefault:vis==='quantitative'?'sum':'none',zeroBaseline:vis==='quantitative'?'meaningful':'none',domainShape:'open',sortDirection:vis==='temporal'?'asc':'desc'};
   }
+  // ---- diverging 颜色决策（2026-10-13 批 A1，Flint design-semantics.md §5.5）----
+  // diverging ∈ {inherent, conditional} 的语义类型才有中点；优先级（技能注解面
+  // 只到类型内在，unit/intrinsicDomain 注解未接）：类型内在 0（Profit/
+  // PercentageChange/Sentiment/Correlation/Temperature °C 缺省）→ Score 有界域
+  // 中点（0–100 → 50）→ 数据范围中点。conditional 还要数据**跨越中点**才发散，
+  // 单侧退 sequential（§5.5「全为正时用 sequential」）。返回
+  // {type:'diverging'|'sequential', midpoint}。**Python 镜像** =
+  // measure_semantics.diverging_decision（parity 由 test_semantic_aggregation 钉）。
+  function flintDivergingDecision(name,values){
+    var label=flintCanonicalAlias(name||'');
+    var t=FLINT_TYPES[label];
+    if(!t||t.diverging==='none')return {type:'sequential',midpoint:null};
+    var nums=[];
+    (values||[]).forEach(function(v){var n=Number(v);if(Number.isFinite(n))nums.push(n);});
+    nums.sort(function(a,b){return a-b;});
+    var dmin=nums.length?nums[0]:null,dmax=nums.length?nums[nums.length-1]:null;
+    var mid;
+    if(label==='Score'){
+      mid=(nums.length&&dmin>=0&&dmax<=100)?50:((dmin+dmax)/2);
+    }else{
+      // Profit/PercentageChange/Sentiment/Correlation/Temperature：类型内在 0。
+      mid=0;
+    }
+    if(!nums.length)return {type:t.diverging==='inherent'?'diverging':'sequential',midpoint:t.diverging==='inherent'?mid:null};
+    if(t.diverging==='inherent')return {type:'diverging',midpoint:mid};
+    var spans=dmin<mid&&dmax>mid;
+    return {type:spans?'diverging':'sequential',midpoint:spans?mid:null};
+  }
   function flintBuildProfile(fields){
     var p={measures:[],temporals:[],categoricals:[],ordinals:[],dims:[],cardinality:{}};
     (fields||[]).forEach(function(f){
@@ -3640,5 +3697,5 @@
     out.sort(function(a,b){return b.score-a.score;});
     return out;
   }
-  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
+  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
 })(window);

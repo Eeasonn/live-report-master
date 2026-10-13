@@ -27,6 +27,8 @@ in ``validate_report.py``; this script covers:
   L19 Report chart theme is a non-default preset
   L20 Price/intensive measure averaged while ignoring an existing category
       column — the average is mix-driven, not a price level (2026-10-13)
+  L21 Diverging-capable measure (Profit/Sentiment/...) spans its midpoint with
+      no conditional format — sign is invisible (2026-10-13)
 """
 
 from __future__ import annotations
@@ -704,6 +706,50 @@ def check_price_mix_average(chart, findings):
     ))
 
 
+# ---------- L21: diverging-capable measure shown without sign treatment ----------
+
+# diverging-capable = Flint 注册表 diverging ∈ {inherent, conditional} 的度量侧
+# 标签（Profit/PercentageChange/Sentiment/Correlation/Temperature/Score）。
+# 数据跨中点（发散成立）而卡上没有任何条件格式 → 建议红负绿正/与0 basis。
+# server 报告无行数据 → 诚实 skip（跨不跨零无从判定）。
+def check_diverging_measure(chart, findings):
+    if chart.get("viewType") not in ("bar", "line", "table"):
+        return
+    data = (chart.get("editor") or {}).get("data") or {}
+    rows = data.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return
+    from measure_semantics import diverging_decision, semantic_label_of
+    measure_types = data.get("measureTypes") or {}
+    columns = data.get("columns") or []
+    table_cfg = (chart.get("editor") or {}).get("table") or {}
+    cond_targets = {c.get("target") for c in (table_cfg.get("condFormat") or [])
+                    if isinstance(c, dict)}
+    for m in (data.get("measures") or []):
+        label = semantic_label_of(measure_types.get(m), m)
+        if label not in ("Profit", "PercentageChange", "Sentiment",
+                         "Correlation", "Temperature", "Score"):
+            continue
+        ci = columns.index(m) if m in columns else -1
+        if ci < 0:
+            continue
+        vals = [r[ci] for r in rows if len(r) > ci]
+        dec = diverging_decision(label, vals)
+        if dec["type"] != "diverging":
+            continue
+        if m in cond_targets:
+            continue
+        findings.append(_finding(
+            "L21", SEVERITY_INFO, chart["id"],
+            f"measure '{m}' ({label}) spans both sides of its diverging midpoint "
+            f"({dec['midpoint']:g}) but no conditional format treats the sign — "
+            "negative and positive values read identically.",
+            "add a condFormat rule on basis 与0 with red-for-negative / green-for-"
+            "positive actions (or color by sign).",
+            path="editor.table.condFormat",
+        ))
+
+
 # ---------- orchestration ----------
 
 class _LintHTMLParser(HTMLParser):
@@ -768,6 +814,7 @@ def lint_html(html: str, packaged: bool = False) -> tuple[list[dict[str, Any]], 
         check_heatmap_range,
         check_measure_behaviour,
         check_price_mix_average,
+        check_diverging_measure,
     ]
     for chart in charts:
         for checker in chart_checkers:
