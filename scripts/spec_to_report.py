@@ -1736,6 +1736,20 @@ def _breakdown_series(c: dict, rows: list) -> tuple[list[dict], list]:
             hit = next((r for r in rows if r[di] == lbl and r[bi] == bdv), None)
             s["data"].append(_num(hit[mi]) if hit is not None else 0)
         series.append(s)
+    # 占比堆叠（2026-10-13 语义批，Flint resolveStackable 'normalize'）：显式
+    # stackMode='normalize' 时每根柱各段归一到 100%（段值/段和×100）。放在 R3
+    # 堆叠排序**之后**——排序按原始总量，归一只改显示值。
+    if vt == "stackedBar" and c.get("stackMode") == "normalize":
+        for _xi in range(len(x_labels)):
+            _tot = 0.0
+            for s in series:
+                _v = s["data"][_xi]
+                if _v is not None:
+                    _tot += _v
+            if _tot > 0:
+                for s in series:
+                    if s["data"][_xi] is not None:
+                        s["data"][_xi] = s["data"][_xi] / _tot * 100.0
     return series, x_labels
 
 def _chart_option(c: dict, rows: list) -> dict:
@@ -2130,6 +2144,8 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
             # multi 分支行数都读它——请求声明 1–3 个行维必须透传，else 分支已有同款）。
             **({"dimensions": list(c["dimensions"])} if c.get("dimensions") else {}),
             "aggregation": c.get("aggregation", "sum"),
+            # 占比堆叠透传（2026-10-13）：运行时 breakdownSeries 与静态 option 同闸。
+            **({"stackMode": c["stackMode"]} if c.get("stackMode") else {}),
             "measureTypes": semantic_types,
             "filter": c.get("filter") or [],
         }
@@ -2166,6 +2182,7 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
             # 行维度有序列表（P2 三维交叉表，行区第 2 个 = 行头嵌套外层→内层）
             **({"dimensions": list(c["dimensions"])} if c.get("dimensions") else {}),
             "aggregation": c.get("aggregation", "sum"),
+            **({"stackMode": c["stackMode"]} if c.get("stackMode") else {}),
             # Raw time dimension: declare its grain so the runtime groups and
             # labels by the same bucket the compiler used (and so a window derived
             # measure knows which period it is comparing).
@@ -4180,13 +4197,17 @@ def validate_chart_shape(c: dict) -> list[str]:
     if vt == "line" and c.get("sort") not in ("time", "none") and _dimension_type(c) not in ("time", "ordinal"):
         problems.append("line chart without a temporal x axis or explicit sort; use sort:time for trends")
     # Non-additive measures (rates/percentages) must never be summed or stacked (P1).
-    if vt == "stackedBar":
+    # 占比堆叠豁免（2026-10-13）：stackMode='normalize' 时堆叠是「归一显示」而非
+    # 把段值当总量读——Flint resolveStackable 对 Percentage 的 normalize 形态；
+    # sum 聚合在归一下变为「段占总和的权重」，口径成立。
+    _norm_stack = vt == "stackedBar" and c.get("stackMode") == "normalize"
+    if vt == "stackedBar" and not _norm_stack:
         bad = _non_additive(c)
         if bad[0]:
             problems.append(f"stackedBar with non-additive measure: {bad[1]}; use a grouped bar or average")
     agg = c.get("aggregation")
     _derived_names = set(c.get("derivedMeasures") or [])
-    if agg == "sum" and not _derived_names:
+    if agg == "sum" and not _derived_names and not _norm_stack:
         # A DERIVED measure is computed AFTER aggregation (formula/window), never
         # re-summed from rows, so an 'sum' chart aggregation cannot double-count it.
         # The rule exists to stop summing percentages that come from the data.
@@ -5840,6 +5861,9 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                               "datasetId": dsid,
                               "viewType": view, "dimension": dim, "measures": measures,
                               "aggregation": agg, "measureTypes": chart_mt,
+                              # 占比堆叠（2026-10-13 语义批）：图级 stackMode 透传，
+                              # 运行时 breakdownSeries 与静态 option 同闸。
+                              **({"stackMode": encoding["stackMode"]} if encoding.get("stackMode") == "normalize" else {}),
                               "roles": ({"cols": list(_bd_list), "breakdown": _bd_list[0]} if _bd_list else {}),
                               # 行维度有序列表（P2 三维交叉表）：dimension 恒在第 1 位
                               "dimensions": (lambda dl: ([dim] + [d for d in dl if d != dim] if dim else dl))(encoding.get("dimensions") or []) or None,

@@ -957,7 +957,16 @@
       if((data.derivedMeasures&&data.derivedMeasures[measure])||(data.derived&&data.derived[measure]&&data.derived[measure].base))return;
       var format=measureFormat(data,measure,fallbackDecimals);
       if(!format)return;
-      entries.forEach(function(entry){var v=number(entry.values[index]);entry.values[index]=roundNumber(format.divisor!==1?v/format.divisor:v,format.decimals);});
+      // percent 表示缩放（2026-10-13 批 A3，与表格 fmtVal 同一判据
+      // percentRepOf）：0-1 比率存值的 percent 显示列 ×100（轴/tooltip 模板
+      // '{value}%' 直显即 15% 而非 0.15%）；0-100 存值（whole）与派生百分数
+      // （derivedPercentUnits，已存 ×100）不缩放。count/none 聚合无 % 语义
+      // 不缩放。显示缩放归运行时 = divisor 同款惯例（静态 option 不缩值）。
+      var _per=(data.aggregations&&typeof data.aggregations==='object'&&!Array.isArray(data.aggregations))?data.aggregations[measure]:null;
+      var _meth=_per||data.aggregation||'sum';
+      var _pctX100=format.suffix==='%'&&_meth!=='count'&&_meth!=='none'
+        &&!derivedPercentUnits(data,measure)&&percentRepOf(data,measure)==='fraction';
+      entries.forEach(function(entry){var v=number(entry.values[index]);if(_pctX100)v=v*100;entry.values[index]=roundNumber(format.divisor!==1?v/format.divisor:v,format.decimals);});
     });
     return entries;
   }
@@ -2621,6 +2630,7 @@
         stack:(crowdedLine||type!=='stackedBar')?undefined:'合计',areaStyle:type==='area'?{}:undefined,smooth:crowdedLine||type==='line'||type==='area',
         data:xd.map(function(lbl){var hit=entries.filter(function(e){return e.label===lbl&&String(e.breakdown)===name;})[0];return hit?(hit.values[0]==null?null:number(hit.values[0])):0;})};
     });
+    normalizeStackData(type,data,series,xd.length);
     option.series=series;
     // Set the category axis to the unique primary labels (no duplicated x cats).
     var meta=categoryAxisMeta(xd);
@@ -2628,6 +2638,23 @@
       axisLabel:{fontSize:11,interval:meta.interval,rotate:meta.rotate,color:'#5e6c84'}};
     if(option.legend)option.legend=Object.assign({type:'scroll'},option.legend,{data:series.map(function(s){return s.name;})});
     return option;
+  }
+  // 占比堆叠（2026-10-13 语义批，Flint resolveStackable 'normalize'——
+  // field-semantics.ts:1028-1031 Percentage→normalize）：stackMode='normalize'
+  // 时每根柱（x）各段归一到 100%（段值/段和×100，null 保留、段和≤0 原样）。
+  // 只改显示值——TOP-K/R3 排序都在归一前的原始值上做。**Python 镜像** =
+  // spec_to_report 交叉表构建器的同款归一（WYSIWYG parity 由
+  // tests/test_semantic_aggregation 双端钉）。
+  function normalizeStackData(type,data,series,xLen){
+    if(type!=='stackedBar'||!data||data.stackMode!=='normalize'||!series.length)return series;
+    for(var i=0;i<xLen;i+=1){
+      var tot=0;
+      for(var s=0;s<series.length;s+=1){var v=series[s].data[i];if(v!=null)tot+=number(v);}
+      if(tot>0){
+        for(var s2=0;s2<series.length;s2+=1){var v2=series[s2].data[i];if(v2!=null)series[s2].data[i]=number(v2)/tot*100;}
+      }
+    }
+    return series;
   }
   function categoryOption(option,type,data,entries,decimals,chart){    clearCoordinates(option);
     option.tooltip=Object.assign({trigger:'axis'},option.tooltip||{});
@@ -2686,6 +2713,7 @@
           stack:(crowdedLine||type!=='stackedBar')?undefined:'合计',areaStyle:type==='area'?{}:undefined,smooth:crowdedLine||type==='line'||type==='area',
           data:xd.map(function(lbl){var hit=entries.filter(function(e){return e.label===lbl&&String(e.breakdown)===name;})[0];return hit?(hit.values[0]==null?null:number(hit.values[0])):0;})};
       });
+      normalizeStackData(type,data,breakdownSeries,xd.length);
       option.series=breakdownSeries;
     }else{
       // Composite (混合图表): per-measure series type + Y-axis. data.seriesType

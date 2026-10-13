@@ -1184,7 +1184,12 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             _dim_v = encoding.get("dimension")
             if _dim_v is not None and (not isinstance(_dim_v, str) or not _dim_v.strip()):
                 raise RequestValidationError(f"encoding.dimension must be a non-empty string; got {_dim_v!r}")
-            unknown_encoding = sorted(set(encoding) - {"dimension", "dimensions", "breakdown", "breakdowns", "measures", "aggregation", "limit", "sort", "roles", "measureTypes", "bucket", "topK", "topKOther", "pagination"})
+            unknown_encoding = sorted(set(encoding) - {"dimension", "dimensions", "breakdown", "breakdowns", "measures", "aggregation", "limit", "sort", "roles", "measureTypes", "bucket", "topK", "topKOther", "pagination", "stackMode"})
+            # stackMode（2026-10-13 语义批）：stackedBar 的堆叠口径——'sum'（缺省）
+            # 或 'normalize'（占比堆叠：每根柱各段归一到 100%，Flint resolveStackable
+            # 对 Percentage 的 normalize 形态，field-semantics.ts:1028-1031）。
+            if encoding.get("stackMode") is not None and encoding["stackMode"] not in ("sum", "normalize"):
+                raise RequestValidationError("encoding.stackMode must be 'sum' or 'normalize'")
             if unknown_encoding:
                 hint = "（topK/pagination 是 chart 级字段，写在 chart 上而不是 encoding 里）" \
                     if {"topK", "pagination"} & set(unknown_encoding) else ""
@@ -1544,6 +1549,16 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             request.setdefault("_chartWarnings", []).append(
                 f"kpis[{_ki}]（{kpi.get('label') or kpi.get('title') or '?'}）提供了静态 value 且请求声明了 filters —— "
                 "筛选后该值不会重算；如需随筛选联动请改用脚本计算的口径（factType count/distinctCount + measure/dimension）")
+        # Advisory（2026-10-13 语义批）：intensive 指标（价格/比率/评分）显式 sum 的
+        # KPI 不阻断（作者显式声明尊重之），但给可行动提示——图表侧 sum 闸是硬错误，
+        # KPI 卡这里只是口径提醒，两端不对称是有意的。
+        if isinstance(kpi, dict) and str(kpi.get("aggregation") or "").lower() == "sum" and kpi.get("measure"):
+            from measure_semantics import default_aggregation as _da
+            _mt_entry = (request.get("measureTypes") or {}).get(kpi["measure"])
+            if _da(_mt_entry, str(kpi["measure"])) == "average":
+                request.setdefault("_chartWarnings", []).append(
+                    f"kpis[{_ki}]（{kpi.get('label') or kpi.get('measure')}）对单价/比率类指标显式声明 aggregation:'sum' —— "
+                    "加总在业务上无意义（所有行价格/比率相加）；建议改 'average'，或换计数类口径")
     if not isinstance(request.get("insights"), (list, type(None))):
         raise RequestValidationError("insights must be a list (got " + type(request.get("insights")).__name__ + ")")
     # 上限分档：free 10，standard 3（关键洞察带的编辑部位假设不变）。
