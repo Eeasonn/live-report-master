@@ -726,10 +726,15 @@
   // on the JS side as the Python compile (e.g. a 转化率 line should data-fit, not
   // pin 0). Returns a canonical T2 label or null.
   function semanticNameType(col){
+    // 与 PY measure_semantics.semantic_label_of 逐词镜像（2026-10-13 收尾批对齐）：
+    // JS 此前缺价族（均价被当 currency），还带着裸「价/额」与 PY 没有的英文词——
+    // 英文名由编译侧 resolve_t2 整词 FAMILY_MAP typing，名称子串推断只认 PY 同款词汇。
     var n=String(col);
-    if(/率|占比|百分比|比例|rate|ratio|percent/i.test(n))return 'percent';
-    if(/金额|销售额|收入|价|额|revenue|amount|price|cost/i.test(n))return 'currency';
-    if(/量|数|个|件|笔|count|qty|数量/i.test(n))return 'count';
+    if(/率|占比|百分比|比例/.test(n))return 'percent';
+    if(/售价|单价|价格|标价|原价|现价|均价|price/i.test(n))return 'price';
+    // 「额」裸子串退役：名额/限额/超额不是钱——X额 只认「货币语素+额」。
+    if(/金额|销售额|收入|营收|营业额|利润|毛利|净利|成本|费用|[销营利毛净税费收支余差]额/.test(n))return 'currency';
+    if(/量|数|个|件|笔/.test(n))return 'count';
     return null;
   }
   function semanticType(data,col){
@@ -826,6 +831,15 @@
   function measureFormat(data,measure,fallbackDecimals){
     if(!measure)return null;
     var rawMt=effectiveMeasureType(data,measure);
+    // 派生指标语义注解槽（2026-10-13 收尾批）：node.semantic 显式声明优先于名称
+    // 推断——「对客折扣」也能拿 percent 格式，不再依赖名字恰好含「率」。只在显式
+    // 声明时接管：node.measureType 的 setdefault {type:'number'} 不参与，否则会
+    // 洗掉既有名称推断（毛利率含「率」→percent）造成回归。
+    var _dmFmt=data&&data.derivedMeasures?data.derivedMeasures[measure]:null;
+    if(_dmFmt&&_dmFmt.semantic){
+      var _sc=flintCanonicalAlias(_dmFmt.semantic);
+      for(var _sk in FLINT_ALIAS){if(FLINT_ALIAS[_sk]===_sc&&T2_CANON[_sk]){rawMt=_sk;break;}}
+    }
     var resolved=resolveMeasureType(rawMt,fallbackDecimals);
     if(!resolved)return null;
     // Per-measure decimal override (data.decimals[measure], set by the measure
@@ -2749,6 +2763,23 @@
       // an explicit index keeps the axis assignment unambiguous and the audit
       // of per-series yAxisIndex deterministic).
       if(dual)option.series.forEach(function(s){if(s.yAxisIndex==null)s.yAxisIndex=0;});
+      // diverging 正负双色（2026-10-13 收尾批，Flint §5.5）：语义发散（Profit/
+      // PercentageChange/Sentiment/Correlation/Temperature，Score 跨中点）且数据
+      // 真有负值 → 负段用对比红、正段保持系列色。环比/同比窗口指标的 rate 输出
+      // 天然是 PercentageChange 语义，无需额外注解。仅 bar 族（堆叠/线不做）。
+      if(type==='bar'){
+        option.series.forEach(function(s,si){
+          var m=(data.measures||[])[si];if(!m)return;
+          var vals=s.data.map(function(v){return (v&&typeof v==='object')?v.value:v;});
+          if(!vals.some(function(v){return v!=null&&Number(v)<0;}))return;
+          var label=null;
+          var dn=data&&data.derivedMeasures?data.derivedMeasures[m]:null;
+          if(dn)label=dn.semantic||((dn.kind==='window'&&dn.output==='rate')?'PercentageChange':null);
+          if(!label){var mts=data&&data.measureTypes?data.measureTypes[m]:null;label=(mts&&mts.semantic)?mts.semantic:null;}
+          if(flintDivergingDecision(label||'',vals).type!=='diverging')return;
+          s.data=vals.map(function(v){return (v!=null&&Number(v)<0)?{value:v,itemStyle:{color:'#dc2626'}}:v;});
+        });
+      }
     }
     // 单位显示在 Y 轴上方：轴名称 = 用户填的名称（缺省取该轴首个指标名）+ 单位后缀
     // （如「销售额（万）」，单位跟轴走——同一根轴上的指标共用其单位）。
@@ -2766,15 +2797,20 @@
       var firstOn0=null,firstOn1=null;
       option.series.forEach(function(s){if(s.yAxisIndex===1){if(firstOn1==null)firstOn1=s.name;}else if(firstOn0==null)firstOn0=s.name;});
       var name0=firstOn0||measureDisplayName(data,measures[0]),name1=firstOn1||measureDisplayName(data,measures[1]);
+      var _dom0=(axisCfg[0]&&(axisCfg[0].min!=null||axisCfg[0].max!=null))?null:flintAxisDomain(data,firstOn0||measures[0],entries.map(function(e){return e.values[0];}));
+      var _dom1=(axisCfg[1]&&(axisCfg[1].min!=null||axisCfg[1].max!=null))?null:flintAxisDomain(data,firstOn1||measures[1],entries.map(function(e){return e.values[1];}));
       option.yAxis=[
-        {type:'value',name:nameWithUnit(0,axisCfg[0]&&axisCfg[0].name!=null?axisCfg[0].name:name0),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}},
-        {type:'value',name:nameWithUnit(1,axisCfg[1]&&axisCfg[1].name!=null?axisCfg[1].name:name1),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{show:false}}
+        Object.assign({type:'value',name:nameWithUnit(0,axisCfg[0]&&axisCfg[0].name!=null?axisCfg[0].name:name0),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}},_dom0||{}),
+        Object.assign({type:'value',name:nameWithUnit(1,axisCfg[1]&&axisCfg[1].name!=null?axisCfg[1].name:name1),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{show:false}},_dom1||{})
       ];
     }else{
       // 轴名走 measureDisplayName：合成行数指标 '*' 显示「记录数」（编译静态层
       // _measure_name 同口径）——裸回退 measures[0] 会在重聚合后把 '*' 挂上轴顶。
       var baseName=(axisCfg[0]&&axisCfg[0].name!=null)?axisCfg[0].name:measureDisplayName(data,(data.measures&&data.measures[0])||'');
-      option.yAxis={type:'value',name:nameWithUnit(0,baseName),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}};
+      // Score 域钉 0–100 / Rank 反转（作者显式 min/max 恒优先——BI-H4 手工轴范围）。
+      var _dom=(axisCfg[0]&&(axisCfg[0].min!=null||axisCfg[0].max!=null))?null
+        :flintAxisDomain(data,(data.measures||[])[0],entries.map(function(e){return e.values[0];}));
+      option.yAxis=Object.assign({type:'value',name:nameWithUnit(0,baseName),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}},_dom||{});
     }
     option.legend=Object.assign({type:'scroll'},option.legend||{},{data:(option.series||[]).map(function(s){return s.name;})});
     if(entries.length>18&&['bar','stackedBar','line','area'].indexOf(type)>=0){
@@ -3625,6 +3661,43 @@
     var spans=dmin<mid&&dmax>mid;
     return {type:spans?'diverging':'sequential',midpoint:spans?mid:null};
   }
+  // ---- 单指标不可加判定（2026-10-13 收尾批）---------------------------------
+  // 编辑器逐指标聚合闸的唯一判据：price/percent/unitless（T2）与 share/window.rate
+  // /声明 intensive 语义的派生指标没有有意义的「求和」。全局聚合已有
+  // anyNonAdditive 强制 average；这里补逐指标 chip-agg 的同一闸。
+  function nonAdditiveMeasureOf(data,measure){
+    var mt=effectiveMeasureType(data,measure);
+    var t=(mt&&typeof mt==='object')?(mt.type||'number'):mt;
+    var resolved=t?normalizeMeasureType(t):null;
+    var t2=(resolved&&(typeof resolved==='object'?resolved.type:resolved))||t||null;
+    if(t2&&NONADDITIVE_TYPE[t2])return true;
+    var dn=data&&data.derivedMeasures?data.derivedMeasures[measure]:null;
+    if(dn){
+      if(dn.kind==='share'||(dn.kind==='window'&&dn.output==='rate'))return true;
+      if(dn.semantic){
+        var sc=flintCanonicalAlias(dn.semantic);
+        for(var k in FLINT_ALIAS){if(FLINT_ALIAS[k]===sc&&NONADDITIVE_TYPE[k])return true;}
+      }
+      return false;
+    }
+    return fieldSemanticNonAdditive(data,measure,t2);
+  }
+  // ---- 轴域语义（2026-10-13 收尾批，Flint domainShape bounded / intrinsicDomain）----
+  // Score/Rating 有界域 [0,100]：值全落在域内时轴钉 0–100（评分 68 不该把轴顶撑到
+  // 70）。Rank 序数域：值越大名次越差 → 轴反转（第 1 名画在轴顶）。作者显式
+  // min/max（axisConfig）恒优先（调用点判）。**Python 镜像** =
+  // spec_to_report._flint_value_axis 同款判定（parity 由 test_semantic_aggregation 钉）。
+  function flintAxisDomain(data,measure,values){
+    var entry=data&&data.measureTypes?data.measureTypes[measure]:null;
+    var sem=(entry&&typeof entry==='object')?entry.semantic:null;
+    var label=flintCanonicalAlias(String(sem||''));
+    var t=FLINT_TYPES[label];
+    if(!t)return null;
+    var nums=[];(values||[]).forEach(function(v){var n=Number(v);if(Number.isFinite(n))nums.push(n);});
+    if(label==='Rank')return nums.length?{inverse:true}:null;
+    if(label==='Score'&&nums.length&&nums.every(function(v){return v>=0&&v<=100;}))return {min:0,max:100};
+    return null;
+  }
   function flintBuildProfile(fields){
     var p={measures:[],temporals:[],categoricals:[],ordinals:[],dims:[],cardinality:{}};
     (fields||[]).forEach(function(f){
@@ -3725,5 +3798,5 @@
     out.sort(function(a,b){return b.score-a.score;});
     return out;
   }
-  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
+  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,nonAdditiveMeasureOf:nonAdditiveMeasureOf,flintAxisDomain:flintAxisDomain,semanticNameType:semanticNameType,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
 })(window);

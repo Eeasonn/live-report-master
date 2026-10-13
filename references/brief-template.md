@@ -52,7 +52,7 @@
 | 一行 = 什么 | DataProfile 核对；粒度决定可加性判断与比率合法性 |
 | 要回答的问题（五要素） | 每条问句 → 一张 chart：维度→`dimensions`、指标→`measures`、时间窗→filters/分桶、图→`presetId`/`encoding`（空 = suggest 按问句动词选：趋势/对比/构成/转化/关联） |
 | 口径与派生 | `derived.measures`（聚合级比率，重算不取平均）/ `derived.columns`；冗余维度只声明其一 + `columnRoles.ignore`；单位 → measureTypes（divisor/currency/percent） |
-| 对账锚点 | 构建后 Agent 抽查勾稽，实测值 vs 锚点记入 build/decisions.md（validate 自动断言为 P2 待做） |
+| 对账锚点 | 声明 `request.anchors:[{label?,measure,value,aggregation?}]`（≤8 条，measure 可引用计算列）——编译期对真实表重算勾稽，**不符即构建失败**（P2 已落地，2026-10-13）；实测值仍记入 build/decisions.md |
 | 对比方式 | 无指标时 → 不落；有指标时 → 数据源配置建窗口派生指标 + `kpi.compareMeasure` |
 | 时间分桶与锚点 | `dimensionBucket`（日/周/月/季/年）；「数据最大期」锚 = dataAsOf 口径 |
 | 交付与受众 | 单文件 → `--mode singlefile`；本机服务端 → `--mode server`；受众 → 汇报模式建议 + 口径注释密度；标题 → cover |

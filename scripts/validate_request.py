@@ -990,7 +990,7 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         raise RequestValidationError('templateId must be "standard-bi-v1" or "free-v1"')
     allowed_keys = {"schemaVersion", "reportId", "templateId", "title", "subtitle", "analysisGoal",
                     "columnRoles", "measureTypes", "semantic_types", "facts", "kpis", "charts", "insights", "filters", "sections",
-                    "texts", "kpiPosition",
+                    "texts", "kpiPosition", "anchors",
                     "style", "runtime", "source", "provenance", "_chartWarnings", "dataTable", "fieldRoles", "hierarchy",
                     "datasets", "relations", "pageWidth", "cover", "dataSourceMode"}
     # P1 (docs/semantic-config-and-derived-redesign.md §1/§5):
@@ -1633,6 +1633,30 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fact.get("id"), str) or not SAFE_ID_RE.fullmatch(fact["id"]) or fact["id"] in fact_ids:
             raise RequestValidationError(f"duplicate/invalid fact id: {fact.get('id')!r}")
         fact_ids.add(fact["id"])
+    # 对账锚点（brief-template v2 §口径槽的 P2 断言落地，2026-10-13 收尾批）：
+    # 构建期勾稽的真值声明——shape 在请求层校验，数值断言在 compile_spec
+    # （_check_anchors，物化计算列之后的真实表上重算），不符即编译失败。
+    anchors = request.get("anchors")
+    if anchors is not None:
+        if not isinstance(anchors, list) or len(anchors) > 8:
+            raise RequestValidationError("anchors must be a list of at most 8 items")
+        for a in anchors:
+            if not isinstance(a, dict):
+                raise RequestValidationError(f"anchor must be an object: {a!r}")
+            unknown = set(a) - {"label", "measure", "aggregation", "value", "dataset", "tolerance"}
+            if unknown:
+                raise RequestValidationError(f"unsupported anchor fields: {sorted(unknown)}")
+            if not isinstance(a.get("measure"), str) or not a["measure"].strip():
+                raise RequestValidationError("anchor.measure 必须是非空字符串")
+            if not isinstance(a.get("value"), (int, float)) or isinstance(a.get("value"), bool):
+                raise RequestValidationError("anchor.value 必须是数字")
+            if (a.get("aggregation") or "sum") not in {"sum", "average", "count", "min", "max"}:
+                raise RequestValidationError("anchor.aggregation 必须是 sum/average/count/min/max")
+            if a.get("dataset") is not None and (not isinstance(a["dataset"], str) or not a["dataset"].strip()):
+                raise RequestValidationError("anchor.dataset 必须是非空字符串")
+            tol = a.get("tolerance")
+            if tol is not None and (not isinstance(tol, (int, float)) or isinstance(tol, bool) or float(tol) < 0):
+                raise RequestValidationError("anchor.tolerance 必须是 ≥0 的数字")
     measure_types = request.get("measureTypes") or {}
     request["measureTypes"] = _normalize_measure_types(measure_types)
     # semantic_types productization (docs/semantic-config-enhancement.md §3): the

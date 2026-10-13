@@ -200,26 +200,55 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"},
-          "title": {"type": "string", "maxLength": 120},
-          "text": {"type": "string", "minLength": 1, "description": "正文（Markdown），必填"},
-          "style": {"type": "object"},
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{1,79}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "正文（Markdown），必填"
+          },
+          "style": {
+            "type": "object"
+          },
           "layout": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "x": {"type": "integer", "minimum": 0},
-              "y": {"type": "integer", "minimum": 0},
-              "h": {"type": "integer", "minimum": 1}
+              "x": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "y": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "h": {
+                "type": "integer",
+                "minimum": 1
+              }
             }
           },
-          "after": {"type": "string", "description": "图表 id：文本块插入该图表之后"}
+          "after": {
+            "type": "string",
+            "description": "图表 id：文本块插入该图表之后"
+          }
         },
-        "required": ["text"]
+        "required": [
+          "text"
+        ]
       }
     },
     "kpiPosition": {
-      "enum": ["top", "bottom"],
+      "enum": [
+        "top",
+        "bottom"
+      ],
       "description": "KPI 条位置，仅 free-v1：top=封面/筛选之下（缺省）；bottom=图表/文本区与洞察卡之后。"
     },
     "datasets": {
@@ -241,8 +270,19 @@
           "file": {
             "description": "路径字符串，或 1-8 个路径的数组（构建期同构并集 UNION：列集一致、顺序无关，类型以合并后全集判定，如 W35+W36 两周数据）",
             "oneOf": [
-              {"type": "string", "maxLength": 512},
-              {"type": "array", "items": {"type": "string", "maxLength": 512}, "minItems": 1, "maxItems": 8}
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "maxLength": 512
+                },
+                "minItems": 1,
+                "maxItems": 8
+              }
             ]
           },
           "columnRoles": {
@@ -360,7 +400,8 @@
                       "enum": [
                         "sum",
                         "average",
-                        "count", "countd",
+                        "count",
+                        "countd",
                         "min",
                         "max"
                       ]
@@ -1118,6 +1159,52 @@
       "type": "object",
       "additionalProperties": true,
       "description": "封面内容（title/meta/summary）。standard 档缺省自动组装；free-v1 档不声明则整张报告无封面。"
+    },
+    "anchors": {
+      "type": "array",
+      "maxItems": 8,
+      "description": "对账锚点（brief-template v2 §口径）：构建期勾稽的真值声明——compile 在物化计算列后的真实表上重算，与声明值不符即编译失败。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "measure",
+          "value"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "maxLength": 60,
+            "description": "锚点人话名（缺省 锚点N）"
+          },
+          "measure": {
+            "type": "string",
+            "minLength": 1
+          },
+          "aggregation": {
+            "enum": [
+              "sum",
+              "average",
+              "count",
+              "min",
+              "max"
+            ],
+            "default": "sum"
+          },
+          "value": {
+            "type": "number"
+          },
+          "dataset": {
+            "type": "string",
+            "description": "数据集 id（缺省主数据集）"
+          },
+          "tolerance": {
+            "type": "number",
+            "minimum": 0,
+            "description": "容差（缺省 max(|value|×1e-6, 1e-6)）"
+          }
+        }
+      }
     }
   },
   "$defs": {
@@ -1170,7 +1257,8 @@
           "enum": [
             "sum",
             "average",
-            "count", "countd",
+            "count",
+            "countd",
             "min",
             "max"
           ]
@@ -1207,7 +1295,8 @@
               "enum": [
                 "sum",
                 "average",
-                "count", "countd",
+                "count",
+                "countd",
                 "min",
                 "max"
               ]
@@ -1322,7 +1411,8 @@
               "enum": [
                 "sum",
                 "average",
-                "count", "countd",
+                "count",
+                "countd",
                 "min",
                 "max"
               ]
@@ -1379,7 +1469,8 @@
           "enum": [
             "sum",
             "average",
-            "count", "countd",
+            "count",
+            "countd",
             "min",
             "max"
           ]

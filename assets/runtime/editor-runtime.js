@@ -8903,6 +8903,10 @@
   function kpiCurrencySymbol(kp){
     var col=kp&&(kp.countDim||kp.measure);
     var ds=col?kpiDataset(kp):null;
+    // 跟随 hideCurrency（2026-10-13 收尾批）：指标芯片关掉货币符号后，同一数据集上
+    // 引用该列的 KPI 也不再显示前缀——图表/表格/KPI 三处口径一致，「图表无 ¥、
+    // KPI 有 ¥」的自相矛盾不再出现。
+    if(ds&&ds.hideCurrency&&ds.hideCurrency[col])return '';
     var mt=(ds&&ds.measureTypes)?ds.measureTypes[col]:null;
     return (typeof adapter!=='undefined'&&adapter.currencySymbolOf)?adapter.currencySymbolOf(mt):'¥';
   }
@@ -10518,14 +10522,21 @@
     if(viewType==='bar'||viewType==='stackedBar'||viewType==='line'||viewType==='area')return 10;
     return (rule&&rule.meas.max!=null)?rule.meas.max:2;
   }
-  function chipMeasureAgg(measure,current){
+  function chipMeasureAgg(measure,current,dataCtx){
     var val=current||'sum';
     // 合成行数指标：聚合恒为行数（COUNT(*)），本地 effectiveMethod 与服务端守卫都
     // 强制 count——下拉锁死成「计数」，不给用户选一个必然被忽略（server 模式直接
     // 400）的聚合。disabled select 的 value 照常可读，updateChart 写回即自愈。
     if(measure==='*')return '<select class="ai-report-chip-agg" data-bi-control="true" data-bi-control-action="chip-agg" data-measure="'+escapeHtml(measure)+'" title="记录数按行数计数（COUNT(*)），聚合方式固定" disabled><option value="count" selected>计数</option></select>';
-    return '<select class="ai-report-chip-agg" data-bi-control="true" data-bi-control-action="chip-agg" data-measure="'+escapeHtml(measure)+'" title="该指标如何聚合">'
-      +AGG_METHODS.map(function(pair){return '<option value="'+pair[0]+'" '+(val===pair[0]?'selected':'')+'>'+pair[1]+'</option>';}).join('')
+    // 语义聚合闸（2026-10-13 收尾批）：不可加指标（price/percent/unitless、share/
+    // window.rate 派生）没有有意义的「求和」——下拉不提供 sum；残留的 sum 值回显为
+    // average（全局聚合 anyNonAdditive 同款先例；服务端信任 manifest，错误请求在
+    // 编辑器这一侧就不再产生）。
+    var na=dataCtx&&adapter.nonAdditiveMeasureOf?adapter.nonAdditiveMeasureOf(dataCtx,measure):false;
+    var opts=na?AGG_METHODS.filter(function(pair){return pair[0]!=='sum';}):AGG_METHODS;
+    if(na&&val==='sum')val='average';
+    return '<select class="ai-report-chip-agg" data-bi-control="true" data-bi-control-action="chip-agg" data-measure="'+escapeHtml(measure)+'" title="该指标如何聚合"'+(na?' data-nonadditive="1"':'')+'>'
+      +opts.map(function(pair){return '<option value="'+pair[0]+'" '+(val===pair[0]?'selected':'')+'>'+pair[1]+'</option>';}).join('')
       +'</select>';
   }
   // A′（2026-09-26 摘要行重构）：聚合方法的中文词。摘要行 aggword 与悬停 title 的
@@ -11483,7 +11494,7 @@
     var popBody='',gearTips=[],cfgN=0;
     if(zone==='measure'&&data){
       var cur=(data.aggregations&&data.aggregations[column])||data.aggregation||'sum';
-      popBody=chipControl('指标处理',chipMeasureAgg(column,cur))
+      popBody=chipControl('指标处理',chipMeasureAgg(column,cur,data))
         +chipComposite(column,data,chart)
         // 单位已从指标 chip 移到「Y 轴」区块，跟轴走（见 axisControls）；不再逐指标设置单位。
         +chipReferenceLine(column,data,chart)
@@ -12369,7 +12380,18 @@
       // 时间轴永不截断（趋势保 chrono），表格用行数/分页控制。表格卡已由上层
       // 早退（表格面板有自己的「显示行数/分页」），这里只对无 TOP-K 的图表解释。
       :(view==='table'?'':('<p class="ai-report-hint">TOP-K 只在 柱状图 / 堆叠柱状图 提供：趋势图保持完整时间序（时间轴永不截断）；表格卡用「显示行数 / 分页」控制行数。</p>'));
-    return sortPrefix+topKPrefix;
+    // 占比堆叠切换（2026-10-13 收尾批，stackMode='normalize' 的编辑器面）：仅堆叠
+    // 柱渲染。绝对值堆叠 = 缺省不落盘（旧 manifest 零漂移）；占比堆叠写
+    // editor.data.stackMode='normalize'（每根柱各段归一 100%，Flint resolveStackable
+    // Percentage→normalize 先例）。换走堆叠视图时 updateChart 删键自洁。
+    var stackPrefix=(view==='stackedBar')?('<fieldset class="ai-report-subfieldset"><legend>堆叠方式</legend>'
+      +'<div class="ai-sort-field"><label>段落取值</label><select id="ai-chart-stackmode" data-bi-control="true">'
+      +'<option value="sum" '+(!edData.stackMode?'selected':'')+'>绝对值堆叠</option>'
+      +'<option value="normalize" '+(edData.stackMode==='normalize'?'selected':'')+'>占比堆叠（每柱 100%）</option>'
+      +'</select></div>'
+      +'<p class="ai-report-hint">占比堆叠把每根柱的各段归一到 100%（显示构成占比；TOP-K 与排序仍按原始值计算）。</p>'
+      +'</fieldset>'):'';
+    return sortPrefix+topKPrefix+stackPrefix;
   }
   function displayControls(chart,flags,data){
     var ed=chart&&chart.editor||{};
@@ -14714,10 +14736,12 @@
           ? '<span class="ai-sem-derive-dep" title="窗口指标声明了自己的时间列与粒度：图表维度必须是它、分桶必须等于粒度">依赖 '+escapeHtml(n.timeField||'?')+' / '+derivedGrainLabel(n.grain)+'</span>'
           : '<span class="ai-sem-derive-dep" title="聚合级公式在图表当前分组上求值（毛利率随维度不同而不同）">按卡片分组计算</span>'));
       var legacy=n.legacyScope?'<span class="ai-sem-derive-dep ai-sem-derive-badge-warn" title="旧口径（父级/固定子集占比），建议重建为公式">旧口径</span>':'';
+      // 语义注解徽标（2026-10-13 收尾批）：显式 semantic 一眼可见。
+      var semBadge=n.semantic?('<span class="ai-sem-derive-dep" title="显式语义注解（Flint '+escapeHtml(n.semantic)+'）：格式/缺省聚合/轴域按此渲染，不再依赖名称推断">'+escapeHtml(n.semantic)+'</span>'):'';
       return '<div class="ai-sem-derive-row ai-sem-derive-row-msr" data-der-msr-row="'+i+'">'
         +'<span class="ai-sem-derive-fx">ƒ</span>'
         +'<span class="ai-sem-derive-summary" title="'+escapeHtml(derivedNodeSummary(n))+'">'+escapeHtml(derivedNodeSummary(n))+'</span>'
-        +dep+legacy
+        +dep+legacy+semBadge
         +'<button type="button" class="ai-sem-derive-edit" data-der-msr-edit="'+i+'">编辑</button>'
         +'<button type="button" class="ai-sem-derive-x" data-der-msr-del="'+i+'" title="删除派生指标">×</button>'
         +'</div>';
@@ -15097,7 +15121,7 @@
         if(nfn==='cum'||nfn==='ytd'||CALC_RANK_FNS.indexOf(nfn)>=0)nwin.kind=nfn;
         if(CALC_RANK_FNS.indexOf(nfn)>=0){delete nwin.grain;delete nwin.offset;delete nwin.timeField;}
         var nmethod=(n.kind==='formula'?'formula':(n.kind==='share'?'share':(n.kind==='filtered'?'filtered':'window')));
-        state={tab:'measure',method:nmethod,name:n.name||'',
+        state={tab:'measure',method:nmethod,name:n.name||'',semantic:n.semantic||'',
                exprText:(n.expr?exprAstToText(n.expr):''),
                win:nwin,
                share:{input:n.input||{agg:'sum',col:''},scope:(n.scope||'all'),parentField:(n.parentField||'')},
@@ -15106,15 +15130,15 @@
     }else if(tab==='column'){
       state={tab:'column',method:'formula',name:'',op:'sub',left:{t:'col',v:''},right:{t:'col',v:''}};
     }else if(method==='formula'){
-      state={tab:'measure',method:'formula',name:'',exprText:''};
+      state={tab:'measure',method:'formula',name:'',exprText:'',semantic:''};
     }else if(method==='share'){
-      state={tab:'measure',method:'share',name:'',
+      state={tab:'measure',method:'share',name:'',semantic:'',
              share:{input:{agg:'sum',col:preset.inputCol||''},scope:(preset.shareScope||'all'),parentField:(preset.parentField||'')}};
     }else if(method==='filtered'){
-      state={tab:'measure',method:'filtered',name:'',
+      state={tab:'measure',method:'filtered',name:'',semantic:'',
              fm:{agg:'countd',col:preset.inputCol||'',filters:[{col:'',op:'eq',value:''}]}};
     }else{
-      state={tab:'measure',method:'window',name:'',
+      state={tab:'measure',method:'window',name:'',semantic:'',
              win:{input:{agg:'sum',col:preset.inputCol||''},fn:'prev',
                   grain:preset.grain||'month',offset:1,
                   timeField:(preset.timeField||semTimeCols()[0]||''),output:'rate'}};
@@ -15148,6 +15172,16 @@
       }).join('');
       var nameRow='<div class="ai-calc-row"><span class="ai-calc-k">名称</span>'
         +'<input class="ai-calc-name" data-calc-name maxlength="40" placeholder="例如 净流入" value="'+escapeHtml(state.name||'')+'"></div>';
+      // 语义注解（2026-10-13 收尾批）：显式声明 Flint 语义标签——格式/不可加闸/
+      // 轴域据此渲染，不再依赖名字含「率」「价」。空 = 自动（名称推断，现状）。
+      var semRow='';
+      if(state.tab==='measure'){
+        var semOpts=['<option value="">自动（按名称推断）</option>'].concat(SEM_SEMANTIC_OPTIONS.map(function(o){
+          return '<option value="'+o[0]+'"'+(state.semantic===o[0]?' selected':'')+'>'+o[1]+'</option>';
+        })).join('');
+        semRow='<div class="ai-calc-row"><span class="ai-calc-k">语义</span>'
+          +'<select data-calc-semantic>'+semOpts+'</select></div>';
+      }
       var body='';
       if(state.tab==='column'){
         var isDD=state.op==='datediff';
@@ -15296,7 +15330,7 @@
             +'<button type="button" class="ai-calc-method'+(state.method==='share'?' is-on':'')+'" data-calc-method="share" title="占比：值 ÷ 分组字段合计 ×100">占比</button>'
             +'<button type="button" class="ai-calc-method'+(state.method==='filtered'?' is-on':'')+'" data-calc-method="filtered" title="条件聚合：组内只聚合满足筛选条件的行（如 数「销量=0 且 库存>1」的门店）">筛选聚合</button></div>')
           :'')
-        +nameRow+body
+        +nameRow+semRow+body
         +msgBlockHtml()+previewBlockHtml()
         +'</div>'
         +(formulaEditor?('<div class="ai-calc-side">'+fieldLib+libHtml
@@ -15449,6 +15483,7 @@
     function readState(){
       var q=function(sel){return box.querySelector(sel);};
       var nm=q('[data-calc-name]');if(nm)state.name=nm.value;
+      var smq=q('[data-calc-semantic]');if(smq)state.semantic=smq.value||'';
       if(state.tab==='column'){
         ['left','right'].forEach(function(side){
           var sel=q('[data-calc-side="'+side+'"]');if(!sel)return;
@@ -15533,7 +15568,7 @@
     }
     // 校验（与编译侧同一裁决器）
     function ownNames(){return ((semCanvas.orig&&semCanvas.orig.derived&&semCanvas.orig.derived.columns)||[]).map(function(c){return c&&c.name;});}
-    function candidate(){
+    function candidateRaw(){
       if(state.tab==='column'){
         function sideVal(s){
           if(!s)return '';
@@ -15583,6 +15618,14 @@
       node.measureType={type:(w.output==='rate')?'percent':'number'};
       if(w.fn==='prev')node.offset=Math.max(1,Number(w.offset||1));   // cum/ytd 无期数
       return node;
+    }
+    // 语义注解随节点落盘（2026-10-13 收尾批）：candidateRaw 各分支不感知
+    // semantic，由这一层统一挂——formula/filtered/window/share 四类节点都接受
+    // （PY derived_model._MEASURE_FIELDS 全 kind 放行同一槽位）。
+    function candidate(){
+      var n=candidateRaw();
+      if(n&&!n.__parseError&&state.tab==='measure'&&state.semantic)n.semantic=state.semantic;
+      return n;
     }
     function validate(){
       var node=candidate();
@@ -16035,6 +16078,9 @@
         // 局部重绘（paintPartial 只换消息条+预览区）：state.name 只渲染在输入框
         // 本身，整弹窗重建会把焦点打掉——逐字输入每敲一个字符都要重新点一遍。
         el.addEventListener('input',function(){state.name=el.value;validate();paintPartial();});
+      });
+      box.querySelectorAll('[data-calc-semantic]').forEach(function(el){
+        el.addEventListener('change',function(){state.semantic=el.value||'';validate();});
       });
       box.querySelectorAll('[data-calc-close],[data-calc-cancel]').forEach(function(el){
         el.addEventListener('click',function(){close();});
@@ -21019,6 +21065,13 @@
       var sel=document.querySelector('.ai-report-chip-agg[data-measure="'+CSS.escape(m)+'"]');
       return sel?sel.value:'default';
     });
+    // 语义聚合闸（读取侧归一，2026-10-13 收尾批）：旧报告/手改 manifest 残留的
+    // 不可加指标 sum 在这里归一为 average 并落盘自愈——下拉已不提供 sum（见
+    // chipMeasureAgg），两处同闸。
+    perMeasureMethods=perMeasureMethods.map(function(meth,idx2){
+      var m2=finalMeasures[idx2];
+      return (meth==='sum'&&adapter.nonAdditiveMeasureOf&&adapter.nonAdditiveMeasureOf(data,m2))?'average':meth;
+    });
     selection.aggregations=perMeasureMethods.reduce(function(acc,meth,idx){
       if(meth!=='default')acc[finalMeasures[idx]]=meth;
       return acc;
@@ -21084,6 +21137,12 @@
     // BI-H3：合并其余为「其他」（开关只在可加指标时渲染）。
     var topKOtherEl=document.getElementById('ai-chart-topk-other');
     if(topKOtherEl){if(topKOtherEl.checked)selection.topKOther=true;else delete selection.topKOther;}
+    // 占比堆叠提交（2026-10-13 收尾批）：select 在场（堆叠柱）按值写/删键；select
+    // 缺席且新视图已不是堆叠柱 → 删键自洁（stackMode 只属于 stackedBar 几何）。
+    // chart.viewType 此刻已是新视图值。
+    var smEl=document.getElementById('ai-chart-stackmode');
+    if(smEl){if(smEl.value==='normalize')chart.editor.data.stackMode='normalize';else delete chart.editor.data.stackMode;}
+    else if(chart.viewType!=='stackedBar')delete chart.editor.data.stackMode;
     var prevViewType=chart.viewType;
     var legEl=document.getElementById('ai-chart-legend'),lblEl=document.getElementById('ai-chart-label'),gridEl0=document.getElementById('ai-chart-grid');
     chart.viewType=view.value;chart.editor.flags={legend:legEl?legEl.checked:(chart.editor.flags&&chart.editor.flags.legend!==false),label:lblEl?lblEl.checked:(chart.editor.flags&&chart.editor.flags.label),grid:gridEl0?gridEl0.checked:(chart.editor.flags&&chart.editor.flags.grid)};
@@ -22949,6 +23008,10 @@ if(rfEl){
         nameSeen[n.name]=1;
       }
       if(['formula','window','share','filtered'].indexOf(n.kind)<0){errors.push(label+'的类型必须是 公式/窗口/占比/筛选聚合');return;}
+      if(n.semantic!=null&&n.semantic!==''){
+        var _sc=(adapter.flintCanonicalAlias?adapter.flintCanonicalAlias(String(n.semantic)):String(n.semantic));
+        if(!(adapter.flintGetType&&adapter.flintGetType(_sc)))errors.push(label+'的语义标签「'+n.semantic+'」不合法');
+      }
       derivedNodeCols(n).forEach(function(col){
         if(cols.indexOf(col)<0)errors.push(label+'引用了未知列 '+col);
       });

@@ -40,6 +40,7 @@
 | 这列是时间/维度/指标/忽略 | `columnRoles.<col>` | `time` \| `dimension` \| `measure` \| `id` \| `ignore`（id 与 ignore 同行为） | profile 自动推断；只校验未引用列存在 |
 | 金额/百分比/计数格式与默认聚合 | `measureTypes.<col>` | `{type: currency\|price\|percent\|count\|duration\|number\|unitless, semantic?, aggregation?, decimals?}` | 类型按 profile 推断（价族名称自动判 price）；聚合按 Flint 聚合角色缺省（additive→sum，**intensive（price/percent/score）→average**）；精度按类型默认 |
 | 指定币种（美元/欧元/日元…） | `measureTypes.<col>.currency` | ISO 代码，必须在内置 23 币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND/RUB）；如 `{"type":"currency","currency":"USD","decimals":2}`（`type:"price"` 同样可用） | 缺省 CNY（¥）；CNY/JPY 显式声明时缺省 `divisor:10000, unit:'万'`，其余币原值；未知代码校验拒绝（自定义显示改用 `symbol`，≤4 字符，优先于查表）。币种只在数据源配置（字段配置）声明，图表级不提供覆盖。**price 与 currency 的唯一差别是可加性**：price=Flint Price intensive（不可加、缺省 average），currency=Amount（可加、缺省 sum） |
+| 派生指标的语义注解 | `datasets[i].derived.measures[].semantic` | 同上 Flint 受控标签（Rating→Score 别名归一；未知标签编译报错） | 自动（按名称推断，如含「率」→percent）。显式声明接管格式/不可加闸/轴域，不依赖名字（`对客折扣` 也能拿 percent）；数据源配置弹窗「语义」下拉可设 |
 | 更细的聚合语义注解（Flint T2） | `measureTypes.<col>.semantic` | Flint 标签：`Price/Revenue/Cost/Amount/Profit/Percentage/Count/Number/Quantity/Duration/Score/Rating/Temperature/Sentiment/Correlation/Rank`…（受控词汇 = flint_core 注册表） | 无。声明后编译按该类型聚合角色执行（如 `semantic:"Price"` → 不可加、缺省 average；`Profit` → signed-additive 可加但发散色）；`type` 继续管格式族，二者正交 |
 | 每行算一个数（客单价=额/数） | `derived.columns[]` | ≤8 `{name, op: add\|sub\|mul\|div, left, right}`；时间差 `{op:"datediff", left, right, unit}`（端可为列或 `__today__`） | 无；物化成真列后处处当普通指标 |
 | 聚合后算比率/同环比/累计/占比/**筛选聚合** | `derived.measures[]` | ≤16，`kind: formula`（AST）/ `window`（fn: prev\|cum\|ytd\|rank…，必填 timeField+grain）/ `share`（scope: all\|parent）/ `filtered`（agg+col+filters≥1，op: eq/ne/gt/ge/lt/le/between/in，条件聚合 AGG(CASE WHEN…)；count 可省 col） | 无；窗口指标要求引用图表维度==timeField 且分桶==grain，否则编译期可行动报错；filtered 无时间语义，被窗口 ref 引用即得同环比 |
@@ -136,6 +137,10 @@
 - 数据有**单价/售价列**（价格、售价、unit price）→ 声明 `type:"price"`（或依赖价族名称自动推断——构建与编辑器已同源）：缺省聚合自动变 average、不可 sum/堆叠。**跨品类视角不要用均价**——分品类切片、价格带/中位数、折扣率（lint L20 会提示品类列在场但未分组的情况）。
 - 数据有**百分比列** → 先看存值表示：0–1 比率（表格与图表显示自动 ×100，轴模板 `{value}%` 直显 15% 而非 0.15%）还是 0–100 百分数（直显，`type:'percent'` 的设计本意）；表示检测自动化（Flint §3.4，profile 带 `percentRepresentation`），不再需要手工豁免。
 - 堆叠图要**占比堆叠**（每根柱各段归一到 100%）→ `encoding.stackMode:'normalize'`（Flint resolveStackable 的 normalize 形态）：percent 类指标进堆叠的唯一合法路径（缺省 sum 堆叠对 percent 仍是编译错误）。
+- 堆叠方式编辑器可切换：堆叠柱卡的「堆叠方式」select（绝对值/占比 100%）读写 `editor.data.stackMode`，换走堆叠视图自动删键。
+- **发散色上屏**（2026-10-13 收尾批）：柱状图指标语义发散（`Profit/PercentageChange/Sentiment/Correlation/Temperature` 注解，或窗口 rate 派生天然 PercentageChange）且数据真有负值 → 负段 `#dc2626`、正段系列色（PY 静态 + JS 运行时同闸）。
+- **轴域语义**（同批）：`semantic:'Score'`（值全在 0–100）→ 值轴钉 0–100；`semantic:'Rank'` → 轴反转（第 1 名在顶）。作者显式 min/max 恒优先。
+- **逐指标聚合闸**：price/percent/unitless 及 share/window.rate 派生的指标芯片下拉不再提供「求和」；旧报告残留 sum 读取时归一 average 落盘自愈（服务端信任 manifest，错误请求在编辑器侧不再产生）。
 - 数据有**利润/情感/相关性这类正负列** → 数据跨零时 lint L21 会建议条件格式（与0 basis 红负绿正）——发散型指标正负同色读不出方向。
 - 绑定指标到维度前自问「**该口径在此切片上是否仍衡量同一对象**」（intensive 指标的可比性审查，见 SKILL.md 模型负责第 5 条）。
 - 业务给了**编码值**要求中文显示 → 显示层值别名（编辑器配，请求层不收；见文首说明）。

@@ -1579,7 +1579,8 @@ def _flint_value_axis(c: dict, measure: str, mark: str, values: list, base: dict
     zero:true → scale:false (include 0); zero:false → scale:true + padded domain.
     Delegates the decision to the canonical ``flint_core.zero_decision`` so the
     Python compile and the JS runtime share one source of truth (parity-tested)."""
-    dec = fc.zero_decision(_measure_sem_label(c, measure), mark, values)
+    label = _measure_sem_label(c, measure)
+    dec = fc.zero_decision(label, mark, values)
     axis = base or {"type": "value"}
     if dec["zero"]:
         axis["scale"] = False
@@ -1590,7 +1591,54 @@ def _flint_value_axis(c: dict, measure: str, mark: str, values: list, base: dict
         padded = fc.padded_domain(values, dec["pad"])
         if padded:
             axis["min"], axis["max"] = padded
+    # 轴域语义（2026-10-13 收尾批，Flint domainShape bounded / intrinsicDomain）：
+    # Rank 值越大名次越差 → 轴反转（第 1 名画在轴顶）；Score 值全在 [0,100] →
+    # 钉 0–100 域（评分 68 不该把轴顶撑到 70）。JS 镜像 =
+    # chart-adapter.flintAxisDomain（作者显式 min/max 恒优先，运行时 BI-H4 同款）。
+    if label == "Rank":
+        axis["inverse"] = True
+    elif label == "Score":
+        _nums = []
+        for _v in values or []:
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError):
+                continue
+            if _f == _f and abs(_f) != float("inf"):
+                _nums.append(_f)
+        if _nums and all(0.0 <= v <= 100.0 for v in _nums):
+            axis["min"], axis["max"] = 0, 100
     return axis
+
+
+def _remote_typed_columns(t: dict) -> list[dict]:
+    """远端（server/mixed）数据集的列形状 = ``[{name, type}]``。
+
+    known-gap 闭环（2026-10-13 收尾批）：schema-only 数据集没有行，运行时
+    ``numericColumns`` 的值探测分支不可用、``columns[i].type==='measure'`` 分支
+    又只认对象列——纯字符串列曾让新建图表 alert「至少需要一个维度和一个指标」。
+    优先级与**服务端孪生** ``server/app._manifest_typed_columns`` 一致：
+    上传 meta.types > ``validate_table._infer_column_type`` 值推断 > dimension 兜底
+    （同一推断实现，无第二份）。行内（有 rows 的）数据集维持字符串列零漂移。
+    """
+    names = [str(c) for c in (t.get("columns") or [])]
+    declared = dict(((t.get("meta") or {}).get("types")) or {})
+    rows = t.get("rows") or []
+    from validate_table import _infer_column_type
+    out: list[dict] = []
+    for i, name in enumerate(names):
+        typ = declared.get(name)
+        if typ not in ("category", "measure", "time", "id", "dimension"):
+            typ = None
+            if rows:
+                try:
+                    vals = [r[i] for r in rows if isinstance(r, list) and i < len(r)]
+                    typ = _infer_column_type(vals, name)
+                except Exception:
+                    typ = None
+            typ = typ if typ in ("category", "measure", "time", "id", "dimension") else "dimension"
+        out.append({"name": name, "type": typ})
+    return out
 
 
 def _series_from_rows(c: dict, rows: list) -> list[dict]:
@@ -1643,6 +1691,37 @@ def _series_from_rows(c: dict, rows: list) -> list[dict]:
         if any_axis1:
             for s in series:
                 s.setdefault("yAxisIndex", 0)
+        if vt == "bar":
+            # diverging 正负双色（2026-10-13 收尾批，Flint §5.5）：语义发散且数据
+            # 真有负值 → 负段对比红、正段保持系列色。判据 = **显式声明**的语义
+            # （measureTypes[col].semantic / 派生节点 semantic；窗口 rate 输出天然是
+            # PercentageChange）——与 JS 侧同闸，名称推断不参与（parity）。
+            _dm = ((c.get("editor") or {}).get("data") or {}).get("derivedMeasures") or {}
+            from measure_semantics import diverging_decision as _dv
+            for _s, _m in zip(series, measures):
+                _vals = list(_s.get("data") or [])
+                if not any(isinstance(v, (int, float)) and not isinstance(v, bool) and v < 0
+                           for v in _vals):
+                    continue
+                _label = None
+                _node = _dm.get(_m) if isinstance(_dm, dict) else None
+                if isinstance(_node, dict):
+                    _label = _node.get("semantic") or (
+                        "PercentageChange"
+                        if _node.get("kind") == "window" and _node.get("output") == "rate"
+                        else None)
+                if not _label:
+                    _mt_entry = (c.get("measureTypes") or {}).get(_m)
+                    if isinstance(_mt_entry, dict) and _mt_entry.get("semantic"):
+                        _label = _mt_entry["semantic"]
+                if not _label:
+                    continue
+                if _dv(_label, [v for v in _vals if v is not None])["type"] != "diverging":
+                    continue
+                _s["data"] = [
+                    {"value": v, "itemStyle": {"color": "#dc2626"}}
+                    if isinstance(v, (int, float)) and not isinstance(v, bool) and v < 0 else v
+                    for v in _vals]
         return series
     if vt in ("pie", "donut", "funnel"):
         mi = cols.index(measures[0]) if measures and measures[0] in cols else 1
@@ -4227,6 +4306,85 @@ def validate_chart_shape(c: dict) -> list[str]:
 
 # ---------- CLI ----------
 
+# ---- 对账锚点（2026-10-13 收尾批，brief-template v2 §口径槽的 P2 断言落地）----
+_ANCHOR_AGGS = {"sum", "average", "count", "min", "max"}
+
+
+def _check_anchors(spec: dict, tables_by_id: dict, datasets: list) -> list[str]:
+    """构建期勾稽：``request.anchors`` 声明的合计真值对真实表断言，不符即失败。
+
+    brief-template v2 把「对账锚点」（1–3 个合计真值）写进口径槽，此前只靠
+    Agent 构建后手工抽查并记入 build/decisions.md。这里是硬闸：锚点在**物化
+    行级计算列之后**的真实表上重算，与声明值差超过容差（缺省 max(|声明|×1e-6,
+    1e-6)，可显式 `tolerance`）→ 编译失败并给出实算/声明两个数——宁可构建
+    失败，不可带着错数据交付。行级计算列派生在锚点之前完成，所以锚点可以
+    引用计算列。
+    """
+    anchors = spec.get("anchors") or []
+    if not anchors:
+        return []
+    if not datasets:
+        raise ValueError("对账锚点（anchors）需要至少一个数据集")
+    notes: list[str] = []
+    for i, a in enumerate(anchors):
+        label = str(a.get("label") or f"锚点{i + 1}")[:60]
+        measure = a["measure"]
+        agg = a.get("aggregation") or "sum"
+        ds_id = a.get("dataset")
+        raw = None
+        table = None
+        if ds_id:
+            for d in datasets:
+                if (d.get("raw") or d.get("id")) == ds_id:
+                    raw = d.get("raw") or d["id"]
+                    table = tables_by_id.get(raw)
+                    break
+        else:
+            raw = datasets[0].get("raw") or datasets[0]["id"]
+            table = tables_by_id.get(raw)
+        cols = list((table or {}).get("columns") or [])
+        rows = list((table or {}).get("rows") or [])
+        if measure not in cols:
+            raise ValueError(
+                f"对账锚点「{label}」：列 {measure!r} 不在数据集 {raw!r} 中；可用列：{cols[:12]}")
+        ci = cols.index(measure)
+        vals = [r[ci] for r in rows if isinstance(r, list) and ci < len(r)
+                and r[ci] is not None and r[ci] != ""]
+        nums = []
+        for v in vals:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f == f and f not in (float("inf"), float("-inf")):
+                nums.append(f)
+        if agg == "count":
+            got = float(len(vals))
+        elif agg == "sum":
+            got = float(sum(nums))
+        elif agg == "average":
+            got = (sum(nums) / len(nums)) if nums else 0.0
+        elif agg == "min":
+            got = min(nums) if nums else 0.0
+        else:
+            got = max(nums) if nums else 0.0
+        exp = a.get("value")
+        try:
+            exp = float(exp)
+        except (TypeError, ValueError):
+            raise ValueError(f"对账锚点「{label}」：value 必须是数字（got {exp!r}）") from None
+        tol = a.get("tolerance")
+        tol = float(tol) if isinstance(tol, (int, float)) and not isinstance(tol, bool) \
+            and float(tol) >= 0 else max(abs(exp) * 1e-6, 1e-6)
+        if abs(got - exp) > tol:
+            raise ValueError(
+                f"对账锚点「{label}」不符：{measure} {agg} 实算 {got:,.4g}，"
+                f"声明 {exp:,.4g}（差 {got - exp:+,.4g}）。数据与口径不一致，拒绝编译"
+                "——请核对锚点数值或数据文件。")
+        notes.append(f"{label}: {measure} {agg} = {got:,.4g} ✓")
+    return notes
+
+
 def infer_measure_types(columns):
     """Heuristic semantic types from column names, so BI-inserted charts and
     authored charts share formatting. Authors may override in the spec's
@@ -6053,6 +6211,10 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                     where=f"dataset {_raw} derived.measures")
             except derived_model.DerivedError as exc:
                 raise ValueError(str(exc)) from None
+        # 对账锚点（brief-template v2 口径槽的 P2 断言）：物化计算列之后的真实表上
+        # 勾稽，不符即编译失败——抽查变硬闸，锚点数值不再靠 Agent 手工核对。
+        for _n in _check_anchors(spec, tables_by_id, datasets):
+            print(f"[anchor] {_n}")
         primary_raw = datasets[0].get("raw") or datasets[0]["id"]
         primary_table = tables_by_id[primary_raw]
         authored_mt = dict(spec.get("measureTypes") or {})
@@ -6091,7 +6253,7 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                 # Schema-only: the browser fetches aggregates from the registry
                 # table keyed by this namespaced id (Phase B runtime remote path).
                 ds = {"id": d["id"], "label": d.get("label", d["id"]),
-                      "columns": t["columns"], "rowCount": len(t.get("rows") or []), "remote": True,
+                      "columns": _remote_typed_columns(t), "rowCount": len(t.get("rows") or []), "remote": True,
                       "role": _ds_role(declared_ds, d.get("raw") or d["id"]),
                       "isDefault": (d.get("raw") or d["id"]) == ctx.get("default") or len(datasets) == 1,
                       "columnTypes": dict((t.get("meta") or {}).get("types") or {}),

@@ -29,6 +29,19 @@ from semantics import flint_core as _fc
 SEMANTIC_VOCAB: set[str] = set(_fc.FLINT_TYPES) | {"Rating"}
 
 
+def semantic_canonical(label: Any) -> str | None:
+    """Normalise a semantic annotation to a Flint label; ``None`` when unknown.
+
+    Single entry for every writer that accepts a ``semantic`` slot
+    (``measureTypes[col].semantic``、``derived.measures[].semantic``) so the
+    vocabulary and the alias table can never drift between consumers.
+    """
+    if not isinstance(label, str) or not label.strip():
+        return None
+    canon = _fc.canonical_alias(label.strip())
+    return canon if canon in SEMANTIC_VOCAB else None
+
+
 def normalize_measure_type(raw: Any) -> dict[str, Any] | str | None:
     """Normalise a model-supplied measure type to a canonical T2 type.
 
@@ -75,7 +88,12 @@ def semantic_label_of(entry: Any, name: str = "") -> str | None:
     if any(k in n for k in ("售价", "单价", "价格", "标价", "原价", "现价", "均价")) \
             or re.search(r"price", n, re.I):
         return "Price"
-    if any(k in n for k in ("金额", "销售额", "收入", "营收", "营业额", "利润", "成本", "费用", "额")):
+    # 「额」裸子串退役（2026-10-13 收尾批）：名额/限额/超额不是钱。X额 收敛为
+    # 「货币语素+额」（销/营/利/毛/净/税/费/收/支/余/差），配合显式词——毛利额/
+    # 净额/税额仍命中，名额/限额/满额不再误判 Revenue。
+    if any(k in n for k in ("金额", "销售额", "收入", "营收", "营业额",
+                            "利润", "毛利", "净利", "成本", "费用")) \
+            or re.search(r"[销营利毛净税费收支余差]额", n):
         return "Revenue"
     if any(k in n for k in ("量", "数", "个", "件", "笔")):
         return "Count"

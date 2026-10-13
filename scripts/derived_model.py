@@ -78,13 +78,13 @@ MAX_MEASURES = 16
 YOY_OFFSET = {"month": 12, "quarter": 4, "year": 1}
 
 _MEASURE_FIELDS = {
-    "formula": {"id", "name", "kind", "expr", "measureType", "additive", "decimals"},
+    "formula": {"id", "name", "kind", "expr", "measureType", "additive", "decimals", "semantic"},
     "window": {"id", "name", "kind", "input", "fn", "grain", "offset", "timeField",
-               "output", "measureType", "additive", "decimals"},
+               "output", "measureType", "additive", "decimals", "semantic"},
     "share": {"id", "name", "kind", "input", "scope", "parentField",
-              "measureType", "additive", "decimals"},
+              "measureType", "additive", "decimals", "semantic"},
     "filtered": {"id", "name", "kind", "agg", "col", "filters",
-                 "measureType", "additive", "decimals"},
+                 "measureType", "additive", "decimals", "semantic"},
 }
 # 计算列（行级）的定义字段。``aggregation``/``decimals`` 曾被白名单放行，但**没有任何
 # 消费方**（编译侧与运行时都不读）——那是「写了没效果」的陷阱：请求作者以为设了默认
@@ -143,6 +143,9 @@ def normalize_measures(value: Any) -> list[dict]:
         raise DerivedError("derived.measures 必须是数组")
     if len(defs) > MAX_MEASURES:
         raise DerivedError(f"derived.measures 最多 {MAX_MEASURES} 项（当前 {len(defs)}）")
+    # 语义注解受控词汇（lazy import：measure_semantics 拉 semantics 包，模块导入期
+    # 不需要）。「semantic」槽位与 measureTypes[col].semantic 同一受控词汇。
+    from measure_semantics import SEMANTIC_VOCAB, semantic_canonical
     out: list[dict] = []
     seen_names: set[str] = set()
     seen_ids: set[str] = set()
@@ -172,6 +175,19 @@ def normalize_measures(value: Any) -> list[dict]:
         node = dict(item)
         node["id"] = mid
         node["name"] = name.strip()
+        # 语义注解槽（2026-10-13 收尾批）：显式声明才写键（缺省不落盘，旧节点零漂移）；
+        # 值归一到 Flint 受控标签——运行时 measureFormat/零基线/轴域据此渲染
+        # （如毛利率显式 Percentage，不再依赖名字恰好含「率」）。
+        sem = item.get("semantic")
+        if sem is None:
+            node.pop("semantic", None)
+        else:
+            canon = semantic_canonical(sem)
+            if canon is None:
+                raise DerivedError(
+                    f"derived.measures[{i}].semantic 未知语义标签 {sem!r}；"
+                    f"允许：{sorted(SEMANTIC_VOCAB)}")
+            node["semantic"] = canon
         if kind == "formula":
             node["expr"] = _normalize_expr(item.get("expr"), f"derived.measures[{i}]")
             node.setdefault("measureType", {"type": "number"})
