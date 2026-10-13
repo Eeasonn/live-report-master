@@ -409,7 +409,8 @@ def check_table_fits_container(chart: dict[str, Any], block_layouts: dict[str, d
 
 # ---------- R3: sortable charts must be sorted by primary measure ----------
 
-MEASURE_TYPE_VOCABULARY = {"currency", "percent", "count", "duration", "number", "unitless"}
+# "price"（2026-10-13 批）：Flint Price intensive——不可加、缺省 average。
+MEASURE_TYPE_VOCABULARY = {"currency", "price", "percent", "count", "duration", "number", "unitless"}
 
 
 def _valid_measure_type(value: Any) -> bool:

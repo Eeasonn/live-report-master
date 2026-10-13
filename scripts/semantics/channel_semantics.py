@@ -22,7 +22,7 @@ from . import flint_core as fc
 
 def field_kind(semantic_type: str | None, is_numeric: bool, time_hint: bool) -> str:
     """TF2-ish kind for a field: 'measure' | 'time' | 'ordinal' | 'category'."""
-    if semantic_type in {"currency", "percent", "count", "duration", "number", "unitless"}:
+    if semantic_type in {"currency", "price", "percent", "count", "duration", "number", "unitless"}:
         return "measure"
     if semantic_type and semantic_type != "None":
         return "measure"

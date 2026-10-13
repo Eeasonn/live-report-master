@@ -2370,7 +2370,10 @@
         if(L.rank&&L.rank[av]!=null&&L.rank[bv]!=null)r=L.rank[av]-L.rank[bv];
         else if(L.rank&&L.rank[av]!=null)r=-1;
         else if(L.rank&&L.rank[bv]!=null)r=1;
-        if(r==null&&L.timeCmp)r=L.timeCmp(av,bv);
+        // timeCmp 返回 0 =「该层无决定」（非日期值/同键），视为未决回落首现序——
+        // 0 直接 return 会把 firstAt 短路（嵌套列序退化行集序的帮凶，与调用端
+        // dimensionKind 门控互为纵深）。
+        if(r==null&&L.timeCmp){var _tc=L.timeCmp(av,bv);if(_tc)r=_tc;}
         if(r==null)r=firstAt(li,a,av)-firstAt(li,b,bv);
         if(r)return r;
       }
@@ -5101,12 +5104,15 @@
           // 列序管道·嵌套泛化（§3.4）：每层列维独立排序——sortOrder 自定义 > 时间
           // chrono（dateChronoCmp 部件序，周安全）> 行序首现；外层优先分组、内层在
           // 外层段内排序。单列维时与 orderMatrixCols 同语义（bdCols 为组合键，split
-          // 恒按层拆）。
+          // 恒按层拆）。chrono 只喂时间/序数维（与 1D/3D 的 bdKind 门控同一条规则）：
+          // dateChronoCmp 对两个非日期值返回 0 而非 null，无条件传会把该层首现序短路
+          // （文本列多层嵌套列序退化为行集首现序，表头段碎成 (brand,category) 小段，
+          // 2026-10-13 街价真机实锤）。
           var mmLayers=mmColDims.map(function(c){
             var _rk=((data&&data.sortOrder)||{})[c];
             var _kind=adapter.dimensionKind(data,c);
             return {rank:(_rk&&_rk.length)?(function(l){var r={};l.forEach(function(v,i){r[String(v)]=i;});return r;})(_rk):null,
-                    timeCmp:dateChronoCmp};
+                    timeCmp:(_kind==='time'||_kind==='ordinal')?dateChronoCmp:null};
           });
           mtmM.bdCols=orderMatrixColsNested(mtmM.bdCols,{layers:mmLayers,split:function(k){return bdComboSplit(k,mmColDims.length);}});
           var mhpM=matrixHeaderPlan(mtmM.bdCols,measures,{rank:!!settings.showRank,rowTotal:mmRowTotal,totalLabel:mmTotalLabel,rankText:rankLabelOf(settings),dim2:mmRowN>1,dim3:mmRowN>2,dimText:colAliasOf(data,_mmRows[0]),dim2Text:mmRowN>1?colAliasOf(data,_mmRows[1]):undefined,dim3Text:mmRowN>2?colAliasOf(data,_mmRows[2]):undefined,bdDims:mmColDims.length,bdDimCols:mmColDims,mnValuesDim:mmHasMNRow,mnMounted:mmMnMounted,measureNameRow:(settings.measureNameRow!==false),measureText:function(m){return colAliasOf(data,m);},subs:subPlan});
@@ -5794,6 +5800,7 @@
   function colAliasOf(ds,col){
     if(col===MN_DIM)return '指标名称';      // 虚拟维度显示名（保留键不在列别名宇宙）
     if(col===MN_VAL)return '指标值';        // 转置值列显示名（D3）
+    if(col==='*')return '记录数';           // 合成行数指标显示名（对齐编译 _measure_name / adapter.measureDisplayName）
     var m=(ds&&ds.columnAliases)||{};
     var v=m[col];
     return (typeof v==='string'&&v)?v:col;
@@ -10468,6 +10475,9 @@
   // classification are the source of truth (Q1 invariant: only raw
   // fields, no derived measures).
   function classifyColumn(data,column){
+    // 合成行数指标「记录数」（'*'）：虚拟列（不在 columns、不在派生表），探测不到
+    // → 不显式归指标就会掉进「维度」组、单击路由进行区（与 MN 虚拟维度同一类缝）。
+    if(column==='*')return 'numeric';
     // A time/ordinal dimension is semantically a dimension, never a measure —
     // classify it FIRST so a YYYYMM column (e.g. YearMonth = 202501) shows as
     // 时间 instead of 数值, even though it is numeric. ``dimensionKind`` honours
@@ -10502,6 +10512,10 @@
   }
   function chipMeasureAgg(measure,current){
     var val=current||'sum';
+    // 合成行数指标：聚合恒为行数（COUNT(*)），本地 effectiveMethod 与服务端守卫都
+    // 强制 count——下拉锁死成「计数」，不给用户选一个必然被忽略（server 模式直接
+    // 400）的聚合。disabled select 的 value 照常可读，updateChart 写回即自愈。
+    if(measure==='*')return '<select class="ai-report-chip-agg" data-bi-control="true" data-bi-control-action="chip-agg" data-measure="'+escapeHtml(measure)+'" title="记录数按行数计数（COUNT(*)），聚合方式固定" disabled><option value="count" selected>计数</option></select>';
     return '<select class="ai-report-chip-agg" data-bi-control="true" data-bi-control-action="chip-agg" data-measure="'+escapeHtml(measure)+'" title="该指标如何聚合">'
       +AGG_METHODS.map(function(pair){return '<option value="'+pair[0]+'" '+(val===pair[0]?'selected':'')+'>'+pair[1]+'</option>';}).join('')
       +'</select>';
@@ -11508,7 +11522,8 @@
     var chipNote=fieldNoteOf(chipDs,column);
     var derTitle=derNode?('派生指标：'+derivedNodeSummary(derNode,function(x){return colAliasOf(chipDs,x);})+(derIssues.length?('\n⚠ 当前图表不满足：'+derIssues.join('；')):'\n定义在「数据源配置 → 字段配置」'))
       :(mnChip?'指标名称（虚拟维度）：拖入行区/列区后，值区塌成单列「指标值」，每行按所属指标各自的格式显示；拖入「自定义顺序」可调指标枚举序'
-      :(column+(chipLabel!==column?('（显示名 '+chipLabel+'）'):'')+(chipNote?('\n'+chipNote):'')));
+      :(column==='*'?'记录数（合成行数指标）：每行 = 一条记录的行数（COUNT(*)）；不是数据里的真实列，字段库「指标」组常驻，删掉后可随时加回'
+      :(column+(chipLabel!==column?('（显示名 '+chipLabel+'）'):'')+(chipNote?('\n'+chipNote):''))));
     var derBadge=derNode?('<span class="ai-report-chip-fx" title="'+escapeHtml(derTitle)+'">ƒ</span>'):'';
     // R11 快赢（2026-09-25）+ 词汇修正（2026-09-26 批六再修）：× 按钮 title 不再泄漏
     // 内部区键，且「行/列/值」是交叉表语义，只属于 heatmap/table；bar/stackedBar 的
@@ -11887,6 +11902,12 @@
     // 指标名称虚拟维度（D2）：字段库「维度」组常驻一枚（仅表格卡；已在行/列区则不
     // 重复；值区没有指标时也不出现——虚拟维度离开指标没有语义，2026-09-28 用户路径批）。
     if(chart.viewType==='table'&&!inUse[MN_DIM]&&chosenMeasures.length)unselGroups.dimension.unshift(MN_DIM);
+    // 合成行数指标「记录数」（'*'，SKILL.md：行数是一等指标）：虚拟列——不在
+    // ds.columns、不在派生表，availableColumns 探测不到。字段库不补它，从值区
+    // 删掉后就永远选不回来（记录型数据全维识别时每张卡的指标都是它，真机实锤）。
+    // 单击/拖入路由 = classifyColumn 'numeric' → 值区；聚合三端（本地
+    // effectiveMethod / server COUNT(*) 守卫 / 编译 _deterministic_rows）原生支持。
+    if(!inUse['*']&&unselGroups.measure.indexOf('*')<0)unselGroups.measure.push('*');
     function chipsFor(list,zone){
       if(!list.length)return '<span class="ai-report-empty">点击或拖入字段</span>';
       // Issue1: classify using fullData (so columns not in the chart's local
@@ -17774,7 +17795,22 @@
   //     server 与 singlefile 同一实现）
   var KPI_UNIT_SUFFIX={k:'K',wan:'万',m:'百万'};
   var KPI_AGGS=[['sum','求和'],['average','平均值'],['count','计数'],['min','最小值'],['max','最大值']];
-  function kpiAggMethod(kp){var m=(kp&&kp.aggregation)||'sum';return m==='avg'?'average':m;}
+  // KPI 缺省聚合（2026-10-13 批）：未显式声明时按数据集 measureTypes 的语义档
+  // 走 Flint resolveAggregationDefault——intensive（Price/Percentage/Score…）→
+  // average，与编译侧 _ensure_default_kpis / 图表缺省同一口径；未知语义回退 sum。
+  function kpiAggMethod(kp){
+    if(kp&&kp.aggregation){var m0=kp.aggregation;return m0==='avg'?'average':m0;}
+    if(kp&&kp.measure&&adapter&&adapter.flintFieldSemantics){
+      var ds=kp.datasetId?datasetById(kp.datasetId):null;
+      var mt=ds&&ds.measureTypes?ds.measureTypes[kp.measure]:null;
+      var ent=(mt==null)?null:(typeof mt==='object'?mt:{type:mt});
+      if(ent&&ent.type){
+        var fs=adapter.flintFieldSemantics(adapter.flintCanonicalAlias?adapter.flintCanonicalAlias(ent.type):ent.type);
+        if(fs&&fs.aggregationDefault==='average')return 'average';
+      }
+    }
+    return 'sum';
+  }
   function kpiTimeColumn(ds){
     // server 模式数据源是 schema-only（无行），dimensionKind 的值探针全盲 → 只靠它
     // 永远找不到时间列（logistics P1-2：对比副行 9s 不渲染的共因）。数据源**声明**的
@@ -18035,21 +18071,33 @@
     for(var i=0;i<=4;i++){out+='<option value="'+i+'"'+(i===cur?' selected':'')+'>'+i+'</option>';}
     return out;
   }
+  // KPI 口径候选 = 数值列 ∪ 合成行数指标「记录数」（'*'）：记录型数据（无数值列）
+  // 唯一可用的口径字段；候选区不补它，绑了 '*' 的卡拆掉后就选不回（与图表字段库
+  // unselGroups.measure 补 '*' 同一条缝）。kpiTypeGrid 的 canChart 判定同源——
+  // 否则记录型数据被误提示「数据源缺少指标字段」。
+  function kpiMeasureCandidates(ds){
+    var numeric=(ds&&adapter.numericColumns(ds))||[];
+    if(numeric.indexOf('*')<0)numeric=numeric.concat(['*']);
+    return numeric;
+  }
   function kpiZones(kp,ds,numeric,cur){
     var unsel=numeric.filter(function(c){return c!==cur;});
     var unselChips=unsel.map(function(c){
-      return '<span class="ai-report-chip" data-bi-control-action="kpi-bind" data-col="'+escapeHtml(c)+'" title="'+escapeHtml(c)+' · 点击设为该指标卡的口径字段">'
+      // title 恒带原列名（批五-d 悬停见全名）；有显示名时追加「（显示名 …）」后缀——
+      // 合成行数指标 '*' 的 title 因此是「*（显示名 记录数）」，不裸漏内部 token。
+      var kpiDisp=colAliasOf(ds,c);
+      return '<span class="ai-report-chip" data-bi-control-action="kpi-bind" data-col="'+escapeHtml(c)+'" title="'+escapeHtml(c)+(kpiDisp!==c?('（显示名 '+escapeHtml(kpiDisp)+'）'):'')+' · 点击设为该指标卡的口径字段">'
         +'<span class="ai-report-chip-kind ai-report-chip-kind-numeric">指标</span>'
-        +'<span class="ai-report-chip-label">'+escapeHtml(c)+'</span></span>';
+        +'<span class="ai-report-chip-label">'+escapeHtml(kpiDisp)+'</span></span>';
     }).join('');
     // 批五：KPI 口径字段与图表面板同模型——⚙ 浮窗承载 指标处理/小数位数/单位。
     var kpiOpen=cur?!!chipFoldSetFor(selected&&selected.chart)[cur]:false;
     var picked=cur?('<span class="ai-report-chip'+(kpiOpen?' ai-chip-open':'')+'" data-kpi-chip="'+escapeHtml(cur)+'" data-col="'+escapeHtml(cur)+'">'
         +'<span class="ai-report-chip-head"><span class="ai-report-chip-kind ai-report-chip-kind-numeric">指标</span>'
-        +'<span class="ai-report-chip-label">'+escapeHtml(cur)+'</span>'
+        +'<span class="ai-report-chip-label">'+escapeHtml(colAliasOf(ds,cur))+'</span>'
         +'<button type="button" class="ai-report-chip-gear" data-bi-control-action="chip-gear" data-col="'+escapeHtml(cur)+'" aria-expanded="'+(kpiOpen?'true':'false')+'" aria-label="字段设置" title="口径设置：指标处理 / 小数位数 / 单位">⚙</button></span>'
         +'<span class="ai-report-chip-settings'+(kpiOpen?'':' ai-chip-folded')+'" data-chip-settings="'+escapeHtml(cur)+'">'
-        +chipControl('指标处理','<select class="ai-report-kpi-bind" data-kpi-bind="aggregation" aria-label="聚合方式">'+kpiAggOptions(kp)+'</select>')
+        +chipControl('指标处理','<select class="ai-report-kpi-bind" data-kpi-bind="aggregation" aria-label="聚合方式">'+(cur==='*'?'<option value="count" selected>计数</option>':kpiAggOptions(kp))+'</select>')
         +chipControl('小数位数','<select class="ai-report-kpi-bind" data-kpi-bind="decimals" aria-label="小数位数">'+kpiDecOptions(kp)+'</select>')
         +chipControl('单位','<select class="ai-report-kpi-bind" data-kpi-bind="unitscale" aria-label="单位">'+kpiKindOptions(kp)+'</select>')
         +'</span></span>')
@@ -18115,7 +18163,7 @@
     selected={kind:'kpi',blockId:blockId,index:index};
     var kp=(manifest.kpis||[])[index]||{};
     var ds=kpiDataset(kp);
-    var numeric=(ds&&adapter.numericColumns(ds))||[];
+    var numeric=kpiMeasureCandidates(ds);
     var cur=kp.countDim||kp.measure||numeric[0]||'';
     var html='<div id="ai-kpi-panel" class="ai-report-kpi-panel">'
       +'<fieldset class="ai-report-fieldset ai-report-section"><legend>图表类型</legend>'
@@ -18140,14 +18188,18 @@
         var kpi=(manifest.kpis||[])[index];if(!kpi)return;
         if(act==='kpi-bind'){
           kpi.measure=b.getAttribute('data-col');kpi.countDim=null;
+          // 合成行数指标「记录数」（'*'）：取数语义钉死 count（服务端 '*' 只认 count
+          // 聚合，value 路径 isNumericAgg 会放行显式 sum → 400）；显示名用「记录数」。
+          var kpiCountStar=kpi.measure==='*';
+          if(kpiCountStar){kpi.factType='count';kpi.aggregation='count';}
           var mtsel=(ds&&ds.measureTypes&&ds.measureTypes[kpi.measure]);
           var sem=mtsel?((typeof mtsel==='object')?mtsel.type:mtsel):null;
-          if(!sem){var _fs=adapter.fieldSemantic(ds,kpi.measure);sem=(_fs&&_fs.measureType)||'number';}
-          kpi.semanticType=sem;
+          if(!sem&&!kpiCountStar){var _fs=adapter.fieldSemantic(ds,kpi.measure);sem=(_fs&&_fs.measureType)||'number';}
+          kpi.semanticType=sem||'number';
           if(typeof mtsel==='object')kpi.measureType=mtsel.type;else if(mtsel)kpi.measureType=mtsel;
-          if(!kpi.labelOverridden)kpi.label=kpi.measure;
+          if(!kpi.labelOverridden)kpi.label=kpiCountStar?'记录数':kpi.measure;
           var labelHost=document.querySelector('[data-report-block-id="block-kpi-'+index+'"] .kpi-card .label');
-          if(labelHost&&!kpi.labelOverridden)labelHost.textContent=kpi.measure;
+          if(labelHost&&!kpi.labelOverridden)labelHost.textContent=kpi.label;
           renderKpiPanel(index);syncManifest();return;
         }
         if(act==='convert-to-chart'){
@@ -18181,7 +18233,7 @@
   function renderKpiPanel(index){
     var kp=(manifest.kpis||[])[index];if(!kp)return;
     var ds=kpiDataset(kp);
-    var numeric=(ds&&adapter.numericColumns(ds))||[];
+    var numeric=kpiMeasureCandidates(ds);
     var cur=kp.countDim||kp.measure||numeric[0]||'';
     var wrap=document.getElementById('ai-kpi-panel');
     if(!wrap)return;
@@ -18379,7 +18431,7 @@
   // 「指标卡 KPI」自身），区别只是这里每张卡都是**切换动作**——非 KPI 的卡切回图表。
   function kpiTypeGrid(ds){
     var dims=(ds&&adapter.dimensionColumns(ds))||[];
-    var numeric=(ds&&adapter.numericColumns(ds))||[];
+    var numeric=kpiMeasureCandidates(ds);
     var canChart=!!(dims.length&&numeric.length);
     function card(value,label,extraCls,extraTitle){
       var rule=null;try{rule=adapter.shapeRules(value);}catch(e){}
@@ -24103,6 +24155,13 @@ function appendNewDataset(table, label){
       var dobj=(def&&typeof def==='object')?def:((typeof def==='string')?{type:def}:null);
       if(dobj&&!data.measureTypes[m])data.measureTypes[m]=Object.assign({},dobj);
       if(dobj&&dobj.aggregation&&data.aggregations[m]==null)data.aggregations[m]=dobj.aggregation;
+      // 缺省聚合按语义档（2026-10-13 批，编译侧 spec_to_report 同一条 Flint
+      // resolveAggregationDefault）：声明无 aggregation 且类型是 intensive
+      // （Price/Percentage/Score…）→ 播种 average，与编译缺省一致（WYSIWYG）。
+      if(data.aggregations[m]==null&&dobj&&dobj.type&&adapter&&adapter.flintFieldSemantics){
+        var _fs=adapter.flintFieldSemantics(adapter.flintCanonicalAlias?adapter.flintCanonicalAlias(dobj.type):dobj.type);
+        if(_fs&&_fs.aggregationDefault==='average')data.aggregations[m]='average';
+      }
     });
   }
   // 列维写入口（批 B，拍板 1 的「写入恒写新形状」半边）：roles.cols（1–3 项数组）
@@ -24484,6 +24543,9 @@ function appendNewDataset(table, label){
     // 指标名称虚拟维度（2026-09-29 用户反馈①）：不在 ds.columns 也不是派生指标，
     // 此前被当「未知列」静默拒绝——芯片能拖、处处落不进（真机：拖动完全无效）。
     if(column==='__measures__')return true;
+    // 合成行数指标「记录数」（'*'）：同一个坑——单击不走闸、拖拽走闸，只放行单击
+    // 等于拖拽全废。字段库常驻候选（见 unselGroups.measure 补 '*'）必须配这一条。
+    if(column==='*')return true;
     return !!derivedChipNode(data,column);
   }
   document.getElementById('ai-report-runtime-panel').addEventListener('drop',function(event){

@@ -449,7 +449,8 @@ def _non_additive(c: dict) -> tuple[bool, str]:
 
     Rates / percentages / balances are not additive: summing or stacking them
     yields a meaningless total. The compiler refuses such a chart so the
-    editor never has to explain a broken number.
+    editor never has to explain a broken number. 2026-10-13 批：price（Flint
+    Price intensive，单价/售价）同闸——把价格加总是「竞品街价报告」病灶。
     """
     measure = (c.get("measures") or [None])[0]
     if not measure:
@@ -461,8 +462,13 @@ def _non_additive(c: dict) -> tuple[bool, str]:
         t = mt.get("type")
     else:
         t = None
-    if t in ("percent", "unitless"):
+    if t in ("percent", "unitless", "price"):
         return True, f"{measure} 为 {t} 类型"
+    from measure_semantics import semantic_label_of
+    label = semantic_label_of(mt, measure)
+    if label in ("Percentage", "PercentageChange", "Price", "Score", "Temperature",
+                 "Sentiment", "Correlation"):
+        return True, f"{measure} 为 {label}（intensive，不可加）"
     if any(k in measure for k in ("率", "占比", "百分比", "比例")):
         return True, f"{measure} 含百分比语义"
     return False, ""
@@ -1113,9 +1119,9 @@ def _dimension_type(c: dict) -> str:
     _mt = c.get("measureTypes") or {}
     _dim_mt = _mt.get(c.get("dimension") or "")
     if isinstance(_dim_mt, dict) and _dim_mt.get("type"):
-        if _dim_mt["type"] in ("count", "number", "unitless", "currency", "percent"):
+        if _dim_mt["type"] in ("count", "number", "unitless", "currency", "price", "percent"):
             return "category"
-    elif isinstance(_dim_mt, str) and _dim_mt in ("count", "number", "unitless", "currency", "percent"):
+    elif isinstance(_dim_mt, str) and _dim_mt in ("count", "number", "unitless", "currency", "price", "percent"):
         return "category"
     dim = (c.get("dimension") or ((c.get("data") or {}).get("columns") or [""])[0] or "")
     rows = (c.get("data") or {}).get("rows") or []
@@ -1262,7 +1268,7 @@ def _apply_static_topn(chart: dict, rows: list, cols: list, dim: str) -> list:
         col = cols[j]
         mt = (chart.get("measureTypes") or {}).get(col)
         t = mt.get("type") if isinstance(mt, dict) else mt
-        if t in ("percent", "unitless"):
+        if t in ("percent", "unitless", "price"):
             return True
         return bool(re.search(r"率|占比|百分比|比例|%.*%|rate|ratio|percent", str(col), re.I))
 
@@ -1557,20 +1563,15 @@ def _measure_name(m: str) -> str:
 
 def _measure_sem_label(c: dict, measure: str) -> str | None:
     """Resolve a measure's Flint semantic label from chart measureTypes.
-    Returns a Flint semantic type (Revenue/Percentage/Count/...) or None."""
+    Returns a Flint semantic type (Revenue/Percentage/Count/...) or None.
+    委托 measure_semantics.semantic_label_of（声明 semantic > type > 名称关键词，
+    价族→Price/金额族→Revenue 的拆分在那一处维护——2026-10-13 批）。"""
+    from measure_semantics import semantic_label_of
     mt = (c.get("measureTypes") or {}).get(measure)
-    if isinstance(mt, dict):
-        return mt.get("type")
-    if isinstance(mt, str):
-        return mt
-    # Name-based fallback (匹配率/占比/金额 keyword) -> Flint semantic type.
-    if any(k in measure for k in ("率", "占比", "百分比", "比例")):
-        return "Percentage"
-    if any(k in measure for k in ("金额", "销售额", "收入", "价", "额")):
-        return "Revenue"
-    if any(k in measure for k in ("量", "数", "个", "件", "笔")):
-        return "Count"
-    return None
+    if mt is None and isinstance(c.get("encoding"), dict):
+        # encoding 级 measureTypes 覆盖优先（与 _used chart_mt 同一优先序）
+        mt = (c["encoding"].get("measureTypes") or {}).get(measure)
+    return semantic_label_of(mt, measure)
 
 
 def _flint_value_axis(c: dict, measure: str, mark: str, values: list, base: dict | None = None) -> dict:
@@ -4583,10 +4584,18 @@ def _raw_time_bucket(table: dict, dim: str | None, role: str | None) -> str | No
 
 
 def _measure_default_agg(measure_types: dict, col: str, chart_agg: str) -> str:
-    """A column's own declared default aggregation (measureTypes), else the chart's."""
+    """Per-measure default aggregation tiers (2026-10-13 批):
+
+    显式 ``measureTypes[col].aggregation`` > aggRole 缺省（intensive→average，
+    Flint resolveAggregationDefault）> 图表级聚合。第二层此前缺失——多指标图里
+    非首指标恒继承图表级 sum，价格/比率列被静默加总。"""
     mdef = (measure_types or {}).get(col)
     if isinstance(mdef, dict) and mdef.get("aggregation"):
         return mdef["aggregation"]
+    from measure_semantics import default_aggregation
+    sem = default_aggregation(mdef, col)
+    if sem:
+        return sem
     return chart_agg
 
 
@@ -5281,13 +5290,30 @@ def _ensure_default_kpis(spec: dict, table: dict, roles: dict, filters: Any) -> 
         used_labels.add(label)
         kpis.append({"label": label, **candidate})
 
+    def _backfill_kpi(col: str) -> None:
+        # 缺省聚合按语义档（2026-10-13 接线 Flint resolveAggregationDefault）：
+        # 显式 measureTypes.aggregation > aggRole 缺省（intensive→average）> sum。
+        # 价格「合计」是把所有 Offer 价格加总，无读者数字（竞品街价报告病灶）；
+        # intensive 指标补「均值」卡。
+        from measure_semantics import default_aggregation
+        mdef = (spec.get("measureTypes") or {}).get(col)
+        agg = None
+        if isinstance(mdef, dict) and mdef.get("aggregation"):
+            agg = mdef["aggregation"]
+        if agg is None:
+            agg = default_aggregation(mdef, col)
+        if agg is None:
+            agg = "sum"
+        label = f"{col}合计" if agg == "sum" else f"{col}均值"
+        add(label, {"type": "total", "measure": col, "aggregation": agg})
+
     add("记录数", {"type": "count"})
     if dims:
         add(f"{dims[0]}数", {"type": "distinctCount", "dimension": dims[0]})
     if measures:
-        add(f"{measures[0]}合计", {"type": "total", "measure": measures[0], "aggregation": "sum"})
+        _backfill_kpi(measures[0])
     if len(measures) > 1:
-        add(f"{measures[1]}合计", {"type": "total", "measure": measures[1], "aggregation": "sum"})
+        _backfill_kpi(measures[1])
     spec["kpis"] = kpis
 
 
@@ -5425,12 +5451,18 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
         kmt = ds_mt[kid]
         kfilters = _filters_for_table(spec.get("filters"), ktbl.get("columns") or [], dimension_keys, kid)
         fact = facts.get(kpi.get("factId"))
-        # measure 级默认聚合：KPI 未显式指定且带 measure 时，按该指标的
-        # measureTypes.aggregation 默认（如 转化率 默认 average 而非 sum）。
+        # measure 级默认聚合：KPI 未显式指定且带 measure 时，声明
+        # measureTypes.aggregation > aggRole 缺省（intensive→average，2026-10-13
+        # 接线 Flint resolveAggregationDefault）——价格/比率 KPI 不再默认 sum。
         if kpi.get("aggregation") is None and kpi.get("measure"):
             mdef = kmt.get(kpi["measure"])
             if isinstance(mdef, dict) and mdef.get("aggregation"):
                 kpi["aggregation"] = mdef["aggregation"]
+            else:
+                from measure_semantics import default_aggregation
+                _sem = default_aggregation(mdef, kpi["measure"])
+                if _sem:
+                    kpi["aggregation"] = _sem
         # A KPI may carry an author-verified ``value`` (often computed externally by
         # the agent, e.g. a growth rate or distinct-user count the model derived
         # from the data). Respect it verbatim instead of re-computing — otherwise
@@ -5691,9 +5723,17 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
             if measures and measures[0] == COUNT_MEASURE:
                 agg = "count"
             else:
-                # measure 级默认聚合：measureTypes[measure].aggregation 在图表未指定时生效。
+                # measure 级默认聚合（2026-10-13 接线 Flint
+                # resolveAggregationDefault）：measureTypes[measure].aggregation
+                # 显式声明 > aggRole 缺省（intensive→average，如 Price/Percentage/
+                # Score）> sum。此前 aggregationDefault 两端定义零消费者，缺省恒
+                # sum——价格/比率列被当销售额加总。解析值会烘进产物 aggregation，
+                # 运行时重聚合与静态 option 同源（WYSIWYG）。
                 mdef = mt.get(measures[0]) if measures else None
                 mdef_agg = mdef.get("aggregation") if isinstance(mdef, dict) else None
+                if mdef_agg is None:
+                    from measure_semantics import default_aggregation
+                    mdef_agg = default_aggregation(mdef, measures[0] if measures else "")
                 agg = mdef_agg or "sum"
         else:
             agg = authored_agg

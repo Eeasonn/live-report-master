@@ -22,12 +22,21 @@ from __future__ import annotations
 from typing import Any
 
 # Canonical T2 format families the runtime knows how to render.
-CANONICAL = {"currency", "percent", "count", "duration", "number", "unitless"}
+# ``price``（2026-10-13 批）：单价/售价语义 = Flint ``Price``（intensive，
+# refs/flint/src/core/type-registry.ts:105）——格式与 currency 全同（¥/万元口径/
+# 币种），唯一差别是**不可加**（不可 sum、不可堆叠，缺省聚合 average）。声明了
+# ``currency`` 的旧条目仍归 Amount（additive），零漂移；只有显式 price 或价族
+# 名称推断才进入 intensive 档。
+CANONICAL = {"currency", "price", "percent", "count", "duration", "number", "unitless"}
 
 # Per-T2-type rules: {format kind, encoding visual kind, aggregation role,
 # zero-baseline (does a value axis start at 0?), non-additive (cannot sum/stack)}.
 TYPE_RULES: dict[str, dict[str, Any]] = {
     "currency": {"encoding": "quantitative", "additive": True, "zero": True,
+                 "format": "currency", "divisor": 10000, "unit": "万"},
+    # 与 currency 逐字段同格式（含 CNY/JPY 万元口径），additive=False 是唯一差别
+    # （= Flint Price intensive；对齐 is_non_additive / compile 堆叠与 sum 闸）。
+    "price":    {"encoding": "quantitative", "additive": False, "zero": True,
                  "format": "currency", "divisor": 10000, "unit": "万"},
     "percent":  {"encoding": "quantitative", "additive": True, "zero": True,
                  "format": "percent"},
@@ -116,11 +125,16 @@ def apply_currency_defaults(semantic: dict[str, Any]) -> dict[str, Any]:
 # non-additive percent column now declare ``type:'percent'`` explicitly; a
 # column whose name happens to contain 率/占比/etc. is no longer auto-flagged.
 FAMILY_MAP: list[tuple[tuple[str, ...], dict[str, Any] | str]] = [
-    # money / price / revenue
+    # 单价/售价族（2026-10-13 批）：必须在 money 行**之前**（first match wins）——
+    # Flint 把 Price 与 Revenue 分家（design-semantics.md §2.4「可加性 vs 强度型」），
+    # 价格列不再折叠成可加 currency。
+    (("售价", "单价", "价格", "标价", "原价", "现价", "均价", "price"),
+     {"type": "price", "divisor": 10000, "unit": "万"}),
+    # money / revenue（可加金额：Flint Amount 族 additive——销售额加总=总盘子，有意义）
     (("货币", "金钱", "收入", "盈利", "营收", "revenue", "money", "assets"),
      {"type": "currency", "divisor": 10000, "unit": "万"}),
-    (("金额", "价格", "成本", "利润", "费用", "消费", "花费", "支出", "售价",
-      "单价", "销售额", "营业额", "price", "cost", "sales", "profit", "amount"),
+    (("金额", "成本", "利润", "费用", "消费", "花费", "支出", "销售额",
+      "营业额", "cost", "sales", "profit", "amount"),
      {"type": "currency", "divisor": 10000, "unit": "万"}),
     (("currency",), "currency"),
     # duration
@@ -184,11 +198,11 @@ def resolve_t2(raw: Any) -> dict[str, Any] | str | None:
 
 
 def is_non_additive(type_: str | None) -> bool:
-    """``unitless`` (and the rarely-used explicit ``percent`` type for raw
-    0-100 columns) cannot be summed or stacked meaningfully. The default
-    route for percent display is now ``measureTypes[col].format='percent'``
-    on a ``type:'number'`` column, which IS additive — see docs §1."""
-    return type_ in {"percent", "unitless"}
+    """``unitless`` / 显式 ``percent``（raw 0-100 列）/ ``price``（2026-10-13 批，
+    Flint Price intensive）不能 sum 或堆叠。percent 的缺省展示路线仍是
+    ``measureTypes[col].format='percent'`` + ``type:'number'``（可加）——见 docs §1。
+    """
+    return type_ in {"percent", "unitless", "price"}
 
 
 def type_rule(type_: str | None) -> dict[str, Any]:

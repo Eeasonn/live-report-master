@@ -28,7 +28,9 @@ ALLOWED_FILTER_OPS = {"=", "!=", ">", ">=", "<", "<=", "eq", "ne", "gt", "gte", 
                       #   between   → value=[low, high]（数值，任一可为 null = 开口）
                       #   daterange → value=['YYYY-MM-DD', 'YYYY-MM-DD']（按规范化 ISO 比较）
                       "between", "daterange"}
-ALLOWED_MEASURE_TYPES = {"currency", "percent", "count", "duration", "number", "unitless"}
+# ``price``（2026-10-13 批）：单价/售价 = Flint Price intensive（不可加、缺省
+# average）；显式 ``currency`` 声明仍归 Amount（additive）——零漂移。
+ALLOWED_MEASURE_TYPES = {"currency", "price", "percent", "count", "duration", "number", "unitless"}
 ALLOWED_TEXT_KINDS = {"heading", "paragraph", "callout", "quote", "divider"}
 ALLOWED_SURFACES = {"default", "soft", "emphasized"}
 ALLOWED_ACCENTS = {"blue", "teal", "orange", "purple"}
@@ -173,9 +175,23 @@ def _normalize_measure_types(measure_types: Any, label: str = "measureTypes") ->
         if not isinstance(column, str):
             raise RequestValidationError(f"{label} keys must be column names")
         if isinstance(semantic, dict):
-            allowed = set(semantic) - {"type", "divisor", "unit", "decimals", "aggregation", "format", "currency", "symbol"}
+            allowed = set(semantic) - {"type", "divisor", "unit", "decimals", "aggregation", "format", "currency", "symbol", "semantic"}
             if allowed:
                 raise RequestValidationError(f"unsupported measure type fields for {column!r}: {sorted(allowed)}")
+            # 批次 2（2026-10-13）：semantic = Flint T2 语义注解键
+            #（design-semantics.md §2.7 LLM 注解策略）。声明 semantic 的列，
+            # 编译/缺省聚合/零基线按 Flint 注册表该类型执行（如 semantic:'Price'
+            # → 不可加、缺省 average）；type 继续管格式族，二者正交。
+            sem_label = semantic.get("semantic")
+            if sem_label is not None:
+                from measure_semantics import SEMANTIC_VOCAB
+                from semantics import flint_core as _fc
+                if not isinstance(sem_label, str) or not sem_label.strip():
+                    raise RequestValidationError(f"measure semantic must be a non-empty label for {column!r}")
+                if _fc.canonical_alias(sem_label.strip()) not in SEMANTIC_VOCAB:
+                    raise RequestValidationError(
+                        f"unknown measure semantic {sem_label!r} for {column!r} — use a Flint type label "
+                        f"(Price/Revenue/Cost/Amount/Profit/Percentage/Count/Score/Rating/...)")
             if semantic.get("format") is not None and semantic["format"] not in {"percent"}:
                 raise RequestValidationError(f"measure format must be 'percent' for {column!r}")
             if semantic.get("aggregation") is not None and semantic["aggregation"] not in {"sum", "average", "count", "countd", "min", "max"}:

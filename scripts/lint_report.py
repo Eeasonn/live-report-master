@@ -25,6 +25,8 @@ in ``validate_report.py``; this script covers:
   L17 Rate/percent measure aggregated with sum, or placed in a stackedBar
   L18 Editable text node is empty or whitespace-only
   L19 Report chart theme is a non-default preset
+  L20 Price/intensive measure averaged while ignoring an existing category
+      column — the average is mix-driven, not a price level (2026-10-13)
 """
 
 from __future__ import annotations
@@ -485,7 +487,10 @@ def check_single_colour_palette(chart: dict[str, Any], findings: list[dict[str, 
 # ---------- L14: currency/percent-like measures without measureTypes ----------
 
 # Heuristic column-name signals. Advisory only; measureTypes remains optional.
-_CURRENCY_HINTS = ("金额", "价格", "收入", "成本", "利润", "额", "费", "价")
+# 价族（2026-10-13 批）先于金额族判定——单价/售价应声明 ``price``（Flint Price
+# intensive：缺省 average、不可加），而不是可加的 currency。
+_PRICE_HINTS = ("售价", "单价", "价格", "标价", "原价", "现价", "均价", "price")
+_CURRENCY_HINTS = ("金额", "收入", "成本", "利润", "额", "费")
 _PERCENT_HINTS = ("率", "占比", "比例", "百分比")
 
 
@@ -496,7 +501,16 @@ def check_measure_types_declared(chart: dict[str, Any], findings: list[dict[str,
     for measure in measures:
         if measure in measure_types:
             continue
-        if any(hint in measure for hint in _CURRENCY_HINTS):
+        if any(hint in measure for hint in _PRICE_HINTS):
+            findings.append(_finding(
+                "L14", SEVERITY_WARN, chart["id"],
+                f"measure '{measure}' looks like a unit price but editor.data.measureTypes does not "
+                f"declare it; the column gets no ¥ formatting and no non-additive protection in the editor.",
+                "add `\"measureTypes\": { \"" + measure + "\": \"price\" }` to editor.data "
+                "so the runtime formats with ¥ and defaults to average (prices are not additive).",
+                path=f"editor.data.measureTypes",
+            ))
+        elif any(hint in measure for hint in _CURRENCY_HINTS):
             findings.append(_finding(
                 "L14", SEVERITY_WARN, chart["id"],
                 f"measure '{measure}' looks like a currency value but editor.data.measureTypes does not "
@@ -602,33 +616,92 @@ def check_heatmap_range(chart: dict[str, Any], findings: list[dict[str, Any]]) -
 
 # ---------- L17: semantic aggregation/stacking validity (Flint T1 behaviour) ----------
 
+# 不可加判据（2026-10-13 扩）：字符串形态 percent/rate/price + object 形态
+# type/semantic（price = Flint Price intensive；intensive 语义标签同闸）。
+_INTENSIVE_LABELS = ("Percentage", "PercentageChange", "Price", "Score",
+                     "Temperature", "Sentiment", "Correlation")
+
+
+def _measure_non_additive_flag(mt: Any) -> bool:
+    if isinstance(mt, str):
+        return mt in ("percent", "rate", "price")
+    if isinstance(mt, dict):
+        if mt.get("type") in ("percent", "price"):
+            return True
+        return mt.get("semantic") in _INTENSIVE_LABELS
+    return False
+
+
 def check_measure_behaviour(chart, findings):
-    """Percent/rate measures must not be summed or stacked (semantically wrong)."""
+    """Percent/rate/price measures must not be summed or stacked (semantically wrong)."""
     vt = chart.get("viewType")
     data = (chart.get("editor") or {}).get("data") or {}
     measure_types = data.get("measureTypes") or {}
     measures = data.get("measures") or []
     aggregation = data.get("aggregation") or "sum"
-    non_additive = [m for m in measures if isinstance(measure_types.get(m), str)
-                    and measure_types[m] in ("percent", "rate")]
+    non_additive = [m for m in measures if _measure_non_additive_flag(measure_types.get(m))]
     if not non_additive:
         return
     if aggregation == "sum" and vt not in ("table",):
         findings.append(_finding(
             "L17", SEVERITY_WARN, chart["id"],
-            f"aggregation is sum for rate/percent measures {non_additive}; "
-            "summing rates across categories is semantically meaningless.",
-            "use average (or median) for rate/percent measures.",
+            f"aggregation is sum for rate/percent/price measures {non_additive}; "
+            "summing rates or unit prices across items is semantically meaningless.",
+            "use average for rate/percent/price measures (Flint intensive → average).",
             path="editor.data.aggregation",
         ))
     if vt == "stackedBar":
         findings.append(_finding(
             "L17", SEVERITY_WARN, chart["id"],
-            f"stacked bar with rate/percent measures {non_additive}; stacking "
+            f"stacked bar with rate/percent/price measures {non_additive}; stacking "
             "non-additive values misrepresents the total.",
             "use a grouped bar or a plain bar instead.",
             path="viewType",
         ))
+
+
+# ---------- L20: price averaged across a mix of incomparable slices ----------
+
+# 品类族列名信号：存在这类列而价格指标没有按它分组时，「国家均价/品牌均价」
+# 实际是品类构成差异（未加权混合均值），不是价格水平（2026-10-13 批，竞品
+# 街价报告 Top15 国家均价病灶的 advisory）。
+_CATEGORY_HINT_RE = re.compile(r"品类|类别|分类|品类|产品线|产业|category|family|industry", re.I)
+
+
+def check_price_mix_average(chart, findings):
+    """Price/intensive measure averaged on a dimension while a category column
+    exists but is not a grouping — the average is mix-driven, not a price level."""
+    if chart.get("viewType") in ("table", "detail"):
+        return
+    data = (chart.get("editor") or {}).get("data") or {}
+    measure_types = data.get("measureTypes") or {}
+    measures = data.get("measures") or []
+    price_measures = [m for m in measures
+                      if (isinstance(measure_types.get(m), dict)
+                          and (measure_types[m].get("type") == "price"
+                               or measure_types[m].get("semantic") == "Price"))]
+    if not price_measures:
+        return
+    columns = data.get("columns") or []
+    cat_cols = [c for c in columns if _CATEGORY_HINT_RE.search(str(c))]
+    if not cat_cols:
+        return
+    grouped = {data.get("dimension")}
+    grouped.update(data.get("dimensions") or [])
+    bd = ((data.get("roles") or {}).get("breakdown"))
+    if bd:
+        grouped.add(bd)
+    if any(c in grouped for c in cat_cols):
+        return
+    findings.append(_finding(
+        "L20", SEVERITY_WARN, chart["id"],
+        f"price measures {price_measures} are averaged over a slice that ignores the "
+        f"category column(s) {cat_cols}; the average mixes incomparable product "
+        "categories (a $21 band and a $3,000 foldable) and tracks mix, not price level.",
+        "group by the category column, compare within one category, or switch to "
+        "discount rate / price-band / median views for cross-category reads.",
+        path="editor.data.dimension",
+    ))
 
 
 # ---------- orchestration ----------
@@ -694,6 +767,7 @@ def lint_html(html: str, packaged: bool = False) -> tuple[list[dict[str, Any]], 
         check_scatter_discrimination,
         check_heatmap_range,
         check_measure_behaviour,
+        check_price_mix_average,
     ]
     for chart in charts:
         for checker in chart_checkers:

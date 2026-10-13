@@ -249,7 +249,7 @@ def resolve_field_kind(semantic_types: dict[str, Any], column: str) -> dict[str,
         t = st.get("type")
         canon = resolve_t2(t)
         t2 = canon["type"] if isinstance(canon, dict) else canon
-        if t2 in {"currency", "percent", "count", "duration", "number", "unitless"}:
+        if t2 in {"currency", "price", "percent", "count", "duration", "number", "unitless"}:
             return {"kind": "measure", "measureType": t2, "nonAdditive": is_non_additive(t2)}
         low = str(t).lower()
         if low in ("datetime", "date", "time", "month", "year", "timestamp"):

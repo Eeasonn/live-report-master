@@ -495,9 +495,13 @@
   function number(value){var n=Number(value);return Number.isFinite(n)?n:0;}
   function chartCatalog(){return clone(CATALOG);}
 
-  var MEASURE_TYPE_KEYS=['currency','percent','count','duration','number','unitless'];
+  // 'price'（2026-10-13 批）= Flint Price intensive（refs/flint/src/core/
+  // type-registry.ts:105）：格式与 currency 全同，唯一差别是不可加（缺省 average）。
+  // Python 镜像 = scripts/semantics/type_registry.py CANONICAL/TYPE_RULES。
+  var MEASURE_TYPE_KEYS=['currency','price','percent','count','duration','number','unitless'];
   var MEASURE_TYPE_FORMATS={
     currency:{axis:'¥{value}',prefix:'¥',suffix:''},
+    price:{axis:'¥{value}',prefix:'¥',suffix:''},
     percent:{axis:'{value}%',prefix:'',suffix:'%'},
     count:{axis:'{value}',prefix:'',suffix:''},
     duration:{axis:'{value} 天',prefix:'',suffix:' 天'},
@@ -538,7 +542,7 @@
   // capped at this many decimals (a chart-/measure-level override may raise it,
   // never beyond the author's intent). Counts stay integers; money/percent are
   // normalised to 2. Set explicitly via editor.data.measureTypes[m].decimals.
-  var MEASURE_TYPE_DECIMALS={currency:2,percent:2,count:0,duration:1,number:2,unitless:2};
+  var MEASURE_TYPE_DECIMALS={currency:2,price:2,percent:2,count:0,duration:1,number:2,unitless:2};
   function roundNumber(value,decimals){var n=number(value);if(!Number.isFinite(n)||decimals==null)return n;var f=Math.pow(10,Math.max(0,decimals));return Math.round(n*f)/f;}
   function typeDecimals(type){return MEASURE_TYPE_DECIMALS[type]!=null?MEASURE_TYPE_DECIMALS[type]:2;}
   function chartDecimals(chart,data){
@@ -674,11 +678,14 @@
   // A single source of truth for "what does this column mean" (field) and
   // "what can it do in this position" (channel). Replaces scattered name-regex
   // guesses so an author's intent is explained once, then enforced everywhere.
-  var T2_CANON={'currency':1,'percent':1,'count':1,'duration':1,'number':1,'unitless':1};
+  var T2_CANON={'currency':1,'price':1,'percent':1,'count':1,'duration':1,'number':1,'unitless':1};
   // T1/T0 family vocabulary -> canonical T2 type. Mirrors scripts/measure_semantics.py.
+  // 价族（售价/单价/价格/price）→ 'price'（intensive），在金额族**之前**判定——
+  // Flint 把 Price 与 Revenue 分家（design-semantics.md §2.4），价格不再折叠成可加金额。
   var FAMILY_WORDS={
-    money:'currency',currency:'currency',price:'currency',cost:'currency',revenue:'currency',amount:'currency',sales:'currency',profit:'currency',
-    '金额':'currency','价格':'currency','成本':'currency','利润':'currency','费用':'currency','消费':'currency','销售额':'currency','营业收入':'currency',
+    money:'currency',currency:'currency',cost:'currency',revenue:'currency',amount:'currency',sales:'currency',profit:'currency',
+    '金额':'currency','成本':'currency','利润':'currency','费用':'currency','消费':'currency','销售额':'currency','营业收入':'currency',
+    price:'price','售价':'price','单价':'price','价格':'price','标价':'price','原价':'price','现价':'price','均价':'price',
     percent:'percent',ratio:'percent',rate:'percent','占比':'percent','比例':'percent','百分比':'percent','率':'percent','比率':'percent',
     duration:'duration','时长':'duration','耗时':'duration','用时':'duration',
     count:'count','人数':'count','用户数':'count','数量':'count','次数':'count','记录数':'count','条数':'count',
@@ -698,7 +705,9 @@
   }
   // A measure is non-additive when its semantic type says so, OR a storage
   // hint (ratio/percent tokens in the name) agrees. Computed once per field.
-  var NONADDITIVE_TYPE={percent:1,unitless:1};
+  // price（Flint Price intensive，2026-10-13 批）与 percent/unitless 同闸：
+  // 不可 sum、不可进堆叠（channelAction reject / TOP-K addMask / 合计闸同源）。
+  var NONADDITIVE_TYPE={percent:1,unitless:1,price:1};
   // Field-role override: a user-set semantic role (measure/time/category/ordinal)
   // that beats the model's auto-detection. Stored on the dataset as fieldRoles[col]
   // and read FIRST by every semantic + formatting + axis decision so a field can
@@ -802,7 +811,8 @@
       resolved.symbol=(raw.symbol!=null&&String(raw.symbol).trim()!=='')?String(raw.symbol).trim():undefined;
       // 拍板 7：显式 currency 声明且未写 divisor/unit → 按 code 分档取缺省
       // （CNY/JPY → 万元口径，其余 → 原值）。无 currency 键不动（零漂移）。
-      if(resolved.type==='currency'&&raw.currency!=null&&raw.divisor==null&&raw.unit==null){
+      // price（2026-10-13 批）同享币种机制（格式与 currency 全同）。
+      if((resolved.type==='currency'||resolved.type==='price')&&raw.currency!=null&&raw.divisor==null&&raw.unit==null){
         var dft=CURRENCY_DEFAULT_SCALES[resolved.currency];
         resolved.divisor=dft?dft.divisor:1;
         resolved.unit=dft?dft.unit:'';
@@ -857,7 +867,7 @@
     // 前缀**显式置空**（不是跳过覆盖——那会漏出静态表默认 ¥），type/divisor/suffix
     // 语义全保留（万元口径等不受影响），面板勾选即回显。
     var prefix=base.prefix;
-    if(resolved.type==='currency'&&!hasPercentFormat){
+    if((resolved.type==='currency'||resolved.type==='price')&&!hasPercentFormat){
       prefix=(data.hideCurrency&&data.hideCurrency[measure])?'':currencyPrefixOf(resolved.currency,resolved.symbol);
     }
     return {type:resolved.type,divisor:divisor,decimals:resolved.decimals,prefix:prefix,suffix:suffix,axis:prefix+'{value}'+suffix};
@@ -2698,13 +2708,15 @@
       // axisConfig[].name. With >2 measures some share an axis (≤2 Y axes).
       var firstOn0=null,firstOn1=null;
       option.series.forEach(function(s){if(s.yAxisIndex===1){if(firstOn1==null)firstOn1=s.name;}else if(firstOn0==null)firstOn0=s.name;});
-      var name0=firstOn0||measures[0],name1=firstOn1||measures[1];
+      var name0=firstOn0||measureDisplayName(data,measures[0]),name1=firstOn1||measureDisplayName(data,measures[1]);
       option.yAxis=[
         {type:'value',name:nameWithUnit(0,axisCfg[0]&&axisCfg[0].name!=null?axisCfg[0].name:name0),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}},
         {type:'value',name:nameWithUnit(1,axisCfg[1]&&axisCfg[1].name!=null?axisCfg[1].name:name1),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{show:false}}
       ];
     }else{
-      var baseName=(axisCfg[0]&&axisCfg[0].name!=null)?axisCfg[0].name:(data.measures&&data.measures[0])||'';
+      // 轴名走 measureDisplayName：合成行数指标 '*' 显示「记录数」（编译静态层
+      // _measure_name 同口径）——裸回退 measures[0] 会在重聚合后把 '*' 挂上轴顶。
+      var baseName=(axisCfg[0]&&axisCfg[0].name!=null)?axisCfg[0].name:measureDisplayName(data,(data.measures&&data.measures[0])||'');
       option.yAxis={type:'value',name:nameWithUnit(0,baseName),axisLabel:{fontSize:11,color:'#5e6c84'},splitLine:{lineStyle:{type:'dashed',color:'#eef1f7'}}};
     }
     option.legend=Object.assign({type:'scroll'},option.legend||{},{data:(option.series||[]).map(function(s){return s.name;})});
@@ -3483,6 +3495,13 @@
     Duration:{t0:'Temporal',t1:'Duration',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'unit-suffix',zero:'meaningful',pad:0},
     Amount:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
     Revenue:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
+    // Price intensive（refs/flint/src/core/type-registry.ts:105，2026-10-13 批）：
+    // 单价/售价不可加、缺省 average——与 PY flint_core.Price 逐字段镜像。
+    Price:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'intensive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
+    Cost:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
+    Temperature:{t0:'Measure',t1:'Physical',v:['quantitative'],aggRole:'intensive',domainShape:'open',diverging:'conditional',fmt:'unit-suffix',zero:'arbitrary',pad:0.05},
+    Sentiment:{t0:'Measure',t1:'SignedMeasure',v:['quantitative'],aggRole:'intensive',domainShape:'open',diverging:'inherent',fmt:'decimal',zero:'meaningful',pad:0},
+    Correlation:{t0:'Measure',t1:'SignedMeasure',v:['quantitative'],aggRole:'intensive',domainShape:'bounded',diverging:'inherent',fmt:'decimal',zero:'meaningful',pad:0},
     Quantity:{t0:'Measure',t1:'Physical',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'unit-suffix',zero:'meaningful',pad:0},
     Percentage:{t0:'Measure',t1:'Proportion',v:['quantitative'],aggRole:'intensive',domainShape:'bounded',diverging:'none',fmt:'percent',zero:'contextual',pad:0},
     PercentageChange:{t0:'Measure',t1:'SignedMeasure',v:['quantitative'],aggRole:'intensive',domainShape:'open',diverging:'conditional',fmt:'percent',zero:'contextual',pad:0.05},
@@ -3496,7 +3515,7 @@
     Status:{t0:'Categorical',t1:'Coded',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Region:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0}
   };
-  var FLINT_ALIAS={currency:'Amount',percent:'Percentage',count:'Count',duration:'Duration',number:'Quantity',unitless:'Number'};
+  var FLINT_ALIAS={currency:'Amount',percent:'Percentage',count:'Count',duration:'Duration',number:'Quantity',unitless:'Number',price:'Price',cost:'Cost',Rating:'Score'};
   function flintGetType(name){return FLINT_TYPES[name];}
   function flintCanonicalAlias(name){return FLINT_ALIAS[name]||name;}
   function flintInferVisCategory(values){

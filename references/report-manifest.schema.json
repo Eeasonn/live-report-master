@@ -493,6 +493,7 @@
               {
                 "enum": [
                   "currency",
+                  "price",
                   "percent",
                   "count",
                   "duration",
@@ -510,12 +511,19 @@
                   "type": {
                     "enum": [
                       "currency",
+                      "price",
                       "percent",
                       "count",
                       "duration",
                       "number",
                       "unitless"
                     ]
+                  },
+                                "semantic": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Flint T2 语义注解标签（Price/Revenue/Percentage/Score/...，2026-10-13 批）：声明后按该类型聚合角色执行（Price → 不可加、缺省 average）。",
+                    "$comment": "docs/zh-CN design-semantics.md §2.7（refs/flint）"
                   },
                   "divisor": {
                     "type": "number",
@@ -928,6 +936,7 @@
               {
                 "enum": [
                   "currency",
+                  "price",
                   "percent",
                   "count",
                   "duration",
@@ -945,12 +954,19 @@
                   "type": {
                     "enum": [
                       "currency",
+                      "price",
                       "percent",
                       "count",
                       "duration",
                       "number",
                       "unitless"
                     ]
+                  },
+                                "semantic": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Flint T2 语义注解标签（Price/Revenue/Percentage/Score/...，2026-10-13 批）：声明后按该类型聚合角色执行（Price → 不可加、缺省 average）。",
+                    "$comment": "docs/zh-CN design-semantics.md §2.7（refs/flint）"
                   },
                   "divisor": {
                     "type": "number",

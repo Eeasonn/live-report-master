@@ -56,6 +56,27 @@ FLINT_TYPES: dict[str, dict[str, Any]] = {
     "Revenue":    {"t0": "Measure", "t1": "Amount", "visEncodings": ["quantitative"],
                    "aggRole": "additive", "domainShape": "open", "diverging": "none",
                    "formatClass": "currency", "zeroBaseline": "meaningful", "zeroPad": 0},
+    # Flint type-registry.ts:105 —— Price 是 intensive（强度量）：每个商品/每笔
+    # Offer 的属性，跨品类加总无业务意义，缺省聚合 average（field-semantics.ts:487）。
+    # 这是「竞品街价报告把价格当销售额加总」病灶的语义修正（2026-10-13 批）。
+    "Price":      {"t0": "Measure", "t1": "Amount", "visEncodings": ["quantitative"],
+                   "aggRole": "intensive", "domainShape": "open", "diverging": "none",
+                   "formatClass": "currency", "zeroBaseline": "meaningful", "zeroPad": 0},
+    # Cost 无独立注册表条目（refs/flint 代码只注册 Amount/Price），按
+    # design-semantics.md §2.4 的 Amount 族 T2（additive currency）补齐别名。
+    "Cost":       {"t0": "Measure", "t1": "Amount", "visEncodings": ["quantitative"],
+                   "aggRole": "additive", "domainShape": "open", "diverging": "none",
+                   "formatClass": "currency", "zeroBaseline": "meaningful", "zeroPad": 0},
+    # 以下三条 verbatim 自 refs/flint/src/core/type-registry.ts:109,117,118。
+    "Temperature": {"t0": "Measure", "t1": "Physical", "visEncodings": ["quantitative"],
+                    "aggRole": "intensive", "domainShape": "open", "diverging": "conditional",
+                    "formatClass": "unit-suffix", "zeroBaseline": "arbitrary", "zeroPad": 0.05},
+    "Sentiment":  {"t0": "Measure", "t1": "SignedMeasure", "visEncodings": ["quantitative"],
+                   "aggRole": "intensive", "domainShape": "open", "diverging": "inherent",
+                   "formatClass": "decimal", "zeroBaseline": "meaningful", "zeroPad": 0},
+    "Correlation": {"t0": "Measure", "t1": "SignedMeasure", "visEncodings": ["quantitative"],
+                    "aggRole": "intensive", "domainShape": "bounded", "diverging": "inherent",
+                    "formatClass": "decimal", "zeroBaseline": "meaningful", "zeroPad": 0},
     "Quantity":   {"t0": "Measure", "t1": "Physical", "visEncodings": ["quantitative"],
                    "aggRole": "additive", "domainShape": "open", "diverging": "none",
                    "formatClass": "unit-suffix", "zeroBaseline": "meaningful", "zeroPad": 0},
@@ -108,7 +129,8 @@ def get_type(name: str) -> dict[str, Any] | None:
 def canonical_alias(name: str) -> str:
     """Resolve a Skill measureTypes label to a Flint semantic type if known."""
     return {"currency": "Amount", "percent": "Percentage", "count": "Count",
-            "duration": "Duration", "number": "Quantity", "unitless": "Number"}.get(name, name)
+            "duration": "Duration", "number": "Quantity", "unitless": "Number",
+            "price": "Price", "cost": "Cost", "Rating": "Score"}.get(name, name)
 
 
 def infer_vis_category(values: list[Any]) -> str:

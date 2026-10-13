@@ -38,8 +38,9 @@
 |---|---|---|---|
 | 一个数据集来自多个同构文件（补 W35+W36 两周/多月） | `datasets[].file` | 路径字符串 **或 1–8 个路径的数组**（构建期同构并集 UNION：列集一致、顺序无关，类型以合并后全集判定；不参与 relations） | 单文件；报告建好后补数据走「追加新行」 |
 | 这列是时间/维度/指标/忽略 | `columnRoles.<col>` | `time` \| `dimension` \| `measure` \| `id` \| `ignore`（id 与 ignore 同行为） | profile 自动推断；只校验未引用列存在 |
-| 金额/百分比/计数格式与默认聚合 | `measureTypes.<col>` | `{type: currency\|percent\|count\|duration\|number\|unitless, aggregation?, decimals?}` | 类型按 profile 推断；聚合 sum；精度按类型默认 |
-| 指定币种（美元/欧元/日元…） | `measureTypes.<col>.currency` | ISO 代码，必须在内置 22 币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND）；如 `{"type":"currency","currency":"USD","decimals":2}` | 缺省 CNY（¥）；CNY/JPY 显式声明时缺省 `divisor:10000, unit:'万'`，其余币原值；未知代码校验拒绝（自定义显示改用 `symbol`，≤4 字符，优先于查表）。币种只在数据源配置（字段配置）声明，图表级不提供覆盖 |
+| 金额/百分比/计数格式与默认聚合 | `measureTypes.<col>` | `{type: currency\|price\|percent\|count\|duration\|number\|unitless, semantic?, aggregation?, decimals?}` | 类型按 profile 推断（价族名称自动判 price）；聚合按 Flint 聚合角色缺省（additive→sum，**intensive（price/percent/score）→average**）；精度按类型默认 |
+| 指定币种（美元/欧元/日元…） | `measureTypes.<col>.currency` | ISO 代码，必须在内置 23 币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND/RUB）；如 `{"type":"currency","currency":"USD","decimals":2}`（`type:"price"` 同样可用） | 缺省 CNY（¥）；CNY/JPY 显式声明时缺省 `divisor:10000, unit:'万'`，其余币原值；未知代码校验拒绝（自定义显示改用 `symbol`，≤4 字符，优先于查表）。币种只在数据源配置（字段配置）声明，图表级不提供覆盖。**price 与 currency 的唯一差别是可加性**：price=Flint Price intensive（不可加、缺省 average），currency=Amount（可加、缺省 sum） |
+| 更细的聚合语义注解（Flint T2） | `measureTypes.<col>.semantic` | Flint 标签：`Price/Revenue/Cost/Amount/Profit/Percentage/Count/Number/Quantity/Duration/Score/Rating/Temperature/Sentiment/Correlation/Rank`…（受控词汇 = flint_core 注册表） | 无。声明后编译按该类型聚合角色执行（如 `semantic:"Price"` → 不可加、缺省 average；`Profit` → signed-additive 可加但发散色）；`type` 继续管格式族，二者正交 |
 | 每行算一个数（客单价=额/数） | `derived.columns[]` | ≤8 `{name, op: add\|sub\|mul\|div, left, right}`；时间差 `{op:"datediff", left, right, unit}`（端可为列或 `__today__`） | 无；物化成真列后处处当普通指标 |
 | 聚合后算比率/同环比/累计/占比/**筛选聚合** | `derived.measures[]` | ≤16，`kind: formula`（AST）/ `window`（fn: prev\|cum\|ytd\|rank…，必填 timeField+grain）/ `share`（scope: all\|parent）/ `filtered`（agg+col+filters≥1，op: eq/ne/gt/ge/lt/le/between/in，条件聚合 AGG(CASE WHEN…)；count 可省 col） | 无；窗口指标要求引用图表维度==timeField 且分桶==grain，否则编译期可行动报错；filtered 无时间语义，被窗口 ref 引用即得同环比 |
 | 省份归并成大区、年龄分段 | `dimGroups[]` | `{name, source, groups:[{label, members[]}], other?}`；未命中归 other（不声明则保留原值） | 无；物化成新维度列，不进计算字段引用宇宙 |
@@ -132,6 +133,8 @@
 - 出现「**完成率/达标/异常标红**」→ `condFormat`（阈值让业务给，缺省与均值/与0 不要凭空造阈值）。
 - 出现「**合计不对，应该是平均/去重**」→ `totalCalc`。
 - 数据有**比率列**（利润率/增长率）→ 考虑 `condFormat` 百分比区间 + 不要把这些列当可加指标堆进合计。
+- 数据有**单价/售价列**（价格、售价、unit price）→ 声明 `type:"price"`（或依赖价族名称自动推断）：缺省聚合自动变 average、不可 sum/堆叠。**跨品类视角不要用均价**——分品类切片、价格带/中位数、折扣率（lint L20 会提示品类列在场但未分组的情况）。
+- 绑定指标到维度前自问「**该口径在此切片上是否仍衡量同一对象**」（intensive 指标的可比性审查，见 SKILL.md 模型负责第 5 条）。
 - 业务给了**编码值**要求中文显示 → 显示层值别名（编辑器配，请求层不收；见文首说明）。
 - **多级维度 + 多指标 + 时间列** → 默认 3D 交叉表已合适；除非业务点名平表/树形，不要乱写 `layout`。
 - 提示词点名的每一个**非基础度量**（比率/均值/占比/同环比/累计/店均/去重计数，如 WOS=Stock/Sales）→ `derived.measures` / `derived.columns` 各一条显式声明；交付前逐个对账，不许静默降级成「只有基础 SUM」。

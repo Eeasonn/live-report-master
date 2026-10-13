@@ -121,6 +121,19 @@ def build_profile(table: dict[str, Any], source: str) -> dict[str, Any]:
                 "mean": _json_value(sum(numeric) / len(numeric)),
                 "sum": _json_value(sum(numeric)),
             })
+            # 语义候选（批次 2，design-semantics.md §2.7 LLM 注解策略的画像侧）：
+            # 名称关键词推出的 Flint T2 标签（Price/Percentage/Revenue/Count），
+            # 只对「会改变聚合语义」的标签给 hint——模型读画像拍板时不必裸猜。
+            # 数值形态加推：0–1 有界数值 → Percentage（0-1 表示检测）。
+            from measure_semantics import semantic_label_of
+            sem = semantic_label_of(None, name)
+            if sem is None and numeric and 0 <= numeric[0] and numeric[-1] <= 1 \
+                    and numeric[-1] > 0:
+                sem = "Percentage"
+            if sem in ("Price", "Percentage", "PercentageChange", "Revenue",
+                       "Cost", "Profit", "Score", "Temperature", "Sentiment",
+                       "Correlation"):
+                item["semanticHint"] = sem
         elif types[name] == "time" and non_null:
             ordered = sorted(str(value) for value in non_null)
             item.update({"min": ordered[0], "max": ordered[-1]})

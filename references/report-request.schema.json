@@ -82,6 +82,7 @@
           {
             "enum": [
               "currency",
+              "price",
               "percent",
               "count",
               "duration",
@@ -99,12 +100,18 @@
               "type": {
                 "enum": [
                   "currency",
+                  "price",
                   "percent",
                   "count",
                   "duration",
                   "number",
                   "unitless"
                 ]
+              },
+              "semantic": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Flint T2 语义注解（design-semantics.md §2.7 LLM 注解策略）：Price/Revenue/Cost/Amount/Profit/Percentage/Count/Score/Rating/Temperature/Sentiment/Correlation 等。声明后编译按该类型的聚合角色执行（如 Price → 不可加、缺省聚合 average）；type 继续管格式族，二者正交。"
               },
               "divisor": {
                 "type": "number",
@@ -123,7 +130,7 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 8,
-                "description": "ISO 货币代码，必须在内置币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND，22 币）。未知代码校验拒绝——自定义符号请改用 symbol。缺省 CNY（¥）。",
+                "description": "ISO 货币代码，必须在内置币表内（USD/EUR/GBP/JPY/CNY/KRW/INR/BRL/CAD/AUD/CHF/SEK/NOK/DKK/HKD/TWD/SGD/THB/MYR/PHP/IDR/VND，22 币 + RUB）。未知代码校验拒绝——自定义符号请改用 symbol。缺省 CNY（¥）。price 类型同样可用（币种前缀/万元口径与 currency 全同）。",
                 "pattern": "^[A-Za-z]{3}$"
               },
               "symbol": {
