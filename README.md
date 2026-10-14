@@ -2,6 +2,8 @@
 
 把一张二维表（Excel / CSV / JSON）变成一份**可编辑的 BI 报告**。
 
+> 📖 **产品手册（图文 + 全流程实例）**：https://eeasonn.github.io/live-report-master/
+
 这是一个 Agent Skill：模型只负责「看懂数据、做分析选择」（列角色、图表选型、KPI、洞察），其余一切——布局求解、ECharts option 生成、SQL 聚合、打包、审计——全部由确定性脚本完成。
 
 ## 工作方式
