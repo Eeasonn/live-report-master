@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live Report · AI 互动报表 — 产品使用手册</title>
+<style>
+  :root{
+    --ink:#1a1a1a; --ink-2:#44423d; --ink-3:#787671; --ink-4:#a4a097;
+    --line:#e5e3df; --line-soft:#ede9e4; --bg:#ffffff; --bg-soft:#f6f5f4;
+    --accent:#5070dd; --accent-soft:#eef2fd;
+    --warn-bg:#fdf6e7; --warn-ink:#8a6116; --warn-line:#f0dfb6;
+    --tip-bg:#eef7f0; --tip-ink:#2f6b40; --tip-line:#cfe8d6;
+    --note-bg:#f4f6fb; --note-ink:#3c5499; --note-line:#d9e1f5;
+    --code-bg:#f6f5f4;
+    --toc-w:236px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  /* ===== 顶部横幅 ===== */
+  .hero{
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#fbfaf9 0%,#ffffff 100%);
+  }
+  .hero-inner{max-width:1120px;margin:0 auto;padding:44px 32px 30px;display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap}
+  .hero h1{margin:0 0 8px;font-size:30px;line-height:1.3;letter-spacing:.2px}
+  .hero h1 .en{color:var(--accent)}
+  .hero p.sub{margin:0;color:var(--ink-3);font-size:14px;max-width:640px}
+  .hero .meta{text-align:right;color:var(--ink-4);font-size:12.5px;line-height:2}
+  .hero .meta b{color:var(--ink-2);font-weight:600}
+  /* ===== 布局 ===== */
+  .wrap{max-width:1120px;margin:0 auto;padding:0 32px;display:flex;gap:44px;align-items:flex-start}
+  nav.toc{
+    position:sticky;top:0;width:var(--toc-w);flex:0 0 var(--toc-w);
+    max-height:100vh;overflow-y:auto;padding:28px 0 60px;
+    font-size:13px;
+  }
+  nav.toc .toc-title{font-weight:700;color:var(--ink-4);letter-spacing:.12em;font-size:11.5px;margin:18px 0 6px;text-transform:uppercase}
+  nav.toc .toc-title:first-child{margin-top:0}
+  nav.toc a{display:block;color:var(--ink-2);text-decoration:none;padding:4px 10px;border-radius:6px;line-height:1.5}
+  nav.toc a:hover{background:var(--bg-soft);color:var(--ink)}
+  nav.toc a.l2{padding-left:22px;color:var(--ink-3);font-size:12.5px}
+  main{flex:1;min-width:0;padding:12px 0 120px}
+  /* ===== 章节 ===== */
+  section.chap{margin-top:56px;scroll-margin-top:16px}
+  section.chap > h2{
+    font-size:24px;line-height:1.4;margin:0 0 6px;padding-top:18px;
+    border-top:1px solid var(--line-soft);
+  }
+  section.chap:first-of-type > h2{border-top:none;padding-top:0}
+  section.chap > h2 .no{color:var(--accent);font-variant-numeric:tabular-nums;margin-right:10px}
+  h3{font-size:17.5px;margin:34px 0 8px;scroll-margin-top:16px}
+  h3 .no{color:var(--ink-4);font-weight:600;font-size:14px;margin-right:8px;font-variant-numeric:tabular-nums}
+  h4{font-size:15px;margin:22px 0 6px;color:var(--ink)}
+  p{margin:10px 0}
+  ul,ol{margin:8px 0;padding-left:22px}
+  li{margin:5px 0}
+  li::marker{color:var(--ink-4)}
+  b,strong{font-weight:650}
+  small{color:var(--ink-3)}
+  /* ===== 提示块 ===== */
+  .callout{border-radius:8px;padding:12px 16px;margin:16px 0;font-size:14px;line-height:1.8}
+  .callout .cap{font-weight:700;margin-right:8px}
+  .callout p{margin:4px 0}
+  .callout.note{background:var(--note-bg);border:1px solid var(--note-line);color:var(--note-ink)}
+  .callout.warn{background:var(--warn-bg);border:1px solid var(--warn-line);color:var(--warn-ink)}
+  .callout.tip{background:var(--tip-bg);border:1px solid var(--tip-line);color:var(--tip-ink)}
+  .callout.note .cap,.callout.warn .cap,.callout.tip .cap{color:inherit}
+  .callout.note,.callout.warn,.callout.tip{color:var(--ink-2)}
+  .callout.note .cap{color:var(--note-ink)} .callout.warn .cap{color:var(--warn-ink)} .callout.tip .cap{color:var(--tip-ink)}
+  /* ===== 表格 ===== */
+  table.cfg{width:100%;border-collapse:collapse;margin:14px 0 20px;font-size:13.5px;line-height:1.7}
+  table.cfg th{background:var(--bg-soft);color:var(--ink-2);font-weight:650;text-align:left;white-space:nowrap}
+  table.cfg th,table.cfg td{border:1px solid var(--line);padding:8px 12px;vertical-align:top}
+  table.cfg td:first-child{white-space:nowrap}
+  table.cfg td.wrap{white-space:normal}
+  table.cfg tbody tr:nth-child(even){background:#fcfbfa}
+  code,.kbd{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--code-bg);border:1px solid var(--line);border-radius:5px;
+    padding:1px 6px;font-size:12.5px;color:var(--ink-2);word-break:break-all;
+  }
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow-x:auto;margin:14px 0}
+  pre code{background:none;border:none;padding:0;font-size:13px;line-height:1.8;color:var(--ink-2)}
+  /* ===== 图示 ===== */
+  figure{margin:18px 0 24px}
+  figure img{max-width:100%;height:auto;border:1px solid var(--line);border-radius:8px;display:block;box-shadow:0 1px 3px rgba(26,26,26,.05)}
+  figure img.plain{box-shadow:none}
+  figcaption{color:var(--ink-4);font-size:12.5px;margin-top:8px;text-align:center}
+  .figrow{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:900px){.figrow{grid-template-columns:1fr}}
+  .diagram{background:#fff}
+  /* ===== 徽标/标签 ===== */
+  .tag{display:inline-block;font-size:11.5px;border-radius:5px;padding:0 7px;line-height:20px;vertical-align:1px;background:var(--bg-soft);border:1px solid var(--line);color:var(--ink-3)}
+  .tag.acc{background:var(--accent-soft);border-color:#c9d6f5;color:var(--accent)}
+  .tag.warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+  /* ===== 步骤 ===== */
+  .steps{counter-reset:step;margin:12px 0;padding:0;list-style:none}
+  .steps li{counter-increment:step;position:relative;padding-left:38px;margin:14px 0}
+  .steps li::before{
+    content:counter(step);position:absolute;left:0;top:2px;width:24px;height:24px;border-radius:50%;
+    background:var(--accent);color:#fff;font-size:13px;font-weight:600;line-height:24px;text-align:center;
+  }
+  /* ===== 锚点返回 ===== */
+  .back{font-size:12px;color:var(--ink-4);text-decoration:none}
+  hr.sep{border:none;border-top:1px dashed var(--line);margin:36px 0}
+  @media (max-width:980px){
+    nav.toc{display:none}
+    .wrap{padding:0 20px}
+  }
+  @media print{
+    nav.toc{display:none}
+    .hero{border-bottom:none}
+    section.chap{page-break-before:always}
+  }
+</style>
+</head>
+<body>
+
+<!-- ===================== 横幅 ===================== -->
+<header class="hero">
+  <div class="hero-inner">
+    <div>
+      <h1><span class="en">Live Report</span> · AI 互动报表 — 产品使用手册</h1>
+      <p class="sub">把一张二维表（Excel / CSV / JSON）变成一份可编辑、可交互、可汇报的 BI 报告。数据、布局、图表、口径全部确定性好掌握：看得懂、改得动、发得出去。</p>
+    </div>
+    <div class="meta">
+      <div>文档版本 <b>v1.2</b> · 更新日期 <b>2026-10-14</b></div>
+      <div>适用产品版本 <b>v2026.10.13</b> 及以上</div>
+      <div>配图来自真实运行报告的真机截图</div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ===================== 目录 ===================== -->
+<nav class="toc" aria-label="目录">
+  <div class="toc-title">指南</div>
+  <a href="#c1">1 产品概述</a>
+  <a href="#c1-2" class="l2">1.1 工作原理</a>
+  <a href="#c1-3" class="l2">1.2 交付形态</a>
+  <a href="#c1-5" class="l2">1.4 创作入口</a>
+  <a href="#c2">2 快速上手</a>
+  <a href="#c2-3" class="l2">2.3 输入模板：页面描述法</a>
+  <a href="#c2-4" class="l2">2.4 输入模板：场景描述法</a>
+  <a href="#c2-5" class="l2">2.5 口径对账锚点</a>
+  <a href="#c2-6" class="l2">2.6 全流程实例：一张表到一份报告</a>
+  <a href="#c3">3 阅读报告</a>
+  <a href="#c3-2" class="l2">3.1 筛选器</a>
+  <a href="#c3-3" class="l2">3.2 KPI 指标卡</a>
+  <a href="#c3-4" class="l2">3.3 图表交互</a>
+  <a href="#c4">4 编辑报告</a>
+  <a href="#c4-2" class="l2">4.2 图表设置面板</a>
+  <a href="#c4-5" class="l2">4.5 报告主题</a>
+  <a href="#c4-7" class="l2">4.7 保存与分享</a>
+  <a href="#c5">5 数据表卡与交叉表</a>
+  <a href="#c5-2" class="l2">5.2 行/列/值配置</a>
+  <a href="#c5-3" class="l2">5.3 表头与合并</a>
+  <a href="#c5-4" class="l2">5.4 合计与小计</a>
+  <a href="#c5-5" class="l2">5.5 排序与取数</a>
+  <a href="#c5-6" class="l2">5.6 单元格样式</a>
+  <a href="#c5-7" class="l2">5.7 列宽</a>
+  <a href="#c5-8" class="l2">5.8 明细视图</a>
+  <a href="#c5-9" class="l2">5.9 层级下钻</a>
+  <a href="#c5-10" class="l2">5.10 指标名称维度</a>
+  <a href="#c5-11" class="l2">5.11 三层行列</a>
+  <a href="#c5-12" class="l2">5.12 配置项速查</a>
+  <a href="#c6">6 数据源管理</a>
+  <a href="#c6-3" class="l2">6.3 计算字段</a>
+  <a href="#c6-5" class="l2">6.5 多表与关联</a>
+  <a href="#c6-6" class="l2">6.6 更新数据</a>
+  <a href="#c7">7 汇报与导出</a>
+  <a href="#c8">8 交付与运维</a>
+  <a href="#c9">9 附录</a>
+  <a href="#c9-a" class="l2">A 图表类型白名单</a>
+  <a href="#c9-b" class="l2">B 筛选操作符</a>
+  <a href="#c9-c" class="l2">C 常见问题</a>
+  <a href="#c9-d" class="l2">D 词汇表</a>
+</nav>
+
+<!-- ===================== 正文 ===================== -->
+<main>
+
+<!-- ============ 1 产品概述 ============ -->
+<section class="chap" id="c1">
+  <h2><span class="no">1</span>产品概述</h2>
+  <p><b>Live Report</b> 是一个面向业务人员的 AI 报表工具：输入一张干净的二维表，产出一份数据真实、口径可查、可以在浏览器里继续编辑的互动报告。它把「让 AI 写报告」这件事里不可靠的部分（排版、图表配置、SQL、数据加工）全部交给确定性脚本，只把「看懂数据、做分析选择」留给模型——因此<b>同一份数据每次构建得到的报告是一致的</b>，图表上看到的每个数字都可以追溯到源数据。</p>
+  <ul>
+    <li><b>数据为真</b>：报告里没有任何手抄数字。KPI、图表、表格都由聚合引擎实时计算；筛选、下钻、改图表配置之后所有卡片同步重算。</li>
+    <li><b>编辑即所得</b>：读者可以进入编辑模式，拖拽字段换维度、换图表类型、改 TOP-N、开合计——全部即时生效，不用回到构建工具。</li>
+    <li><b>一份报告多种用途</b>：日常在浏览器里看、月度例会切到汇报模式放映、临时导出 PPTX / PDF 分发，布局互不干扰。</li>
+  </ul>
+
+  <h3 id="c1-2"><span class="no">1.1</span>工作原理</h3>
+  <figure>
+    <svg class="diagram" viewBox="0 0 960 168" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="工作原理流程图">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b0aca4"/></marker>
+      </defs>
+      <g font-size="13" fill="#1a1a1a" font-family="inherit">
+        <rect x="8" y="52" width="150" height="64" rx="10" fill="#f6f5f4" stroke="#e5e3df"/>
+        <text x="83" y="78" text-anchor="middle" font-weight="600">二维表数据</text>
+        <text x="83" y="99" text-anchor="middle" font-size="11.5" fill="#787671">Excel / CSV / JSON</text>
+
+        <line x1="162" y1="84" x2="204" y2="84" stroke="#b0aca4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <rect x="208" y="34" width="228" height="100" rx="10" fill="#eef2fd" stroke="#c9d6f5"/>
+        <text x="322" y="60" text-anchor="middle" font-weight="600">智能构建</text>
+        <text x="322" y="82" text-anchor="middle" font-size="11.5" fill="#3c5499">数据画像 → 分析意图 → 请求校验</text>
+        <text x="322" y="102" text-anchor="middle" font-size="11.5" fill="#3c5499">编译布局 · 聚合 · 浏览器审计</text>
+        <text x="322" y="122" text-anchor="middle" font-size="11.5" fill="#3c5499">（全流程确定性脚本）</text>
+
+        <line x1="440" y1="84" x2="482" y2="84" stroke="#b0aca4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <rect x="486" y="34" width="200" height="100" rx="10" fill="#f6f5f4" stroke="#e5e3df"/>
+        <text x="586" y="60" text-anchor="middle" font-weight="600">三种交付形态</text>
+        <text x="586" y="82" text-anchor="middle" font-size="11.5" fill="#787671">单文件 HTML</text>
+        <text x="586" y="101" text-anchor="middle" font-size="11.5" fill="#787671">本机数据服务</text>
+        <text x="586" y="120" text-anchor="middle" font-size="11.5" fill="#787671">混合模式</text>
+
+        <line x1="690" y1="84" x2="732" y2="84" stroke="#b0aca4" stroke-width="1.5" marker-end="url(#arr)"/>
+
+        <rect x="736" y="20" width="216" height="128" rx="10" fill="#f6f5f4" stroke="#e5e3df"/>
+        <text x="844" y="44" text-anchor="middle" font-weight="600">使用与协作</text>
+        <text x="844" y="66" text-anchor="middle" font-size="11.5" fill="#787671">筛选 · 下钻 · 编辑</text>
+        <text x="844" y="85" text-anchor="middle" font-size="11.5" fill="#787671">汇报放映 · PPTX / PDF</text>
+        <text x="844" y="104" text-anchor="middle" font-size="11.5" fill="#787671">副本 / 覆盖 · 分享链接</text>
+        <text x="844" y="123" text-anchor="middle" font-size="11.5" fill="#787671">局域网协作 · 数据更新</text>
+      </g>
+    </svg>
+    <figcaption>图 1-1 从二维表到互动报告的完整链路</figcaption>
+  </figure>
+  <p>其中「智能构建」阶段会自动完成：数据画像（类型 / 基数 / 缺失率 / 数值统计）、列角色与数值语义推断、图表选型与布局求解、KPI 与筛选器生成，最后经过真实浏览器审计（每张图必须真实绘制、控件必须可用）才算构建成功。</p>
+
+  <h3 id="c1-3"><span class="no">1.2</span>三种交付形态</h3>
+  <p>构建时按数据规模自动选择（<code>auto</code>），也可以显式指定。三种形态的报告功能完全一致，差别只在数据放在哪里。</p>
+  <table class="cfg">
+    <thead><tr><th>形态</th><th>数据位置 · 适合场景 · 打开方式</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>单文件<span class="tag" style="margin-left:6px">singlefile</span></td>
+        <td>全量数据内嵌在 HTML 文件里。适合小数据量（≤ 10 万行）、离线分发、邮件附件；<br>双击 <code>&lt;报告标题&gt;.html</code> 即可打开，无需任何服务。</td>
+      </tr>
+      <tr>
+        <td>数据服务<span class="tag" style="margin-left:6px">server</span></td>
+        <td>数据在本机 SQLite 数据服务中，浏览器按需取聚合结果。适合大数据量（≤ 500 万行）、在线编辑 / 局域网分享 / 持续更新数据；<br>双击 <code>打开报告.command</code>（macOS）/ <code>打开报告.cmd</code>（Windows）启动器，或访问报告 URL。</td>
+      </tr>
+      <tr>
+        <td>混合<span class="tag" style="margin-left:6px">mixed</span></td>
+        <td>小表内嵌、大表上服务，按表自动分流。适合多数据源报告中只有部分大表；<br>打开方式同 server。</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><span class="cap">注意</span><p>server / mixed 模式下，报告文件夹里的 <code>&lt;报告标题&gt;.html</code> 是一张<b>指引入口页</b>（载有访问地址、编辑口令、管理页链接），<b>不是报告本体</b>，请勿把它当报告文件单独发送——收到的人打开会看到图表「加载不出来」。正确的交付物是报告 URL + 启动器 + 管理页地址。</p></div>
+
+  <h3 id="c1-4"><span class="no">1.3</span>数据量上限</h3>
+  <table class="cfg">
+    <thead><tr><th>形态</th><th>行数上限</th><th>其他约束</th></tr></thead>
+    <tbody>
+      <tr><td>单文件</td><td>≤ 100,000 行</td><td>内嵌 JSON ≤ 50 MB；维度取值基数 ≤ 2,000（订单号等实体键列不计入）</td></tr>
+      <tr><td>数据服务</td><td>≤ 5,000,000 行</td><td>≤ 200 列；超出时建议先拆分或预聚合</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c1-5"><span class="no">1.4</span>四种创作入口</h3>
+  <p>不必懂任何「请求词汇」，四种入口殊途同归，最终都汇成同一份构建请求：</p>
+  <table class="cfg">
+    <thead><tr><th>入口</th><th>怎么用</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td>说（缺省）</td><td>一句话直接构建：「把这份销售明细做成报告，重点看区域构成」</td><td>快速看数</td></tr>
+      <tr><td>选（诉求单）</td><td>按固定槽位填一张结构化诉求单（分析主题 / 关注维度 / 指标口径 / 交付方式），可由 AI 代填后确认</td><td>想要结构化表达诉求</td></tr>
+      <tr><td>画（草图）</td><td>发来手绘版式、截图或参考报告图片，AI 转译为版面请求，<b>先出草案确认再构建</b></td><td>心里已有理想版式</td></tr>
+      <tr><td>拼版画板</td><td>从空白画布开始：拖占位块自由摆位，逐块写一句话说明要什么图，拼完交给 AI 一键生成正式报告</td><td>想自己掌控版面</td></tr>
+    </tbody>
+  </table>
+  <div class="callout tip"><span class="cap">提示</span><p>拼版画板有三个入口：本机还没有任何报告时直接对 AI 说「拼版 / 开画板」；已有服务在跑时从<b>报告管理页</b>点「＋ 新建拼版草稿」；也可以在任何报告的编辑态顶栏点「＋ 新建拼版草稿」（以当前数据集为底开新草稿）。</p></div>
+</section>
+
+<!-- ============ 2 快速上手 ============ -->
+<section class="chap" id="c2">
+  <h2><span class="no">2</span>快速上手</h2>
+  <h3 id="c2-1"><span class="no">2.1</span>从一张表到一份报告</h3>
+  <ol class="steps">
+    <li><b>准备数据</b>：一张首行为表头、一行一条记录的二维表（Excel / CSV / JSON）。构建时会自动体检常见数据问题（合并表头、内嵌合计行、千分位文本等）并在报告中如实说明，不会擅自改数。</li>
+    <li><b>描述诉求</b>：把数据交给 AI，用一句话说明分析主题（如「按月看销售与库存走势，关注区域构成」）；也可以用诉求单或草图表达。</li>
+    <li><b>构建与验收</b>：AI 生成构建请求并运行构建。构建成功的报告会经过真实浏览器审计，确保每张图表都真实绘制。</li>
+    <li><b>打开报告</b>：单文件双击打开；server 模式双击 <code>打开报告</code> 启动器或访问报告 URL。</li>
+    <li><b>继续打磨</b>：既可以在对话里继续提修改（AI 重新构建），也可以直接进入报告的编辑模式动手调整（见第 4 章）。</li>
+  </ol>
+  <p>构建完成后，报告文件夹的结构如下：</p>
+  <pre><code>华为终端 PSI 月度经营报告/
+├── 华为终端 PSI 月度经营报告.html   ← singlefile：双击离线打开；server/mixed：指引入口页
+├── 打开报告.command                  ← server/mixed：双击即启动本地服务并打开浏览器（macOS）
+├── 打开报告.cmd                      ← 同上（Windows）
+└── build/                            ← 构建产物（数据画像、请求、决策清单等）</code></pre>
+
+  <h3 id="c2-2"><span class="no">2.2</span>打开报告：阅读态总览</h3>
+  <p>报告自上而下依次是：<b>封面 → 筛选条 → KPI 指标卡 → 章节图表 → 关键洞察</b>。多章节的报告顶部会出现页签（如下图的「首页 / 大盘趋势 / 结构与下钻 / 区域明细」），封面右上角常驻「数据截至」徽章，标明数据的时间边界。</p>
+  <figure>
+    <img src="images/01-report-cover.png" alt="报告阅读态总览：页签、封面、筛选条、KPI 与关键洞察">
+    <figcaption>图 2-1 报告阅读态：页签导航、封面（含记录数与数据截至）、全局筛选条、KPI 指标卡与关键洞察</figcaption>
+  </figure>
+  <div class="callout note"><span class="cap">说明</span><p>封面右下角与汇报页脚出现的「数据截至」日期，取自数据时间列的最大期，由构建自动生成；数据更新后会随之刷新。</p></div>
+
+  <h3 id="c2-3"><span class="no">2.3</span>输入模板一：页面描述法（你说了算的版面）</h3>
+  <p>适合「脑子里已经有版面」的情况：从上到下逐块说清每一块放什么。下面给出两种载体——<b>直接打字描述</b>，或者在<b>拼版画板</b>上亲手拖出来；两份模板都可以整段复制，把 <code>&lt;……&gt;</code> 换成自己的内容即可。</p>
+  <table class="cfg">
+    <thead><tr><th>你的情况</th><th>用哪个</th></tr></thead>
+    <tbody>
+      <tr><td>版面意图明确，打字能说清</td><td>纯文字版（下文 A）——一次对话直接出稿</td></tr>
+      <tr><td>想亲手拖块摆位、边拖边想</td><td>拼版画板版（下文 B）——先摆骨架，逐块转正</td></tr>
+      <tr><td>只知道业务问题，不知道怎么摆</td><td>改用 2.5 的场景描述法，让 AI 推荐版面</td></tr>
+    </tbody>
+  </table>
+
+  <h4>A · 纯文字版：逐块描述页面</h4>
+  <p>把下面这段整段发给 AI（替换尖括号内容）：</p>
+  <pre><code>把 &lt;数据文件路径&gt; 做成一份报告。
+
+页面从上到下这样排：
+1. 最上面放标题：「&lt;标题名&gt;」，副标题「&lt;一句话说明 / 数据截至&gt;」。
+2. 标题下面放 &lt;N&gt; 个指标卡：&lt;指标1&gt;、&lt;指标2&gt;、&lt;指标3&gt;、&lt;指标4&gt;。
+3. 第一块是「&lt;块名&gt;」：一张&lt;销售随时间变化&gt;的&lt;折线图&gt;（维度 &lt;时间列&gt;，指标 &lt;数值列&gt;，按&lt;月&gt;汇总）。
+4. 第二块是「&lt;块名&gt;」：……（每块一句话：什么图 + 哪个维度 + 哪个指标 + 时间范围 / TOP-N / 排序；
+   两块想左右并排，就在句尾写「和第 X 块并排」）
+5. 最后放一张&lt;明细 / 聚合&gt;表：……
+
+全局要求：
+- 筛选器：&lt;列1&gt;、&lt;列2&gt;
+- 交付：&lt;单文件 / 本机服务端&gt;，标题「&lt;报告标题&gt;」
+- 不要出现：&lt;……&gt;（如 散点图 / 明细表 / 封面）</code></pre>
+  <p>填好的示例：</p>
+  <pre><code>把 data/销售明细_2026.xlsx 做成一份报告。
+
+页面从上到下这样排：
+1. 最上面放标题：「2026 年销售经营月报」，副标题写「数据截至 2026-09」。
+2. 标题下面放 4 个指标卡：总销售额、订单数、客单价、达成率（达成率 = 销售额 ÷ 目标额）。
+3. 第一块是「销售趋势」：一张销售额随月份变化的折线图，按月汇总。
+4. 第二块是「区域排名」：一张各区域销售额对比的柱状图，只看 TOP 10，和第三块并排。
+5. 第三块是「品类结构」：一张品类销售额占比的环形图。
+6. 最后放一张聚合表：区域 × 品类的销售额交叉表，带合计行和数据条。
+
+全局要求：
+- 筛选器：区域、品类
+- 交付：本机服务端打开，标题「2026 年销售经营月报」
+- 不要出现：散点图</code></pre>
+  <div class="callout tip"><span class="cap">背后发生什么</span><p>逐块描述会被转成 12 列网格的<b>显式坐标</b>（整行 = 12 列、并排 = 6+6 或 8+4），钉过的版面之后<b>永不被自动重排</b>；「不要出现 + 版面取舍成体系」时走自由模式（声明即全部，不自动垫内容）。构建后先给草案，对着报告说「第 3 块换成堆叠柱」即可增量重出，不必整段重来。</p></div>
+
+  <h4>B · 拼版画板版：先摆骨架，逐块转正</h4>
+  <ol class="steps">
+    <li><b>开画板</b>：对 AI 说「<code>开一个拼版画板，数据用 &lt;数据文件&gt;</code>」；服务已在跑时也可以从<b>报告管理页</b>点「＋ 新建拼版草稿」，或在任何报告编辑态顶栏点「＋ 新建拼版草稿」（以当前数据集为底）。</li>
+    <li><b>拖占位块</b>：把 图表 / 指标卡 / 文本 / 表格 占位块拖到画布上，自由摆位、拉大小——这一步完全用手，不写一个字。</li>
+    <li><b>逐块交代（三选一，可混用）</b>：① 在块的面板里直接绑字段；② 写一句话，如「<code>销售随月份的折线</code>」「<code>各区域 TOP10 柱状</code>」；③ 留白——这块交给 AI 定。</li>
+    <li><b>交给 AI 转正</b>：对 AI 说：</li>
+  </ol>
+  <pre><code>画板拼好了，按每个占位块里写的一句话生成正式图表，转成正式报告。
+（也可以点名：「第 2、4 块留白的你看着定」）</code></pre>
+  <div class="callout tip"><span class="cap">提示</span><p>转正在<b>原地址</b>完成：占位块原地变成真实图表，报告 ID、链接都不变。草稿随服务持久化，拼到一半关掉下次继续；转正后的报告与普通报告无异（可编辑 / 分享 / 导出）。</p></div>
+
+  <h3 id="c2-4"><span class="no">2.4</span>输入模板二：场景描述法（说数据 + 说问题）</h3>
+  <p>适合「不知道版面、只知道要回答什么」的情况：列出数据是什么、问题有哪些，图表选型、版面编排全部交给 AI 按数据画像推荐。这条模板与产品内置的<b>诉求单</b>同构（对 AI 说「给我诉求单」可获得完整槽位并由 AI 代填）。</p>
+  <pre><code>【我的数据】
+- 数据文件：&lt;路径&gt;（多张表请都列出，并说明靠哪两列互相关联）
+- 一行 = 什么：&lt;表粒度一句话，如「一行 = 一个门店一个月的销售记录」&gt;
+
+【我要回答的问题】（1–5 条，每条一行）
+1. &lt;整体问题&gt;？（可注明期望的图：折线 / 柱状 / …；不注 = 让 AI 推荐）
+2. &lt;分组问题&gt;？（如 各区域销量 TOP 5 的产品是哪些）
+3. ……
+
+【可选 · 口径与偏好】（全部可空，空着 = 按数据自动推荐，每个自动决策都记录在
+ build/decisions.md、可回滚）
+- 口径：&lt;比率 = 分子 ÷ 分母 与单位&gt;；对比方式：环比 / 同比 / 目标 / 无
+- 对账锚点：&lt;1–3 个合计真值，如 全年销售额合计 = ___&gt;
+- 交付：&lt;单文件 / 本机服务端&gt;；标题「&lt;报告标题&gt;」；主题色 / 页签偏好
+- 不要出现：&lt;……&gt;</code></pre>
+  <p>填好的示例：</p>
+  <pre><code>【我的数据】
+- 数据文件：data/PSI_月度.csv
+- 一行 = 什么：一个区域 × 一个品类 × 一个月的 PSI 记录，数值列有 Sell In、Sell Out、Inventory
+
+【我要回答的问题】
+1. 销售（Sell In）整体是什么趋势？→ 折线，按月
+2. 各区域下销量 TOP 5 的产品是哪些？→ 每个区域内取 TOP 5
+3. 库存结构健康吗？→ 库存量与月均 Sell Out 的对比，最好有比率
+4. 哪些区域本月环比下滑最明显？
+
+【可选】
+- 口径：净流入 = Sell In − Sell Out；对比方式：核心指标带环比
+- 对账锚点：全年 Sell In 合计 = 127,994
+- 交付：本机服务端，标题「PSI 月度经营报告」，页签按「总览 / 趋势 / 结构」分组
+- 不要出现：散点图</code></pre>
+  <div class="callout note"><span class="cap">背后发生什么</span><p>每条问句变成一张卡：<b>维度 × 指标 × 时间窗 → 图</b>——问句动词决定图型（趋势 → 折线、排名 → 条形、构成 → 饼 / 环、转化 → 漏斗、关联 → 散点），版面由布局求解器自动编排。对账锚点在构建后自动抽查勾稽，实测值与锚点的比对结果记入决策清单，交付时可指给业务方。</p></div>
+</section>
+
+<!-- ============ 3 阅读报告 ============ -->
+<section class="chap" id="c3">
+
+  <h3 id="c2-5"><span class="no">2.5</span>口径对账锚点</h3>
+  <p>如果你手里已经有<b>必须对上的合计真值</b>（比如「全年销售额合计 = 7,300」「订单总数 = 1,280」来自 ERP 或上级报表），在提需求时直接告诉 AI，它会把这些数字写成构建请求里的 <code>anchors</code> 对账锚点。构建时脚本会在<b>物化完计算列之后的真实数据</b>上重算同一个口径，并与你声明的值逐条比对：</p>
+  <ul>
+    <li><b>对上了</b>：构建日志逐条打印 <code>[anchor] 全年销售额合计: 销售额 sum = 7,300 ✓</code>，正常交付。</li>
+    <li><b>对不上</b>：构建直接失败，报错给出<b>实算 / 声明两个数和差值</b>——数据文件与口径说法打架时，让构建停下来，绝不交付一份对不上的报告。锚点声明的容差缺省是相对 1e-6（金额精确勾稽），也可以放宽（如 <code>tolerance: 0.5</code>）。</li>
+  </ul>
+  <div class="callout tip"><span class="cap">什么时候用</span><p>月度例行报告换数据重建时，把上期已核实的合计值留作锚点，相当于给每次重建上一道免费的<b>勾稽保险</b>：数据文件悄悄换错、口径悄悄漂移，构建当场就拦下，而不是等读者发现问题。锚点也支持引用计算列（如「净销售额合计」），最多 8 条，覆盖 count / sum / average / min / max 五种口径。</p></div>
+
+  <h3 id="c2-6"><span class="no">2.6</span>全流程实例：一张表到一份报告</h3>
+  <p>以一张 6 行的<b>连锁门店月度销售表</b>为例，完整走一遍从原始数据到交付的全过程。你只需要做第 1 步和最后确认，中间每一步都是技能（Agent）自动完成的——列在这里是为了让你知道<b>每一层闸门在哪里</b>、出问题时去哪里看。</p>
+  <h4>第 0 步 · 原始数据</h4>
+  <p><code>门店销售月表.csv</code>——首行表头、一行一条记录的标准二维表：</p>
+  <table class="cfg">
+    <thead><tr><th>月份</th><th>区域</th><th>门店</th><th>渠道</th><th>销售额</th><th>订单数</th></tr></thead>
+    <tbody>
+      <tr><td>2026-01</td><td>华东</td><td>门店A</td><td>线上</td><td>1,200</td><td>210</td></tr>
+      <tr><td>2026-01</td><td>华北</td><td>门店B</td><td>线下</td><td>900</td><td>180</td></tr>
+      <tr><td>2026-02</td><td>华东</td><td>门店A</td><td>线上</td><td>1,500</td><td>260</td></tr>
+      <tr><td>2026-02</td><td>华北</td><td>门店B</td><td>线下</td><td>1,100</td><td>200</td></tr>
+      <tr><td>2026-03</td><td>华东</td><td>门店A</td><td>线上</td><td>1,350</td><td>240</td></tr>
+      <tr><td>2026-03</td><td>华北</td><td>门店B</td><td>线下</td><td>1,250</td><td>190</td></tr>
+    </tbody>
+  </table>
+  <h4>第 1 步 · 你给 AI 的话</h4>
+  <p>把文件放进对话（或给出文件路径），用一两句话说清主题与关注点：</p>
+  <pre><code>这是 Q1 门店销售月表。帮我做一份经营报告：
+按月看销售额趋势和区域构成，门店做 TOP 对比；
+客单价（销售额/订单数）要单独看，注意它是均价不要加总；
+另外全年销售额合计应该是 7300、订单总数 1280，帮我核对。</code></pre>
+  <h4>第 2 步 · 数据体检与画像（自动）</h4>
+  <p>脚本先读表做<b>体检</b>（合并表头、内嵌合计行、千分位文本、缺失值……只报告不擅改）和<b>画像</b>：每列推断存储类型（时间 / 维度 / 指标），指标列再给<b>语义提示</b>（这一步认出「销售额」是金额类、「订单数」是计数类）。日志大致是：</p>
+  <pre><code>[input-lint] 门店销售月表.csv: 6 列 × 6 行 — FAIL 0 / WARN 0</code></pre>
+  <h4>第 3 步 · 生成构建请求（自动）</h4>
+  <p>AI 把你的话翻成一份结构化请求（<code>report_request.json</code>）——本例的关键片段（词汇对照见附录 D 与 <code>references/authoring-feature-map.md</code>）：</p>
+  <pre><code>{
+  "title": "连锁门店 Q1 经营报告",
+  "columnRoles": { "月份": "time", "区域": "dimension", "门店": "dimension",
+                   "渠道": "dimension", "销售额": "measure", "订单数": "measure" },
+  "measureTypes": {
+    "销售额": {"type": "currency"},
+    "订单数": {"type": "count"}
+  },
+  "datasets": [{
+    "id": "sales", "file": "门店销售月表.csv",
+    "derived": {
+      "columns": [
+        { "name": "客单价", "op": "div", "left": "销售额", "right": "订单数" }
+      ],
+      "measures": [
+        { "name": "销售额环比", "kind": "window", "input": {"agg": "sum", "col": "销售额"},
+          "fn": "prev", "grain": "month", "offset": 1, "timeField": "月份", "output": "rate" }
+      ]
+    }
+  }],
+  "anchors": [
+    { "label": "全年销售额合计", "measure": "销售额", "aggregation": "sum", "value": 7300 },
+    { "label": "订单总数", "measure": "订单数", "aggregation": "sum", "value": 1280 }
+  ],
+  "charts": [
+    { "presetId": "line.trend",   "title": "销售额月度趋势", "encoding": {"dimension": "月份", "measures": ["销售额"]} },
+    { "presetId": "bar.stacked",  "title": "区域构成",       "encoding": {"dimension": "月份", "measures": ["销售额"], "breakdown": "区域", "stackMode": "normalize"} },
+    { "presetId": "bar.rank",     "title": "门店对比",       "encoding": {"dimension": "门店", "measures": ["销售额", "客单价"]} },
+    { "presetId": "table.aggregate", "title": "区域月度明细", "encoding": {"dimension": "月份", "measures": ["销售额", "订单数"], "breakdown": "区域"} }
+  ]
+}</code></pre>
+  <p>三个点值得注意：<b>客单价</b>是计算列（销售额 ÷ 订单数），价族名字让它自动拿到「价格」语义——<b>不可加总、缺省按平均聚合</b>；<b>销售额环比</b>是窗口派生指标，引用它的图表时间维度必须一致；<b>anchors</b> 就是你说的那两个合计真值。</p>
+  <h4>第 4 步 · 编译与审计（自动）</h4>
+  <p>编译器把请求编译成报告：校验词汇与形状 → 物化计算列 → 解析指标语义与缺省聚合（价格列不用你声明，自动按「平均」）→ 布局求解（12 列网格排卡片）→ 生成静态图表与交互脚本 → <b>对账锚点逐条勾稽</b> → 真实浏览器审计（每张卡真实绘制、数据真值与聚合一致）。日志大致是：</p>
+  <pre><code>[anchor] 全年销售额合计: 销售额 sum = 7,300 ✓
+[anchor] 订单总数: 订单数 sum = 1,280 ✓
+=== DONE (singlefile, ready): 连锁门店 Q1 经营报告/连锁门店 Q1 经营报告.html ===</code></pre>
+  <div class="callout note"><span class="cap">闸门长什么样</span><p>如果 AI 误把「客单价」声明成按求和聚合，构建会当场失败并给出可行动的报错（价格类指标求和无业务意义，建议 average）——<b>宁失败不出错图</b>。锚点对不上同理（见 2.5）。</p></div>
+  <h4>第 5 步 · 交付物</h4>
+  <p>构建产出一个报告文件夹（结构见 2.1）。数据量 ≤ 10 万行默认出<b>单文件</b>：一个 HTML 双击离线打开，编辑器、汇总、导出全部内嵌；数据更大或要多表关联时出 <b>server</b> 模式（双击「打开报告」启动本地服务）。文件夹拷给别人也能用，无需安装任何东西。</p>
+  <h4>第 6 步 · 阅读与核对</h4>
+  <p>打开报告，从上到下核对：KPI 指标卡（合计 / 均值口径与你说的一致）→ 趋势与构成图（占比堆叠每根柱 100%）→ 门店对比（客单价按平均显示）→ 明细表。三个自动行为值得知道：金额带 ¥ 与万元口径、环比在第二个月才有值（首期无前期显示空缺而不是 0）、锚点勾稽已在构建期替你做过一遍。</p>
+  <h4>第 7 步 · 迭代</h4>
+  <p>两种方式随便混用：<b>回对话继续说</b>（「环比再加一条订单数线」「门店只看华东」→ AI 增量重建，布局与已确认的版面保持稳定）；或<b>进编辑模式自己动手</b>（第 4 章）：拖字段、换图型、调聚合——但语义闸在编辑器里同样生效，价格 / 占比类指标的聚合下拉里根本没有「求和」选项，想错都错不了。</p>
+
+  <h2><span class="no">3</span>阅读报告（读者视角）</h2>
+
+  <h3 id="c3-2"><span class="no">3.1</span>筛选器</h3>
+  <p>报告顶部的筛选条是<b>交互式控件</b>而非静态说明：改变任一筛选条件，全部图表、KPI、表格会立即重新聚合。控件形态按字段角色自动匹配：</p>
+  <table class="cfg">
+    <thead><tr><th>字段角色</th><th>控件形态</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>维度</td><td>值域下拉，可勾选「多选」</td><td>高基数列只列出声明过的候选值</td></tr>
+      <tr><td>时间</td><td>日期范围（起 – 止）</td><td>任一端留空为开口区间；<code>2026/9/5</code>、<code>20260905</code>、<code>2026年9月5日</code> 等写法都能正确比较</td></tr>
+      <tr><td>数值指标</td><td>min – max 区间</td><td>如「只看销售额 ≥ 100 万」</td></tr>
+    </tbody>
+  </table>
+  <figure>
+    <img src="images/02-report-filters.png" alt="全局筛选条" class="plain">
+    <figcaption>图 3-1 全局筛选条：多个维度筛选并列，右上角可一键恢复全选</figcaption>
+  </figure>
+  <p>筛选器以「卡片」形式存在，每张卡片有<b>作用范围</b>：</p>
+  <ul>
+    <li><span class="tag acc">全局</span> 作用于全报告所有卡片；</li>
+    <li><span class="tag acc">页签</span> 只作用于所在页签的内容（多页签报告里每个页签可以有相对独立的筛选）。</li>
+  </ul>
+  <p>若在数据源配置中建立了<b>维度层级</b>（如 区域 ▸ 办事处 ▸ 国家），筛选器会自动按层级级联：子级选项随上级选中值收窄，失效选择自动清理。</p>
+
+  <h4>数据卡上的筛选条（筛选 ▾）</h4>
+  <p>除报告级筛选卡外，每张数据卡的卡头还有一个「<b>筛选 ▾</b>」按钮，展开<b>常驻筛选条</b>——它是一组固定在卡片上的值域勾选列表：</p>
+  <ul>
+    <li><b>作者</b>（编辑态）负责勾选哪些维度值得常驻（如给区域表卡挂上「品类」）；</li>
+    <li><b>读者</b>（阅读态）点开任一维度就是一枚<b>值域按钮</b>：搜索、全选 / 清空、勾选即重聚合（<code>2026-06</code> <code>2026-07</code> 这样的多选一并生效）；单选显示所选值，多选显示「已选 N 项」；</li>
+    <li>常驻条只影响<b>本卡</b>，与报告级筛选卡叠加计算；</li>
+    <li><b>值域联动</b>：如果作者对这张卡配置过数据范围限制（见 4.3），常驻条的选项会随限制收窄——读者永远选不出注定为空的值。</li>
+  </ul>
+  <div class="callout note"><span class="cap">说明</span><p>筛选在此收敛为两层：<b>读者筛选</b>（报告级筛选卡 + 卡头常驻条，读者可改）与<b>作者配置</b>（编辑态列头漏斗 / 维度范围，对整卡固化、读者不可见）。早年在表格工具条上的筛选按钮已并入这两层。</p></div>
+
+  <h3 id="c3-3"><span class="no">3.2</span>KPI 指标卡</h3>
+  <p>KPI 是数据绑定的一等公民：它的数值由聚合引擎实时计算，跟随筛选联动，永远不会与图表矛盾。KPI 卡可开启<b>对比</b>（引用一个「窗口派生指标」，如月环比），数值下方出现同比/环比副行，涨跌着色。</p>
+  <figure>
+    <img src="images/03-kpi-cards.png" alt="KPI 指标卡条" class="plain">
+    <figcaption>图 3-2 KPI 指标卡：总 Sell In / 总 Sell Out / 总 Inventory / 记录数（行数是一等指标）</figcaption>
+  </figure>
+
+  <h3 id="c3-4"><span class="no">3.3</span>图表交互</h3>
+  <h4>TOP-N 即时切换</h4>
+  <p>排名类柱状图支持在 5 / 10 / 20 / 50 / 全部 之间即时切换，重算在毫秒级完成。被截断时卡片右下角会如实标注口径：</p>
+  <figure>
+    <img src="images/05-chart-office-top12.png" alt="办事处 Sell In 对比 TOP12 柱线组合图">
+    <figcaption>图 3-3 柱线组合图（柱 = Sell In，线 = Sell In 占比），右下角标注「已按首指标显示前 12 项（共 22 项）」</figcaption>
+  </figure>
+  <h4>趋势与多序列</h4>
+  <p>时间维度自动按日历序排列、按日 / 周 / 月 / 年正确分桶。多指标趋势图支持下「柱 + 线」混排；派生序列（如 净流入 = Sell In − Sell Out）与基础序列同轴呈现：</p>
+  <figure>
+    <img src="images/04-chart-trend.png" alt="月度 Sell In / Sell Out / Inventory / 净流入 趋势图">
+    <figcaption>图 3-4 月度趋势：Sell In / Sell Out / Inventory / 净流入（净流入为派生列）</figcaption>
+  </figure>
+  <h4>时间层级下钻</h4>
+  <p>点击时间轴上的一根柱子 / 一个点 = 只看该桶并自动换更细一级（年 → 季 → 月 → 日），卡片顶部出现 <code>全部 › 2025 › 返回上级</code> 面包屑。粒度不会比源数据更细——月精度的数据不会提供「日」这一级，绝不给会算错的入口。</p>
+  <h4>表格行跳转明细</h4>
+  <p>勾选了明细视图的聚合表格，鼠标悬停任意一行会出现「点击行看明细」提示，点击即跳转到预置了对应筛选条件的明细数据，并可一键返回聚合视图。</p>
+</section>
+
+<!-- ============ 4 编辑报告 ============ -->
+<section class="chap" id="c4">
+  <h2><span class="no">4</span>编辑报告（作者视角）</h2>
+
+  <h3 id="c4-1"><span class="no">4.1</span>进入编辑模式</h3>
+  <p>点击顶栏右侧「编辑模式」进入编辑态。顶栏随即多出一组编辑工具：<b>数据源配置、页面宽度、报告主题、插入卡片</b>；每张卡片悬停时出现操作条（拖拽手柄、编辑、筛选、删除等）。所有改动即时生效，但<b>需要「保存并覆盖」之后读者才能看到</b>——阅读态顶栏常驻这句话提醒。</p>
+  <figure>
+    <img src="images/08-edit-toolbar.png" alt="编辑模式顶栏与编辑工具">
+    <figcaption>图 4-1 编辑模式：顶栏出现「数据源配置 / 宽度 / 主题 / 插入卡片」，筛选条进入可编辑状态（作用范围、存为默认、添加筛选）</figcaption>
+  </figure>
+  <p>「插入卡片」菜单提供四种卡片：<span class="tag acc">图表</span> <span class="tag acc">文本</span> <span class="tag acc">表格</span> <span class="tag acc">筛选器</span>。新插入的图表卡默认半宽（12 栅格中的 6 列、高 6 行），插入后立即打开设置面板开始配置。</p>
+
+  <h3 id="c4-2"><span class="no">4.2</span>图表设置面板</h3>
+  <p>点击任意图表卡卡头的「编辑」按钮，右侧打开<b>图表设置</b>面板。面板自上而下分三段：<b>图表类型 → 数据设置 → 显示设置</b>。</p>
+  <figure>
+    <img src="images/10-panel-chart.png" alt="图表设置面板：图表类型网格与数据设置">
+    <figcaption>图 4-2 图表设置面板：上为九类图表类型网格，下为「已选择 / 未选择」双栏数据设置</figcaption>
+  </figure>
+  <h4>图表类型</h4>
+  <p>九种图表类型 + 指标卡，点击即切换，维度 / 指标的合法性约束会即时提示（不合法的字段拒绝拖入）：</p>
+  <p><span class="tag">柱状/折线图</span> <span class="tag">堆叠柱状图</span> <span class="tag">面积图</span> <span class="tag">饼图</span> <span class="tag">环形图</span> <span class="tag">散点图</span> <span class="tag">漏斗图</span> <span class="tag">表格（明细 / 聚合）</span> <span class="tag acc">指标卡 KPI</span></p>
+  <div class="callout note"><span class="cap">说明</span><p>「柱状/折线图」是一张合并的类型卡：每个指标芯片上有「形态」按钮（柱形 / 线形），全柱形 = 柱状图、全线形 = 折线图、混排 = 柱线组合图。「指标卡 KPI」也在同一张类型网格里——图表卡可以一键转成指标卡，反之亦然。</p></div>
+  <h4>数据设置：已选择 / 未选择 双栏</h4>
+  <ul>
+    <li><b>已选择</b>区按「维度 / 指标」分区（表格卡为「行 / 列 / 值」三区，见第 5 章）；字段芯片可拖拽换区、换顺序，芯片上的 <b>⚙</b> 打开该芯片的全部设置（聚合方式、小数位、Y 轴、单位等），<b>×</b> 移除。</li>
+    <li><b>未选择</b>区是字段库，按 时间 / 维度 / 指标 / 其他 分组；支持搜索、单击加入、拖拽指定落区。id / 忽略类字段只展示不可拖入，需先在「数据源配置」改角色。</li>
+    <li>面板底部实时显示统计：维度 N · 指标 N · 过滤 N。</li>
+  </ul>
+  <h4>显示设置</h4>
+  <p>排序（字段 + 方向，或时间序 / 自定义）、TOP-K 与「合并其余为其他」、目标值进度条、参考线、图例、图表标题（直接点击卡片标题就地改）等。每个指标的小数位与 Y 轴（左 / 右）在指标芯片上单独设置。堆叠柱状图另有<b>「堆叠方式」</b>开关：<b>绝对值堆叠</b>（各段按原始值落叠）/<b>占比堆叠</b>（每根柱归一到 100%，看构成占比；TOP-K 与排序仍按原始值计算）。</p>
+  <div class="callout note"><span class="cap">自动语义</span><p>几类「看了就懂」的渲染是自动的：柱状图上利润 / 环比这类有正有负的指标，<b>负值段自动染对比红色</b>（正负双色，盈亏一眼分清）；「评分」类指标值轴固定 0–100（68 分不会把轴顶撑到 70）；「排名」类值轴自动反转（第 1 名在顶部）。这些跟随字段配置里的<b>语义注解</b>（见 6.2），不需要逐卡设置。</p></div>
+
+  <h3 id="c4-3"><span class="no">4.3</span>卡片操作</h3>
+  <table class="cfg">
+    <thead><tr><th>操作</th><th>方式</th></tr></thead>
+    <tbody>
+      <tr><td>移动卡片</td><td>按住卡片顶部拖拽手柄拖动；或聚焦手柄后用方向键微移（Shift 加速）</td></tr>
+      <tr><td>调整大小</td><td>拖拽卡片边缘 / 右下角；文本卡右下角还有 1px 级精调手柄</td></tr>
+      <tr><td>卡片设置</td><td>卡头「编辑」按钮打开右侧设置面板</td></tr>
+      <tr><td>读者筛选条</td><td>卡头「筛选 ▾」：编辑态勾选让哪些维度常驻卡头；读者在阅读态多选值域、勾选即重聚合（只影响本卡，见 3.1）</td></tr>
+      <tr><td>数据范围限制</td><td>编辑态列头「漏斗」配置对整卡生效的筛选与维度范围（<code>只看华东</code>、<code>近 6 月</code>）——读者不可查看与修改，且会收窄读者筛选条的选项值域</td></tr>
+      <tr><td>手动高度</td><td>拖过高度后卡为「手动高度」，点「适应内容」恢复自动贴合</td></tr>
+      <tr><td>删除 / 撤销</td><td>卡头「删除」；误删后底部出现「已删除 X · 撤销」（一层，Cmd/Ctrl+Z 等价）</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c4-4"><span class="no">4.4</span>文本卡与批注</h3>
+  <p>文本卡全部内联编辑：点击文字直接改，格式条提供 段落级别（H1/H2/H3/正文）、加粗、斜体、删除线、列表、引用、代码、链接。每张文本卡可选五种形态：<b>标题 / 段落 / 批注 / 引用 / 分隔线</b>，以及「卡片样式」（透明 / 白底 / 8 种色板）。章节叙述带支持 Markdown 子集（构建期声明）。</p>
+
+  <h3 id="c4-5"><span class="no">4.5</span>报告主题</h3>
+  <p>顶栏「主题 ▾」一键切换整报告视觉：<b>图表配色、字体、封面渐变、KPI 强调色、表头、筛选胶囊、合计行</b>全部一起换肤。悬停菜单项即整报告实时预览，移开自动回滚。</p>
+  <figure>
+    <img src="images/09-theme-menu.png" alt="主题菜单与色板样票">
+    <figcaption>图 4-3 主题菜单：12 档主题，每项带实时绘制的色板样票</figcaption>
+  </figure>
+  <table class="cfg">
+    <thead><tr><th>主题</th><th>风格</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>默认</td><td>Notion 式中性皮肤，蓝紫主色</td><td>报告缺省</td></tr>
+      <tr><td>The Economist / New York Times / Swiss / Nature / McKinsey / Datawrapper</td><td>六大经典编辑 / 咨询风格</td><td>取自权威图表风格的墨色与色板</td></tr>
+      <tr><td>Power BI / Power BI Light</td><td>商业智能风</td><td>Power BI 为深底档，仅图表换肤、报告壳保持默认</td></tr>
+      <tr><td>Pop / Cartoon</td><td>高饱和活泼风</td><td>同为深底档（Pop）</td></tr>
+      <tr><td>华为</td><td>品牌红主色</td><td>按品牌令牌定制的整报告皮肤</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c4-6"><span class="no">4.6</span>页面宽度</h3>
+  <p>顶栏「宽度 ▾」提供 <b>标准 1280 / 宽 1440 / 更宽 1600 / 全屏 1920</b> 四档，切换后所有卡片、图表、表格立即重排，选择随报告保存。</p>
+
+  <h3 id="c4-7"><span class="no">4.7</span>保存与分享</h3>
+  <p>顶栏「保存与分享」打开分享中心，集中承载保存、分享与导出：</p>
+  <figure>
+    <img src="images/14-share-center.png" alt="保存与分享中心">
+    <figcaption>图 4-4 保存与分享中心：两种保存、两种分享链接、三种导出</figcaption>
+  </figure>
+  <table class="cfg">
+    <thead><tr><th>能力</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>保存为副本</td><td>保留当前版本，另存一份新报告，生成新链接</td></tr>
+      <tr><td>保存并覆盖</td><td>用当前内容覆盖这份报告；打开该链接的人都会看到新版并自动刷新</td></tr>
+      <tr><td>分享（只读）<span class="tag" style="margin-left:6px">推荐</span></td><td>对方只能查看，不能改动；复制当前报告的只读链接</td></tr>
+      <tr><td>分享（可编辑）</td><td>对方可进入编辑界面调整；保存需要编辑口令</td></tr>
+      <tr><td>导出 PPTX · 图片版</td><td>每页一张幻灯片，图表导出为高清图片，文本卡为可编辑文本框</td></tr>
+      <tr><td>导出 PPTX · 原生版</td><td>文本、表格和柱 / 线 / 饼图以可编辑原生元素写入 PPT；不支持原生映射的图表自动降级为图片</td></tr>
+      <tr><td>导出 PDF</td><td>浏览器打印为 16:9 PDF，每页一张幻灯片；发起后会先自动进入汇报模式</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><span class="cap">注意</span><p>分享出去的永远是<b>最近一次保存</b>的版本；未保存的改动不会被分享。server 模式的分享链接依赖本机服务保持运行，关机后对方无法访问。</p></div>
+</section>
+
+<!-- ============ 5 数据表卡与交叉表 ============ -->
+<section class="chap" id="c5">
+  <h2><span class="no">5</span>数据表卡与交叉表</h2>
+  <p>表格卡是本产品能力最深的一类卡片：既是普通的明细查数工具，也是一张专业的<b>交叉表（透视表）</b>。本章按配置面板的顺序展开。</p>
+
+  <h3 id="c5-1"><span class="no">5.1</span>概述与典型用法</h3>
+  <p>表格卡有「<b>明细</b>」与「<b>聚合</b>」两个子视图（类型网格里「表格」的两个选项）。聚合视图即交叉分析的主场：行维度 × 列维度交叉，值区放指标，表头自动两级 / 三级展开，合计与小计按全量口径统计。</p>
+  <figure>
+    <img src="images/06-cross-table-region.png" alt="区域 × 品类 × 月份交叉矩阵">
+    <figcaption>图 5-1 交叉矩阵：行 = 区域 × 品类（合并单元格 + 段尾小计），列 = 月份 × 指标（两级表头），含行总计与总计行，单元格带数据条</figcaption>
+  </figure>
+
+  <h3 id="c5-2"><span class="no">5.2</span>数据配置：行 / 列 / 值 三区</h3>
+  <p>表格视图（及热力 / 堆叠等交叉视图）的设置面板采用「行 / 列 / 值」三区布局，字段库在右，拖拽或单击即可配置：</p>
+  <figure>
+    <img src="images/11-panel-table.png" alt="表格卡设置面板：行/列/值三区">
+    <figcaption>图 5-2 表格卡设置面板：行区 2 维、列区 1 维（带「交叉列」徽标）、值区 2 指标；字段库中可见「指标名称」虚拟维度与带 ƒ 徽标的派生指标</figcaption>
+  </figure>
+  <table class="cfg">
+    <thead><tr><th>区域</th><th>容量</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>行</td><td>最多 3 维 ＋ 指标名称</td><td>第 1 维为大组，后续维度嵌套在内；「指标名称」是常驻字段库的虚拟维度（见 5.10）</td></tr>
+      <tr><td>列</td><td>0–3 维 ＋ 指标名称<br><small>合计最多 4 层；指标名称可挂任意位置</small></td><td>拖入即透视——列区落列后自动变为交叉矩阵，无需手动选布局；「指标名称」挂载位即表头层级位（见 5.10）</td></tr>
+      <tr><td>值</td><td>最多 100 个指标</td><td>每个指标可单独设置聚合方式、小数位、格式、数据条目标值</td></tr>
+      <tr><td>过滤器</td><td>多条同时生效（AND）</td><td>卡级数据范围限制；时间字段支持「近 6 月 / 近 4 周」等相对范围</td></tr>
+    </tbody>
+  </table>
+  <p>行 / 列 / 值的组合决定了表格形态，路由规则如下：</p>
+  <table class="cfg">
+    <thead><tr><th>行维数</th><th>列维数</th><th>渲染形态</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>0</td><td>平铺分组表（每行一条维度取值 + 指标列）</td></tr>
+      <tr><td>2–3</td><td>0</td><td>嵌套平铺：第 1 维合并组头，段尾可加小计（图 5-5）</td></tr>
+      <tr><td>1</td><td>1</td><td>交叉矩阵：行 × 列两级表头</td></tr>
+      <tr><td>2–3</td><td>1–3</td><td>多层交叉矩阵：行嵌套 × 列嵌套，表头最多三级（图 5-4）；加上「指标名称」作为一层最多四层，指标名出现在它挂载的那一层</td></tr>
+      <tr><td>&gt;3 或下钻超限</td><td>任意</td><td>自动泄压为 ND 长表（每行一条完整维度路径），保证永不丢数</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c5-3"><span class="no">5.3</span>表头与合并（中国式表格）</h3>
+  <ul>
+    <li><b>合并同类单元格</b>：默认开启。对当前行集「相邻同值」合并（rowspan），排序 / 筛选 / 翻页后随新行集重算，永远一致。</li>
+    <li><b>两级 / 三级表头</b>：列区多列维或「列 × 指标」组合时自动生成嵌套段组表头；单指标也可选择「表头显示指标名」。</li>
+    <li><b>指标名称作表头层</b>：把「指标名称」拖入列区后，指标名成为表头的一个真实层级（帆软式转置，见 5.10）。</li>
+    <li><b>表头竖线均可拖</b>：任意表头竖线（含段组格右缘）都是列宽手柄，拖哪条调哪一列。</li>
+  </ul>
+
+  <h3 id="c5-4"><span class="no">5.4</span>合计与小计</h3>
+  <table class="cfg">
+    <thead><tr><th>能力</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>合计行</td><td>显示 / 隐藏可切换，位置可选顶部或底部；按<b>全量过滤后的原始行</b>重算，而非页面可见值二次聚合——翻页 / 截断不改变口径</td></tr>
+      <tr><td>合计口径</td><td>每列可指定 求和 / 平均 / 最大 / 最小 / 去重计数 等（如「合计应为平均」）</td></tr>
+      <tr><td>行总计列</td><td>行尾横向加总列，开关可配</td></tr>
+      <tr><td>段尾小计</td><td>嵌套 / 多层矩阵中按第 1 维分组输出小计行，小计标签可自定义</td></tr>
+      <tr><td>派生指标口径</td><td>比率类派生指标（占比 / 环比）在合计行显示「—」——比率不可加，宁可空缺也不给错数</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c5-5"><span class="no">5.5</span>排序与取数</h3>
+  <ul>
+    <li><b>表头点击排序</b>：任意表头升 / 降序，多级排序可在面板配置。</li>
+    <li><b>矩阵列序管道</b>：列维顺序 = 自定义排序列表 ＞ 时间日历序 ＞ 行序首现，行序与列序解耦。</li>
+    <li><b>组内 TopN</b>：按第 1 维分组取组内前 N（如「每个区域只看 Sell In 前 5 的品类」），名次按首指标降序，合计口径与显示行集一致。</li>
+    <li><b>显示截断</b>：表格可只显示前 N 行；截断是显示层行为，合计仍按全量统计。</li>
+    <li><b>维度取值范围</b>：每个维度芯片可配「范围」——时间维度支持近 N 期（周 / 月 / 季 / 年）或起止期（锚点默认数据最大期）；类目维度支持值域多选。</li>
+    <li><b>分页</b>：嵌套 / 矩阵表按第 1 维<b>组</b>为单位分页，组永不跨页（不会出现组合被拦腰截断、合并格错位）；每页条数可调。</li>
+  </ul>
+
+  <h3 id="c5-6"><span class="no">5.6</span>单元格样式</h3>
+  <table class="cfg">
+    <thead><tr><th>能力</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>数据条</td><td>默认开启：相对列最大值的内嵌条形，一眼比大小（图 5-1 / 5-3 可见）</td></tr>
+      <tr><td>目标进度条</td><td>为指标声明目标值后，数据条变为「实际 vs 目标」进度语义</td></tr>
+      <tr><td>条件格式</td><td>阈值规则高亮：达标标红 / 异常高亮等，规则即时生效</td></tr>
+      <tr><td>占比列</td><td>一键为指标追加占比列（走「占总计」派生指标口径，筛选后分母正确重算）</td></tr>
+      <tr><td>副指标 / 迷你图</td><td>指标旁可挂同比 / 环比副列；行尾可加趋势迷你图（点名开启）</td></tr>
+      <tr><td>空值展示</td><td>空值统一显示「—」，可为空值配置专属别名</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="c5-7"><span class="no">5.7</span>列宽</h3>
+  <p>表格设置中「列宽」提供两种模式：</p>
+  <ul>
+    <li><b>自适应内容</b>（默认）：按表头与当前页内容计算最小列宽，表更宽时撑满卡片、更窄时出横向滚动条，并出现「可横向滚动」提示；</li>
+    <li><b>等分填充</b>：列宽均分并拉伸撑满。</li>
+  </ul>
+  <p>拖拽任意表头竖线即进入<b>自定义</b>：被拖列精确到像素、其余列不跟随变形；双击列缘恢复按内容自适应。自定义几何在两种模式下都优先生效。矩阵表头支持<b>冻结首列</b>（序号 / 维度列 sticky）。</p>
+
+  <h3 id="c5-8"><span class="no">5.8</span>明细视图</h3>
+  <p>明细视图是一张可搜索的原始数据表：关键字搜索（不分大小写）、表头排序、分页、字段显隐自选（「字段」按钮）、以及导出 Excel（带合并与列宽）。聚合视图勾选「点击行看明细」后，聚合行可一键跳入预筛选的明细：</p>
+  <figure>
+    <img src="images/07-aggregate-table.png" alt="国家/地区聚合明细表">
+    <figcaption>图 5-3 聚合表：按首指标降序、数据条、占比列、合计行（占比列合计显示「—」，比率不可加）、底部横滚提示</figcaption>
+  </figure>
+
+  <h3 id="c5-9"><span class="no">5.9</span>层级下钻</h3>
+  <p>在数据源配置中把维度字段拖成父子层级（如 区域 ▸ 办事处 ▸ 国家）后：</p>
+  <ul>
+    <li>表格卡最深行维的单元格出现 <b>▸</b> 展开标记，点击 = 追加下钻一级，整表重渲；</li>
+    <li>表顶出现<b>面包屑</b>，可逐级回退；</li>
+    <li>图表卡点击柱 / 饼切片同样按层级下钻，多分支层级会弹出「下钻到」选择目标层级。</li>
+  </ul>
+
+  <h3 id="c5-10"><span class="no">5.10</span>指标名称维度（转置）</h3>
+  <p>字段库常驻一枚特殊虚拟维度「<b>指标名称</b>」：把它拖入行区或列区任意位置，值区指标就会被「转置」——每个指标成为一行（或一列表头），实现「指标当年月展开」「指标当区域展开」等帆软式布局。要点：</p>
+  <ul>
+    <li>值区为空时不出现；每次往值区加指标，会自动把它挂到列区末尾（也可手动移走）；</li>
+    <li>指标名称<b>不占行列区的 3 维容量</b>，且<b>可挂任意位置</b>：行区最多 3 个真实维度 ＋ 指标名称，列区同样最多 3 真实维 ＋ 指标名称（合计 4 层表头）——挂载在哪一位，指标名就出现在表头哪一层（如 列区「品类 × 指标名称 × 月份」= 品类段组下先分指标、再按月份展开）；</li>
+    <li>每个指标保留自己的格式与小数位（per-measure 格式缝），数据条也按同指标行内比较；</li>
+    <li>行区挂载时跨指标合计无业务意义，合计行 / 行总计列会自动关闭；</li>
+    <li>未挂载且只有一个指标时，表头不再出现重复的「指标值」空层。</li>
+  </ul>
+
+  <h3 id="c5-11"><span class="no">5.11</span>三层行列与四层表头</h3>
+  <p>行、列各支持最多 3 层维度（＋指标名称，合计 4 层表头），列多层以嵌套段组表头展开，服务端单次 GROUP BY 直接支撑：</p>
+  <div class="figrow">
+    <figure>
+      <img src="images/16-table3x3-matrix.png" alt="三层行 × 三层列交叉矩阵">
+      <figcaption>图 5-4 三层行（区域 / 国家 / 产品线）× 三层列（办事处 / 品类 / 月份）+ 小计行 + 合计行 + 行总计列</figcaption>
+    </figure>
+    <figure>
+      <img src="images/17-table3x3-nested.png" alt="三层行嵌套平铺表">
+      <figcaption>图 5-5 嵌套平铺：3 行维合并组头（无列维），含工具条（排序 / 筛选 / 字段 / 导出）</figcaption>
+    </figure>
+  </div>
+
+  <h3 id="c5-12"><span class="no">5.12</span>配置项速查</h3>
+  <table class="cfg">
+    <thead><tr><th>配置项</th><th>取值</th><th>缺省</th></tr></thead>
+    <tbody>
+      <tr><td>布局</td><td>交叉矩阵 / 分组行 / 嵌套平铺 / 明细长表</td><td>列区有列 = 交叉矩阵；无列 = 分组行</td></tr>
+      <tr><td>合并同类单元格</td><td>开 / 关</td><td>开</td></tr>
+      <tr><td>数据条</td><td>开 / 关（目标值可选）</td><td>开</td></tr>
+      <tr><td>合计行</td><td>开 / 关 × 顶部 / 底部</td><td>关（点名开启）</td></tr>
+      <tr><td>行总计列 / 段尾小计</td><td>开 / 关</td><td>关</td></tr>
+      <tr><td>组内 TopN</td><td>0 / 空 = 关，正整数 = 组内前 N</td><td>关</td></tr>
+      <tr><td>列宽模式</td><td>自适应内容 / 等分填充</td><td>自适应内容</td></tr>
+      <tr><td>每页条数</td><td>10 / 20 / 50 / 100…</td><td>20 条/页</td></tr>
+      <tr><td>点击行看明细</td><td>开 / 关（需勾选明细视图）</td><td>开</td></tr>
+      <tr><td>维度范围</td><td>近 N 期（周 / 月 / 季 / 年）/ 起止期（时间）；值域多选（类目）</td><td>不限</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============ 6 数据源管理 ============ -->
+<section class="chap" id="c6">
+  <h2><span class="no">6</span>数据源管理</h2>
+
+  <h3 id="c6-1"><span class="no">6.1</span>数据源配置界面</h3>
+  <p>编辑态顶栏「数据源配置」进入全屏三段式界面：左侧数据表列表（可搜索，显示行数 / 列数 / 被几张图表引用，server 模式下还有「服务端数据表」物理表清单），右侧默认是<b>字段配置</b>，可切换<b>画布模式</b>查看表间关系图。</p>
+  <figure>
+    <img src="images/12-datasource-config.png" alt="数据源配置：左侧表列表，右侧字段配置">
+    <figcaption>图 6-1 数据源配置：字段配置四列结构（字段 / 角色 / 默认聚合与格式 / 示例值），按 时间 / 维度 / 指标 分组展示</figcaption>
+  </figure>
+
+  <h3 id="c6-2"><span class="no">6.2</span>字段配置</h3>
+  <p>每个字段一行，行内自带数据事实副行（类型 · 不同值数 · 缺失率 · 范围），可展开字段全部设置：</p>
+  <table class="cfg">
+    <thead><tr><th>配置</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>角色</td><td>时间 / 维度 / 指标 / 忽略 四选一；与系统推断不同时行内提示「系统默认：X」</td></tr>
+      <tr><td>重命名（别名）</td><td>只改显示名，取数仍用原名——改名不会让任何图表失效；显示名不允许重复；改名弹窗会告知影响面（几张图表 / 指标卡 / 派生定义）</td></tr>
+      <tr><td>默认聚合 / 格式</td><td>数据集级默认值：新建图表、新拖入的指标自动套用（求和 / 平均 / 计数 / 去重计数…；常规 / 百分比 / 货币 / <b>价格</b> / 整数 / 时长，小数位 0–6），图表内可再单独覆盖。价格档与货币同格式（含币种与万元口径），但<b>缺省聚合是平均、不可加总</b></td></tr>
+      <tr><td>语义注解</td><td>Flint 语义标签下拉（金额 / 收入 / 成本 / 价格 / 占比 / 评分 / 排名 / 温度 / 情感…；<b>自动</b> = 按字段名推断，如「转化率」→占比）。声明后按该语义执行：价格 / 占比类<b>不可加总、不可堆叠求和</b>（构建期显式求和直接报错）、缺省聚合改平均；评分列图表轴自动钉 0–100、排名列轴自动反转。用于纠正「按名字猜错」或表达名字看不出的语义</td></tr>
+      <tr><td>货币符号</td><td>货币类指标的芯片 ⚙ 里有「货币符号」开关（默认显示）；关闭后 图表 / 表格 / KPI 三处同步隐藏 ¥ 前缀，数值口径不受影响。币种在列级声明（23 种内置 + 自定义符号），KPI 卡不单独覆盖币种</td></tr>
+      <tr><td>字段说明</td><td>≤ 120 字，写「这列是什么 / 怎么算的」，随字段提示展示</td></tr>
+      <tr><td>值别名</td><td>维度取值的显示层改名（如「华东区」→「华东」）；谓词与下钻仍用原值，不会打出空结果</td></tr>
+      <tr><td>隐藏字段</td><td>不进「新增」候选，但仍参与取数与既有引用；从字段行 ⋯ 菜单可取消隐藏</td></tr>
+      <tr><td>引用反查</td><td>每行有「被 N 张图表引用」徽标，点开列出全部引用点，点击滚动定位到那张卡片——「改这个字段会影响什么」一眼可见</td></tr>
+      <tr><td>维度层级</td><td>维度行拖 ⠿ 到另一字段 = 建立父子层级（拖到分组表头 = 回到顶层）；层级驱动筛选级联与下钻</td></tr>
+    </tbody>
+  </table>
+  <p>时间粒度不在这层配置——哪个图表要多粗的粒度，就在那个图表的时间维度芯片上选（原始 / 年 / 季 / 月 / 周 / 日）。数据值本身就是<b>周编号</b>的列（如 <code>W35</code>、<code>2026-W35</code>、<code>2026年35周</code>、<code>35周</code>）也能直接当时间列用：统一识别为周粒度，排序、分桶、筛选、近 N 期全链路一致，轴上显示归一为 <code>W05</code> / <code>2026-W05</code> 形态；裸数字周号（只有「35」）不带年份、无法保证跨年排序，建议列里带上年份信息。</p>
+  <p>顶部排序控件支持按 分组（角色分组 + 维度树）/ 名称 / 不同值 / 缺失 四种视图；所有改动实时生效，底部「完成」提交、「放弃本次改动」回滚到打开时的快照，删除类操作支持一层撤销。</p>
+
+  <h3 id="c6-3"><span class="no">6.3</span>计算字段：计算列与派生指标</h3>
+  <p>「＋ 新建 ▾」打开统一的计算字段弹窗（行级 / 聚合级两个页签 × 公式 / 时间窗口 / 占比 / 筛选聚合四种形态），带预设栏、可搜索字段库、实时校验和<b>前 5 行 / 期真实数据预览</b>。定义只在这一处发生，图表与表格面板只读引用：</p>
+  <figure>
+    <img src="images/13-datasource-derived.png" alt="计算字段区：计算列与派生指标">
+    <figcaption>图 6-2 计算字段区：计算列「净流入 = Sell In − Sell Out」（已物化）与 3 个派生指标（环比 / 占总计×2）</figcaption>
+  </figure>
+  <table class="cfg">
+    <thead><tr><th>类型</th><th>求值时机</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td>计算列（行级）<br><span class="tag">≤ 8 列</span></td><td>逐行计算，物化成真实列</td><td>客单价 = 销售额 / 订单数；净流入 = Sell In − Sell Out；日期差</td></tr>
+      <tr><td rowspan="4">派生指标（聚合级）<br><span class="tag">四类合计 ≤ 16 个</span></td><td>公式：聚合之后按公式求值</td><td>毛利率 = SUM(毛利额) / SUM(收入)；公式函数含 COUNTD（去重计数）</td></tr>
+      <tr><td>时间窗口：聚合后按时间键取前期 / 累计</td><td>月环比 / 同比 / 累计（须声明时间列与粒度，引用它的图表维度必须一致）</td></tr>
+      <tr><td>占比：聚合后除以总计 / 父级组内和</td><td>占总计（与合计行同口径）、占父级</td></tr>
+      <tr><td>筛选聚合（条件聚合）：聚合时只统计满足条件的行</td><td>有货国家的 Sell In；达标门店的销售额；只统计「线上渠道」的订单数——分组不变，组内只累加通过条件的行</td></tr>
+    </tbody>
+  </table>
+  <div class="callout note"><span class="cap">说明</span><p>派生指标是「不可加」指标：它在每张卡片当前的分组上求值，同一指标在不同维度的图表里值不同——这是正确语义。因此在表格合计行里比率类派生显示「—」。依赖不满足的窗口口径（图表维度 / 分桶与声明不一致）会置灰并给出原因，绝不静默算错：宁可空缺，也不给错周期。四类派生指标都可以带<b>语义注解</b>（弹窗里的「语义」下拉，如毛利率显式声明「占比」）——格式与可加性按声明走，不再依赖名字里恰好带「率」字。</p></div>
+  <div class="callout tip"><span class="cap">提示</span><p>指标芯片右键 / ⚙ 里的「显示为占比」是快捷方式：自动创建（或复用）一个「占总计」派生指标并交换该芯片，再点还原。KPI 卡的「对比」同样是引用一个窗口派生指标。</p></div>
+
+  <h3 id="c6-4"><span class="no">6.4</span>维度值分组</h3>
+  <p>把一个维度字段的枚举值归并成大组（如 省 → 大区、200+ 国家 → 区域），物化成一个新的真实维度列，之后处处当普通维度使用。分组构建器从值域勾选成员（可搜索 / 全选），未归并的值保留原样或落入「其他」桶；域外新增历史值靠手打区跨期保留。</p>
+
+  <h3 id="c6-5"><span class="no">6.5</span>多数据源与表间关联</h3>
+  <ul>
+    <li>一份报告最多挂 <b>8 张数据表</b>，每张表独立成数据源；图表 / KPI / 筛选器各自声明归属，卡片按实际归属表显示数据源徽标。</li>
+    <li><b>表间关联</b>：声明两表保留 + 关联键（≤ 16 条关系），可链式合并出一张宽表数据集；合并键自动派生「对齐维度」，驱动跨表筛选级联与跨表同图聚合。宽表可解散、可重新合并；关系地图在「画布模式」可视化维护。</li>
+    <li><b>数据源独立模式</b>：声明「各数据源完全独立、禁止合并」，与表间关联互斥（同时声明会被校验拦截）。</li>
+    <li>构建期也支持传路径数组（如 <code>W35.csv + W36.csv</code>）做同构并集，一行声明补多期数据。</li>
+  </ul>
+
+  <h3 id="c6-6"><span class="no">6.6</span>更新数据</h3>
+  <p>数据源配置侧栏的每张表都有「替换数据」入口，弹窗提供三种模式（两步确认，第二步会对比新旧行数与时间值集）：</p>
+  <table class="cfg">
+    <thead><tr><th>模式</th><th>语义</th><th>适合</th></tr></thead>
+    <tbody>
+      <tr><td>全量替换</td><td>新文件整体换掉当前表（列结构不同走列映射向导）</td><td>重刷整表</td></tr>
+      <tr><td>增量合并（upsert）</td><td>按主键并入：有则覆盖、无则插入；幂等（重复导入结果一致）</td><td>往期追溯修正</td></tr>
+      <tr><td>追加新行</td><td>不查重不覆盖，全部行并入表尾（免选主键）</td><td>同构文件补新一期数据（如月度新一批）</td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>上次使用的模式会被记住并标「上次使用」；「维度 + 时间列」按钮一键设主键预设。</li>
+    <li><b>大文件（&gt; 4 MB，server 模式）直传后台任务</b>：右下角常驻任务条展示上传百分比 → 服务端阶段 → 终态；<b>终态必须手动关闭</b>，成功带新增行数勾稽、失败带可行动文案且数据零改动。xlsx 大文件解析约每 10 万行 10–40 秒属正常。</li>
+  </ul>
+  <div class="callout warn"><span class="cap">注意</span><p>数据「没更新」时，先看两处：<b>任务条终态文案</b>与<b>数据源配置里的行数</b>。不要用手工合并 / 转换源文件的方式绕过导入——那是数据事故的常见起点。</p></div>
+
+  <h3 id="c6-7"><span class="no">6.7</span>服务端数据表与行级管理</h3>
+  <ul>
+    <li><b>服务端数据表块</b>（侧栏底部，server 模式）：列出本报告全部物理表，历史 / 未引用表带徽标 + 行数 / 占用，可逐表真删除（引擎表 + 快照 + 记账一起清）；被其他报告副本共享的表只脱离、不删除。</li>
+    <li><b>管理数据弹窗</b>：筛选构建器 + 勾选行 + 「删除选中行 / 删除筛选命中行」，server 模式真删数据库行并保留单份备份供人工回滚；删除全部行的筛选需显式确认。</li>
+  </ul>
+</section>
+
+<!-- ============ 7 汇报与导出 ============ -->
+<section class="chap" id="c7">
+  <h2><span class="no">7</span>汇报模式与导出</h2>
+  <h3 id="c7-1"><span class="no">7.1</span>16:9 分页预览</h3>
+  <p>顶栏「汇报模式」把所有卡片装入<b>行对齐的 16:9 分页</b>：每页顶部预留标题带，卡片只能落在内容区，某一行放不下就整体顺延到下一页（永不劈卡）。分页布局与单页正文<b>相互独立</b>——在汇报模式里的拖拽 / 插入只影响放映版式，退出后单页布局原样还原；「从单页重置」可重新自动分页。</p>
+  <figure>
+    <img src="images/15-presentation.png" alt="汇报模式 16:9 分页">
+    <figcaption>图 7-1 汇报模式：16:9 页框、页码 1/8、页脚「数据截至」徽章、工具条（放映 / 从单页重置 / 无框文本）</figcaption>
+  </figure>
+  <h3 id="c7-2"><span class="no">7.2</span>放映</h3>
+  <p>左上角「放映」进入浏览器全屏：当前页按视口等比铺满，方向键 / 空格 / 点击翻页。图表以静态图方式上屏，保证任何机器上都流畅。</p>
+  <h3 id="c7-3"><span class="no">7.3</span>导出</h3>
+  <p>导出入口在「保存与分享」中心（见 4.7）：<b>PPTX 图片版</b>（版式最稳）、<b>PPTX 原生版</b>（文本 / 表格 / 柱线饼可再编辑）、<b>PDF</b>（浏览器打印，每页一张幻灯片）。导出复用汇报模式的分页器，屏幕预览与导出分页完全一致。</p>
+</section>
+
+<!-- ============ 8 交付与运维 ============ -->
+<section class="chap" id="c8">
+  <h2><span class="no">8</span>交付与运维</h2>
+
+  <h3 id="c8-1"><span class="no">8.1</span>统一服务与报告管理页</h3>
+  <p>每台电脑只跑一个报告数据服务（默认从 8765 端口起），所有报告集中注册。任意报告服务的<b>报告管理页</b>（<code>http://127.0.0.1:8765/manager</code>）一处可见本机所有报告：</p>
+  <figure>
+    <img src="images/18-manager.png" alt="报告管理页">
+    <figcaption>图 8-1 报告管理页：按报告族分组、本机 / 局域网链接、编辑口令管理、修改日志、关闭服务</figcaption>
+  </figure>
+  <ul>
+    <li>管理页<b>仅限本机打开</b>（非本机访问一律拒绝）；报告页面里没有任何进入它的按钮——把构建日志 / 入口页里的 <code>/manager</code> 链接告诉报告主人即可。</li>
+    <li>每条报告可开关「<b>允许在线编辑</b>」并「设置口令」；关闭后任何保存都会提示联系管理员（分享链接不受影响）。</li>
+    <li>server 模式构建时若未设置编辑口令，会自动生成一个并打印在构建日志 / 入口页 / build README 中。</li>
+  </ul>
+
+  <h3 id="c8-2"><span class="no">8.2</span>局域网分享</h3>
+  <p>数据服务默认绑定所有网卡，「分享（只读 / 可编辑）」会给出局域网链接——同一 WiFi / 网段内的同事、手机直接打开即可（首次可能需要允许防火墙入站）。服务所在电脑关机后链接不可用，可双击报告文件夹里的「打开报告」启动器重新拉起。</p>
+
+  <h3 id="c8-3"><span class="no">8.3</span>便携启动器：报告文件夹可搬家</h3>
+  <p>server / mixed 报告的文件夹是<b>自足可移植</b>的：整体拷贝（或压缩发送）到另一台电脑，双击 <code>打开报告.command</code> / <code>.cmd</code> 即可用——零第三方依赖；目标机器没有合适 Python 时启动器自动下载便携版（校验官方 SHA256），数据快照随文件夹走并自动注册进对方机器的服务。环境变量 <code>LRM_PORT / LRM_STATE_HOME / LRM_NO_OPEN</code> 可定制端口 / 数据目录 / 不自动开浏览器。</p>
+
+  <h3 id="c8-4"><span class="no">8.4</span>安全边界</h3>
+  <ul>
+    <li>服务 API 只提供健康检查、注册 / 注销、schema、受限聚合与分页明细，<b>不暴露任意 SQL</b>，无公网鉴权——请只在可信内网使用。</li>
+    <li>server 报告的 manifest 不含原始行数据；图表切换全部经受限聚合接口完成。</li>
+    <li>报告为纯静态渲染：无外部脚本 / 字体 / 图片，运行资产全部内联，不允许函数字符串 formatter。</li>
+  </ul>
+</section>
+
+<!-- ============ 9 附录 ============ -->
+<section class="chap" id="c9">
+  <h2><span class="no">9</span>附录</h2>
+
+  <h3 id="c9-a"><span class="no">A</span>图表类型白名单</h3>
+  <table class="cfg">
+    <thead><tr><th>类型</th><th>适用场景</th><th>维度要求</th></tr></thead>
+    <tbody>
+      <tr><td>柱状 / 折线图</td><td>排名对比；趋势随时间变化；多指标柱线组合</td><td>1 个维度（时间 / 有序）+ 1–2 个指标（多指标时自动柱线混排）</td></tr>
+      <tr><td>堆叠柱状图</td><td>构成与「A × B」交叉计数</td><td>维度 + 交叉列；主类目少、序列多时自动改折线防拥挤</td></tr>
+      <tr><td>面积图</td><td>带体感的趋势</td><td>时间或有序维度</td></tr>
+      <tr><td>饼图 / 环形图</td><td>整体占比</td><td>切片 ≤ 8</td></tr>
+      <tr><td>散点图</td><td>两个指标的关联</td><td>两条值轴，远离 0 时自动数据拟合（不强制 0 锚定）</td></tr>
+      <tr><td>漏斗图</td><td>阶段流转</td><td>≥ 3 个有序阶段</td></tr>
+      <tr><td>表格（聚合）</td><td>交叉分析 / 证据表</td><td>见第 5 章</td></tr>
+      <tr><td>表格（明细）</td><td>原始记录查数（搜索 / 排序 / 分页）</td><td>自选字段</td></tr>
+      <tr><td>指标卡 KPI</td><td>单一关键数字 + 对比副行</td><td>一个指标 + 可选窗口派生对比</td></tr>
+    </tbody>
+  </table>
+  <p>热力图、仪表盘、地图、雷达、桑基等暂不在白名单内。</p>
+
+  <h3 id="c9-b"><span class="no">B</span>筛选操作符</h3>
+  <p>报告 / 卡片级筛选支持的谓词（最多 10 条，AND + 一层 OR 组合）：</p>
+  <p><code>eq</code> <code>ne</code> <code>gt</code> <code>gte</code> <code>lt</code> <code>lte</code> <code>contains</code> <code>in</code> <code>not in</code> <code>is null</code> <code>is not null</code>，数值区间 <code>between</code>、日期范围 <code>daterange</code>（三端语义一致，日期在规范化 ISO 上比较）。</p>
+
+  <h3 id="c9-c"><span class="no">C</span>常见问题（FAQ）</h3>
+  <h4>C1 打开 <code>&lt;标题&gt;.html</code> 后图表「加载不出来」？</h4>
+  <p>server / mixed 模式的该文件是<b>指引入口页</b>，不是报告本体。请双击「打开报告」启动器，或访问入口页上的报告 URL；也不要把这个文件当附件发给别人。</p>
+  <h4>C2 数据更新后报告里没变化？</h4>
+  <p>先看两处：右下角<b>任务条终态文案</b>（是否成功、新增多少行）与<b>数据源配置里的行数</b>。另外记得：编辑过的报告要「保存并覆盖」读者才能看到新版。</p>
+  <h4>C3 时间轴乱序或有空白期？</h4>
+  <p>确认时间列的角色是「时间」。产品内置统一的时间解析器，<code>2026/9/5</code>、<code>20260905</code>、<code>2026年9月5日</code>、epoch 时间戳等写法都能正确按日历序排列与分桶；多种写法混在一列也没问题。</p>
+  <h4>C4 列区拖入字段后表格还是普通平表？</h4>
+  <p>「列区落列即透视」是缺省行为；若报告此前显式把布局固定成了「分组行」，到表格设置 → 布局里改回「交叉矩阵」即可。</p>
+  <h4>C5 派生指标芯片显示「不可用」？</h4>
+  <p>窗口类派生指标（环比 / 同比 / 累计）要求图表维度正是它声明的时间列、且分桶粒度一致。芯片置灰即当前卡片不满足依赖，按提示调整维度或分桶。</p>
+  <h4>C6 为什么不建议在 Excel 里预先算好占比 / 环比再导入？</h4>
+  <p>Excel 算死的值无法跟随筛选与维度变化，筛选后必然与图表矛盾。正确做法：行级加工留在 Excel（每行自己决定的值），<b>占比 / 同环比 / 排名 / 合计这类随查询变化的值交给报告的派生体系</b>（6.3 节）。</p>
+  <h4>C7 大 xlsx 导入慢？</h4>
+  <p>走直传 + 后台任务，任务条会显示已耗时；xlsx 解析约每 10 万行 10–40 秒属正常，请等终态再判断成败。</p>
+  <h4>C8 局域网同事打不开链接？</h4>
+  <p>确认服务所在电脑开机且服务在跑（管理页可查）；首次访问需允许 macOS / Windows 防火墙入站；链接是 <code>http://&lt;局域网IP&gt;:端口/reports/&lt;id&gt;</code>，不要发成 127.0.0.1。</p>
+  <h4>C9 筛选后图表显示「没有数据」？</h4>
+  <p>卡片会如实显示原因与生效筛选数，并提供一键「清除筛选」。若筛选值与数据写法不一致（如「华南」vs「华南大区」），用值别名统一显示层写法。</p>
+  <h4>C10 想要地图 / 热力图？</h4>
+  <p>暂不支持（图表白名单见附录 A）。交叉矩阵 + 数据条 / 条件格式可以覆盖大部分「看分布」的诉求。</p>
+  <h4>C11 时间列的值是「W35」「35周」这样的周编号，能当时间用吗？</h4>
+  <p>能。<code>W35</code>、<code>2026-W35</code>、<code>2026年35周</code>、<code>35周</code> 等写法统一识别为周粒度时间：轴上按日历周序排列、显示归一为 <code>2026-W35</code> 形态，「近 N 期」范围也支持按周裁剪。注意裸数字周号（只有「35」）不带年份、无法保证跨年排序，建议列里带上年份。</p>
+  <h4>C12 表格工具条上的「筛选」按钮去哪了？</h4>
+  <p>筛选入口收敛为两层：<b>读者的筛选</b>走卡头「筛选 ▾」常驻条（多选值域、勾选即重算，见 3.1）与报告级筛选卡；<b>作者要对整卡固化的数据范围</b>在编辑态用列头漏斗配置，读者不可见、不可改。</p>
+
+  <h3 id="c9-d"><span class="no">D</span>词汇表</h3>
+  <table class="cfg">
+    <thead><tr><th>词汇</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>数据集 / 数据表</td><td>报告挂载的一张二维表；一份报告最多 8 张</td></tr>
+      <tr><td>卡片 / 区块</td><td>报告画布上的一个元素：图表、表格、KPI、文本、筛选器等</td></tr>
+      <tr><td>维度 / 指标</td><td>维度 = 分析视角（文本 / 类别列）；指标 = 被聚合的数值列</td></tr>
+      <tr><td>交叉列</td><td>放在表格「列区」的维度，展开为透视表头</td></tr>
+      <tr><td>计算列（行级）</td><td>逐行计算并物化成真实列的派生字段（四则 / 日期差）</td></tr>
+      <tr><td>派生指标（聚合级）</td><td>聚合后求值的指标：公式 / 时间窗口（环比同比累计）/ 占比 / 筛选聚合（条件聚合），带 ƒ 徽标</td></tr>
+      <tr><td>筛选聚合</td><td>派生指标的一种：聚合时只统计满足条件的行（如「有货国家的 Sell In」），分组不变、组内只累加通过条件的行</td></tr>
+      <tr><td>周字段</td><td>值形如 <code>W35</code> / <code>2026-W35</code> / <code>35周</code> 的时间列，按周粒度参与排序 / 分桶 / 筛选 / 近 N 期</td></tr>
+      <tr><td>卡头筛选条</td><td>卡头「筛选 ▾」展开的常驻筛选：作者挑常驻维度，读者多选值域、勾选即重聚合（只影响本卡）</td></tr>
+      <tr><td>指标名称</td><td>常驻字段库的虚拟维度，拖入行 / 列区可把指标转置为行 / 表头层</td></tr>
+      <tr><td>作用范围</td><td>筛选器卡片的作用域：全局 / 页签</td></tr>
+      <tr><td>汇报布局</td><td>汇报模式独立的 16:9 分页版式，与单页正文互不影响</td></tr>
+      <tr><td>编辑口令</td><td>在线保存需要的口令，构建时自动生成，管理页可改 / 可关闭在线编辑</td></tr>
+      <tr><td>数据截至</td><td>数据时间列的最大期，封面 / 页脚徽章自动展示</td></tr>
+      <tr><td>报告管理页</td><td><code>/manager</code>：本机集中管理所有报告与服务的页面（仅本机可开）</td></tr>
+      <tr><td>状态目录</td><td><code>~/.ai-html-report/</code>：注册表、数据快照与服务进程信息的机器级目录</td></tr>
+    </tbody>
+  </table>
+
+  <hr class="sep">
+  <p><small>本手册配图全部截取自真实运行中的报告（华为终端 PSI 月度经营报告、多维表格三层行列验收报告），页面内容与产品 v2026.10.13 实际行为一致。产品中文名以正式定名为准。</small></p>
+</section>
+
+</main>
+</div>
+</body>
+</html>
