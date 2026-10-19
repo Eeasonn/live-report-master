@@ -130,8 +130,8 @@
       <p class="sub">把一张二维表（Excel / CSV / JSON）变成一份可编辑、可交互、可汇报的 BI 报告。数据、布局、图表、口径全部确定性好掌握：看得懂、改得动、发得出去。</p>
     </div>
     <div class="meta">
-      <div>文档版本 <b>v1.3</b> · 更新日期 <b>2026-10-14</b></div>
-      <div>适用产品版本 <b>v2026.10.13</b> 及以上</div>
+      <div>文档版本 <b>v1.4</b> · 更新日期 <b>2026-10-19</b></div>
+      <div>适用产品版本 <b>v2026.10.19</b> 及以上</div>
       <div>配图来自真实运行报告的真机截图</div>
     </div>
   </div>
@@ -181,6 +181,11 @@
   <a href="#c7-6" class="l2">7.6 更新数据</a>
   <a href="#c8">8 汇报与导出</a>
   <a href="#c9">9 交付与运维</a>
+  <a href="#c9-5" class="l2">9.5 Agent 升级路线</a>
+  <a href="#c9-5-1" class="l2">9.5.1 先理解报告口径</a>
+  <a href="#c9-5-2" class="l2">9.5.2 一次分析如何完成</a>
+  <a href="#c9-5-3" class="l2">9.5.3 哪些动作需要确认</a>
+  <a href="#c9-5-4" class="l2">9.5.4 分阶段升级</a>
   <a href="#c10">10 附录</a>
   <a href="#c10-a" class="l2">A 图表类型白名单</a>
   <a href="#c10-b" class="l2">B 筛选操作符</a>
@@ -1125,6 +1130,83 @@
   </ul>
 </section>
 
+<!-- ============ 9.5 Agent 升级路线 ============ -->
+<section class="chap" id="c9-5">
+  <h2><span class="no">9.5</span>Agent 升级路线：从互动报表到 Report Agent</h2>
+  <p>Live Report 的下一步不是让模型直接改 HTML，而是让 Agent <b>读懂报告口径、调用受控工具、给出可核验证据，再在得到确认后执行改变报告的动作</b>。报告仍由确定性构建器保证数据真实；Agent 负责把「我想知道什么」翻译成结构化分析，把结果和依据带回给人。</p>
+
+  <svg class="diagram" width="100%" height="192" viewBox="0 0 960 192" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Report Agent 分层流程图">
+    <defs>
+      <marker id="agent-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#9ba7cf"/></marker>
+    </defs>
+    <g font-family="inherit" font-size="13" fill="#1a1a1a">
+      <rect x="8" y="48" width="164" height="92" rx="10" fill="#f6f5f4" stroke="#e5e3df"/>
+      <text x="90" y="76" text-anchor="middle" font-weight="600">你提出问题</text>
+      <text x="90" y="99" text-anchor="middle" font-size="11.5" fill="#787671">“这张卡为何下降？”</text>
+      <text x="90" y="120" text-anchor="middle" font-size="11.5" fill="#787671">“帮我改成月环比”</text>
+      <line x1="176" y1="94" x2="218" y2="94" stroke="#9ba7cf" stroke-width="1.5" marker-end="url(#agent-arr)"/>
+      <rect x="222" y="28" width="210" height="132" rx="10" fill="#eef2fd" stroke="#c9d6f5"/>
+      <text x="327" y="57" text-anchor="middle" font-weight="600" fill="#3c5499">1 · 理解报告</text>
+      <text x="327" y="82" text-anchor="middle" font-size="11.5" fill="#3c5499">定位卡片与数据集</text>
+      <text x="327" y="103" text-anchor="middle" font-size="11.5" fill="#3c5499">读取维度、指标、聚合、粒度</text>
+      <text x="327" y="124" text-anchor="middle" font-size="11.5" fill="#3c5499">锁定数据版本与筛选范围</text>
+      <line x1="436" y1="94" x2="478" y2="94" stroke="#9ba7cf" stroke-width="1.5" marker-end="url(#agent-arr)"/>
+      <rect x="482" y="28" width="210" height="132" rx="10" fill="#f0f8f2" stroke="#cfe8d6"/>
+      <text x="587" y="57" text-anchor="middle" font-weight="600" fill="#2f6b40">2 · 计划与取证</text>
+      <text x="587" y="82" text-anchor="middle" font-size="11.5" fill="#2f6b40">生成 typed plan</text>
+      <text x="587" y="103" text-anchor="middle" font-size="11.5" fill="#2f6b40">调用真实聚合 / 对比 / 下钻</text>
+      <text x="587" y="124" text-anchor="middle" font-size="11.5" fill="#2f6b40">返回 evidence 与限制</text>
+      <line x1="696" y1="94" x2="738" y2="94" stroke="#9ba7cf" stroke-width="1.5" marker-end="url(#agent-arr)"/>
+      <rect x="742" y="28" width="210" height="132" rx="10" fill="#fdf6e7" stroke="#f0dfb6"/>
+      <text x="847" y="57" text-anchor="middle" font-weight="600" fill="#8a6116">3 · 提议与执行</text>
+      <text x="847" y="82" text-anchor="middle" font-size="11.5" fill="#8a6116">查询自动返回</text>
+      <text x="847" y="103" text-anchor="middle" font-size="11.5" fill="#8a6116">改图 / 保存 / 通知先出 diff</text>
+      <text x="847" y="124" text-anchor="middle" font-size="11.5" fill="#8a6116">确认后原子应用，可回滚</text>
+    </g>
+  </svg>
+  <p><small>图 9-2　Agent 只在服务端调用受控工具。模型输出是计划和参数，不是 SQL、HTML 或权限。</small></p>
+
+  <h3 id="c9-5-1"><span class="no">9.5.1</span>先把报告讲清楚，Agent 才能做对事</h3>
+  <p>Agent 读取的是报告的语义上下文：当前卡片、所属页签、数据集、维度与指标、每个指标的聚合方式、时间分桶、筛选器、TOP-N 截断和数据版本。比如「销售额」和「客单价」都可能是数字，但前者可加、后者不可直接求和；「同比」还必须绑定时间列和粒度。上下文由服务端重新校验，用户切换卡片或刷新数据后，旧回答不会串到新卡片。</p>
+  <p>这套口径延续报告已有的语义引擎：字段先分为时间、维度、指标等语义类型，再根据通道决定排序、轴域、颜色和堆叠；类别过多时按成员聚合后做 TOP-N，并明确告诉读者发生了截断。这样 Agent 的解释和报告上的数是同一套数。</p>
+
+  <h3 id="c9-5-2"><span class="no">9.5.2</span>一次分析如何完成</h3>
+  <table class="cfg">
+    <thead><tr><th>你说的话</th><th>Agent 做的事</th><th>你看到的结果</th></tr></thead>
+    <tbody>
+      <tr><td>“解释这张库存趋势图”</td><td>定位当前卡片，读取库存指标、月份粒度与筛选，调用趋势分析工具</td><td>结论 + 真实聚合行 + 数据截至 + 缺失期 / 截断提示</td></tr>
+      <tr><td>“比较华东和华南的 Sell In”</td><td>校验两个区域值，按同一时间口径取数并计算贡献度</td><td>对比表、差异、覆盖范围和口径说明</td></tr>
+      <tr><td>“帮我找出异常门店”</td><td>在服务端做有界异常扫描，超过扫描预算时明确返回原因</td><td>异常候选、观测证据、下一步可选分析，不宣称因果</td></tr>
+      <tr><td>“把这张图改成月环比”</td><td>检查时间列 / 分桶是否满足派生指标依赖，生成图表 proposal</td><td>修改前后 diff；点击「确认应用」才写入当前会话</td></tr>
+    </tbody>
+  </table>
+  <p>长耗时任务会进入任务条：模型调用、复杂聚合、证据导出和数据替换都返回 <code>jobId</code>，页面按服务端建议轮询。你可以停止等待；服务端会取消查询、关闭可取消的 provider 连接并清理任务记录。安全的只读任务支持带 token 重试，未知副作用不会自动重放。</p>
+
+  <h3 id="c9-5-3"><span class="no">9.5.3</span>哪些动作需要确认</h3>
+  <table class="cfg">
+    <thead><tr><th>动作</th><th>默认行为</th><th>确认与权限</th></tr></thead>
+    <tbody>
+      <tr><td>问答、解释、对比、下钻、画像</td><td>可自动执行只读工具</td><td>返回 evidence、provenance、假设与限制</td></tr>
+      <tr><td>修改图表字段 / 类型 / 筛选</td><td>先生成 proposal</td><td>展示 before / after、影响卡片和数据集范围；确认后应用</td></tr>
+      <tr><td>保存报告、更新数据、导出证据</td><td>进入受控 Job</td><td>按编辑口令、数据集范围和审批要求执行；失败可诊断</td></tr>
+      <tr><td>创建监控、发送通知</td><td>默认只读 / 不发送</td><td>通知需显式启用、审批和幂等 delivery；未配置 connector 时 fail-closed</td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><span class="cap">数据边界</span><p>报告文件、原始数据、Server、Agent 状态和密钥管理留在本机。远程 Provider（如 DeepSeek）只会收到经过裁剪和脱敏的上下文与 evidence；需要数据完全不出机时，配置本机 Ollama / llama.cpp 等 OpenAI-compatible 端点。API Key 只由服务端读取，不写入 manifest、HTML、日志或发布包。</p></div>
+
+  <h3 id="c9-5-4"><span class="no">9.5.4</span>分阶段升级：每一步都可验收</h3>
+  <table class="cfg">
+    <thead><tr><th>阶段</th><th>用户感受到的变化</th><th>产品底座</th></tr></thead>
+    <tbody>
+      <tr><td>现在：Copilot</td><td>选中一张卡提问，得到按当前口径计算的答案和证据；可预览受限改图</td><td>ReportContext、真实聚合、派生指标统一求值、卡片会话隔离</td></tr>
+      <tr><td>升级：Report Agent</td><td>一句话触发多步分析，查看计划、工具、每一步证据和预算；只读计划可连续执行</td><td>typed AgentPlan、Tool Registry、依赖拓扑、Job / 取消 / 重试 / 审计</td></tr>
+      <tr><td>持续：Monitor / Watch</td><td>保存异常、期间比较和数据质量监控；变化时生成通知提议</td><td>持久 monitor、证据指纹去重、审批与可选 webhook；邮件 / Slack 连接器按部署启用</td></tr>
+      <tr><td>产品化边界</td><td>多用户、跨主机队列、企业身份和长期趋势由部署平台接入</td><td>当前本机版本保持 fail-closed，外部基础设施未配置时返回可行动错误</td></tr>
+    </tbody>
+  </table>
+  <p>完整的状态、目标和验收入口见<a href="https://github.com/Eeasonn/live-report-master/blob/main/docs/agent-program-master-plan-2026-10-18.md">Agent/server 总推进方案</a>；Copilot 的接口与安全约束见<a href="https://github.com/Eeasonn/live-report-master/blob/main/references/copilot-agent.md">Server-mode Report Copilot 说明</a>。这两份文档是工程细节，产品使用时只需要记住：<b>先选卡，再提问；先看证据，再确认改动</b>。</p>
+</section>
+
 <!-- ============ 9 附录 ============ -->
 <section class="chap" id="c10">
   <h2><span class="no">10</span>附录</h2>
@@ -1200,7 +1282,7 @@
   </table>
 
   <hr class="sep">
-  <p><small>本手册配图全部截取自真实运行中的报告（华为终端 PSI 月度经营报告、多维表格三层行列验收报告），页面内容与产品 v2026.10.13 实际行为一致。产品中文名以正式定名为准。</small></p>
+  <p><small>本手册配图全部截取自真实运行中的报告（华为终端 PSI 月度经营报告、多维表格三层行列验收报告），页面内容与产品 v2026.10.19 实际行为一致。Agent 章节依据本仓库的 Agent/server 总推进方案与 Server-mode Report Copilot 说明维护。产品中文名以正式定名为准。</small></p>
 </section>
 
 </main>
