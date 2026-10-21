@@ -1,0 +1,336 @@
+{
+  "version": 1,
+  "contract": "Use request paths only for request-supported capabilities. For editor-only capabilities, disclose the exact follow-up action; never silently claim the request created it.",
+  "capabilities": [
+    {
+      "id": "semantic-field-type",
+      "phrases": [
+        "价格",
+        "比率",
+        "日期",
+        "地区"
+      ],
+      "support": "request",
+      "requestPath": "semantic_types.<column>",
+      "resultPath": "datasets[].measureTypes / charts[].editor.data.measureTypes",
+      "verification": "validate_request + manifest semantic parity"
+    },
+    {
+      "id": "per-measure-aggregation",
+      "phrases": [
+        "销售额求和",
+        "价格求均值",
+        "组合图"
+      ],
+      "support": "request",
+      "requestPath": "charts[].chartSpec.encodings.y[].aggregate",
+      "resultPath": "charts[].editor.data.aggregations",
+      "verification": "static rows and runtime aggregates agree"
+    },
+    {
+      "id": "chart-auto-recommendation",
+      "phrases": [
+        "自动选择图表",
+        "智能推荐"
+      ],
+      "support": "request",
+      "requestPath": "charts[].chartSpec.chartType=auto",
+      "resultPath": "charts[].editor.data.dimension / measures",
+      "verification": "both chart type and channel bindings exist"
+    },
+    {
+      "id": "derived-measure",
+      "phrases": [
+        "毛利率",
+        "环比",
+        "同比",
+        "累计"
+      ],
+      "support": "request",
+      "requestPath": "datasets[].derived.measures",
+      "resultPath": "datasets[].derived.measures",
+      "verification": "compiled values match runtime values"
+    },
+    {
+      "id": "measure-name-pivot",
+      "phrases": [
+        "指标名称",
+        "指标名做表头",
+        "指标转置"
+      ],
+      "support": "editor",
+      "editorAction": "表格卡字段库：把「指标名称」拖到行区或列区",
+      "manifestPath": "charts[].editor.data.dimensions/roles.cols + __measures__",
+      "fallback": "request creates a multi-measure table with measures as separate columns; explicitly disclose that pivot remains manual"
+    },
+    {
+      "id": "column-only-crosstab",
+      "phrases": [
+        "仅列维",
+        "无行维交叉表"
+      ],
+      "support": "editor",
+      "editorAction": "在表格卡清空行区，保留列区维度",
+      "manifestPath": "charts[].editor.data.roles.cols",
+      "fallback": "request creates the nearest row-dimension × column-dimension crosstab; explicitly disclose the manual row removal"
+    },
+    {
+      "id": "tab-scope-filter",
+      "phrases": [
+        "页签级筛选",
+        "各页独立筛选"
+      ],
+      "support": "editor",
+      "editorAction": "在对应页签插入筛选器卡，将作用范围设为「页签」",
+      "manifestPath": "blocks[filter].scope=tab",
+      "fallback": "request.filters is report-wide; explicitly disclose that tab scope requires the editor"
+    },
+    {
+      "id": "table-column-width",
+      "phrases": [
+        "列宽",
+        "双击自适应"
+      ],
+      "support": "editor",
+      "editorAction": "拖动表格列缘设置列宽，双击恢复自适应",
+      "manifestPath": "charts[].editor.table.colWidths",
+      "fallback": "request leaves automatic width; explicitly disclose geometry is editor-only"
+    },
+    {
+      "id": "table-multiview",
+      "phrases": [
+        "聚合明细切换",
+        "一张卡两种视图"
+      ],
+      "support": "editor",
+      "editorAction": "在表格卡设置中勾选聚合/明细视图并选择明细列",
+      "manifestPath": "charts[].editor.table.modes",
+      "fallback": "request creates separate aggregate and detail cards; explicitly disclose same-card switching is manual"
+    },
+    {
+      "id": "presentation-pagination",
+      "phrases": [
+        "汇报分页",
+        "逐页微调"
+      ],
+      "support": "editor",
+      "editorAction": "进入汇报模式，逐页拖拽或调整标题带",
+      "manifestPath": "presentation.layout",
+      "fallback": "request seeds the default 16:9 page layout; explicitly disclose manual fine-tuning"
+    },
+    {
+      "id": "report-sections",
+      "phrases": [
+        "章节",
+        "报告目录",
+        "按主题分组"
+      ],
+      "support": "request",
+      "requestPath": "sections[]",
+      "resultPath": "manifest.sections",
+      "verification": "section chart references resolve and every chart has one section"
+    },
+    {
+      "id": "hierarchy-drilldown",
+      "phrases": [
+        "逐级下钻",
+        "区域到国家",
+        "层级筛选"
+      ],
+      "support": "request",
+      "requestPath": "datasets[].hierarchy",
+      "resultPath": "datasets[].hierarchy + chart drill metadata",
+      "verification": "parent-child closure and drill filters remain in the same dataset"
+    },
+    {
+      "id": "date-scope",
+      "phrases": [
+        "近几个月",
+        "最近一期",
+        "时间范围"
+      ],
+      "support": "request",
+      "requestPath": "chart.table.dateScope / dimScopes[]",
+      "resultPath": "chart editor data scopes",
+      "verification": "date_parse sort/bucket and server daterange agree"
+    },
+    {
+      "id": "conditional-format",
+      "phrases": [
+        "异常标红",
+        "达标颜色",
+        "数据条"
+      ],
+      "support": "request",
+      "requestPath": "chart.table.condFormat[] / showBars",
+      "resultPath": "chart editor table formatting",
+      "verification": "format rules are bounded and totals policy is explicit"
+    },
+    {
+      "id": "row-drill",
+      "phrases": [
+        "点击看明细",
+        "聚合行下钻",
+        "查看原始记录"
+      ],
+      "support": "request",
+      "requestPath": "chart.table.rowDrill",
+      "resultPath": "chart editor table modes + drill metadata",
+      "verification": "detail fields are declared and sensitive fields remain blocked"
+    },
+    {
+      "id": "data-refresh",
+      "phrases": [
+        "追加数据",
+        "替换数据",
+        "月度刷新"
+      ],
+      "support": "editor",
+      "editorAction": "打开数据源配置，选择替换数据或追加新行，并在任务条确认终态",
+      "manifestPath": "datasets[].file / server dataset snapshot",
+      "fallback": "request can declare source files for a rebuild; existing server data is not mutated without an approved data-update job"
+    },
+    {
+      "id": "agent-card-context",
+      "phrases": [
+        "分析这张卡",
+        "当前卡片",
+        "按这张图解释"
+      ],
+      "support": "agent",
+      "tool": "resolve_card + get_semantic_context",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "chartId + contextKey + datasetRevision are server-validated and card history is isolated"
+    },
+    {
+      "id": "agent-semantic-reconcile",
+      "phrases": [
+        "对比两张卡",
+        "口径是否一致",
+        "跨卡对账"
+      ],
+      "support": "agent",
+      "tool": "reconcile_cards",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "dataset, fields, filters, pivot, bucket and aggregation conflicts are returned as evidence"
+    },
+    {
+      "id": "agent-period-analysis",
+      "phrases": [
+        "同比",
+        "环比",
+        "期间比较",
+        "趋势变化"
+      ],
+      "support": "agent",
+      "tool": "compare_periods + trend_inflection",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "server aggregation and date_parse time keys produce bounded evidence with assumptions"
+    },
+    {
+      "id": "agent-safe-change",
+      "phrases": [
+        "帮我改图",
+        "保存报告",
+        "更新数据"
+      ],
+      "support": "agent",
+      "tool": "propose_* → validate → approve → apply",
+      "permissions": [
+        "editor"
+      ],
+      "verification": "no direct mutation; proposal diff, approval, snapshot, hash check and rollback are required"
+    },
+    {
+      "id": "agent-action-recommendation",
+      "phrases": [
+        "下一步怎么做",
+        "给出行动建议",
+        "异常后怎么排查",
+        "分析建议"
+      ],
+      "support": "agent",
+      "tool": "recommend_actions",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "suggestions are linked to observed aggregate evidence, bounded to read-only typed tools, and explicitly non-causal"
+    },
+    {
+      "id": "business-calendar",
+      "phrases": [
+        "财年",
+        "财政年度",
+        "四月起算",
+        "按财季分析"
+      ],
+      "support": "request",
+      "requestPath": "calendar / datasets[].calendar",
+      "resultPath": "ReportContext.timeSemantics.calendar + Agent bucket calendar",
+      "verification": "explicit fiscalStartMonth is validated; SQL Agent labels and gap analysis remain date_parse-backed; chart renderer does not silently infer a calendar"
+    },
+    {
+      "id": "agent-alias-confirmation",
+      "phrases": [
+        "业务别名",
+        "把收入叫销售额",
+        "确认字段名称"
+      ],
+      "support": "agent",
+      "tool": "resolve_field → propose_alias_confirmation",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "authored/manifest aliases are accepted; inferred aliases remain requiresConfirmation until explicit confirmation, which emits an editor-approved proposal; sensitive/conflicting aliases fail closed"
+    },
+    {
+      "id": "agent-impact-graph",
+      "phrases": [
+        "哪些卡片会受影响",
+        "跨报告影响范围",
+        "共享字段图谱"
+      ],
+      "support": "agent",
+      "tool": "GET /api/reports/:reportId/copilot/impact-graph",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "bounded read-only graph is tenant-scoped; cross-dataset same-name fields are candidates only and never inferred joins"
+    },
+    {
+      "id": "agent-confidence-signal",
+      "phrases": [
+        "结果可信度",
+        "证据置信度",
+        "为什么这个结论可信"
+      ],
+      "support": "agent",
+      "tool": "typed provenance confidenceAssessment",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "bounded heuristic is explainable and explicitly non-calibrated/non-probabilistic; malformed provenance fails closed"
+    },
+    {
+      "id": "agent-provider-model-discovery",
+      "phrases": [
+        "读取可用模型",
+        "DeepSeek 模型列表",
+        "模型 ID 不确定",
+        "检查服务商模型"
+      ],
+      "support": "agent",
+      "tool": "GET /api/copilot/provider-models",
+      "permissions": [
+        "model-admin"
+      ],
+      "verification": "server-only bounded provider /models discovery returns legal model IDs without exposing API keys or silently aliasing unknown models; final Chat Completions test remains authoritative"
+    }
+  ]
+}

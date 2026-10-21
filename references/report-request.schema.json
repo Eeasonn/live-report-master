@@ -63,6 +63,10 @@
       "type": "string",
       "maxLength": 1000
     },
+    "calendar": {
+      "$ref": "#/$defs/calendar",
+      "description": "显式业务日历覆盖（缺省 Gregorian；fiscal 按 fiscalStartMonth 命名 FY 起始年）。"
+    },
     "columnRoles": {
       "type": "object",
       "additionalProperties": {
@@ -293,6 +297,9 @@
           },
           "hierarchy": {
             "type": "array"
+          },
+          "calendar": {
+            "$ref": "#/$defs/calendar"
           },
           "dimGroups": {
             "type": "array",
@@ -1208,6 +1215,26 @@
     }
   },
   "$defs": {
+    "calendar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["gregorian", "fiscal"]
+        },
+        "fiscalStartMonth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 12
+        },
+        "weekStart": {
+          "type": "integer",
+          "const": 0,
+          "description": "当前仅支持 ISO weekStart=0；非 ISO 周历必须先声明独立 calendar 规则。"
+        }
+      }
+    },
     "derivedAgg": {
       "description": "聚合级派生指标允许的聚合（formula expr / window·cum·rank·share input 共用；countd = 去重计数，与 derived_model.AGG_FNS、server SUPPORTED_AGG 同一词汇）",
       "enum": [

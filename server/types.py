@@ -61,6 +61,11 @@ class AggregateRequest:
     # 拿不到 measureTypes——占比/比率型列由客户端判定后否决进「其他」行
     # （true=可加，False=否决，None/缺省=沿用聚合方式判断，向后兼容老客户端）。
     add_mask: Optional[list] = None
+    # Agent/query safety budgets.  These are hard fail-closed limits, not
+    # semantic truncation: a request exceeding them returns an actionable
+    # error rather than silently changing Flint's grouped result.
+    max_scan_rows: Optional[int] = None
+    max_groups: Optional[int] = None
 
 
 @dataclass
@@ -77,6 +82,8 @@ class AggregateResponse:
     group_total: int = 0
     # BI-H3：本次响应合并了「其他（N 项）」尾部行时的标记（{"omitted": N}）。
     other_merged: Optional[dict[str, Any]] = None
+    # Bounded query-budget diagnostics; never includes raw rows or SQL.
+    query_budget: Optional[dict[str, Any]] = None
     elapsed_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,4 +100,6 @@ class AggregateResponse:
             out["truncatedReason"] = self.truncated_reason
         if self.other_merged:
             out["otherMerged"] = self.other_merged
+        if self.query_budget:
+            out["queryBudget"] = self.query_budget
         return out

@@ -14,6 +14,11 @@ from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any
 
+_SKILL_DIR = Path(__file__).resolve().parents[1]
+if str(_SKILL_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SKILL_DIR))
+from server.agent_extensions import BusinessCalendarError, normalize_calendar
+
 ALLOWED_ROLES = {"time", "dimension", "measure", "id", "ignore"}
 ALLOWED_PRESETS = {
     "kpi.metric", "table.aggregate", "table.detail",
@@ -287,7 +292,7 @@ def _validate_datasets(request: dict) -> tuple[list[str], str]:
     for _i, ds in enumerate(declared):
         if not isinstance(ds, dict):
             raise RequestValidationError("each dataset must be an object")
-        unknown_ds = sorted(set(ds) - {"id", "label", "file", "columnRoles", "measureTypes", "hierarchy", "derived", "role", "isDefault", "dimGroups", "primaryKey"})
+        unknown_ds = sorted(set(ds) - {"id", "label", "file", "columnRoles", "measureTypes", "hierarchy", "derived", "role", "calendar", "isDefault", "dimGroups", "primaryKey"})
         if unknown_ds:
             raise RequestValidationError(f"unsupported dataset fields: {unknown_ds}")
         # 增量合并主键（datasets[].primaryKey，2026-09-15）：形状在这里校验；
@@ -313,6 +318,11 @@ def _validate_datasets(request: dict) -> tuple[list[str], str]:
         ds_ids.append(did)
         if "label" in ds and (not isinstance(ds["label"], str) or len(ds["label"]) > 60):
             raise RequestValidationError(f"dataset {did} label must be a string of at most 60 chars")
+        if ds.get("calendar") is not None:
+            try:
+                ds["calendar"] = normalize_calendar(ds["calendar"], where=f"dataset {did}.calendar")
+            except BusinessCalendarError as exc:
+                raise RequestValidationError(str(exc)) from None
         if "file" in ds:
             # file 收数组 = 构建期同构并集（2026-09-22）：N 个同构文件并成一张
             # 表（W35+W36 补新一期），语义真源 table_input.load_table_files。
@@ -988,7 +998,7 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     # 筛选带只渲染显式声明的，编译器不再替作者做主）。
     if request.get("templateId") not in ("standard-bi-v1", "free-v1"):
         raise RequestValidationError('templateId must be "standard-bi-v1" or "free-v1"')
-    allowed_keys = {"schemaVersion", "reportId", "templateId", "title", "subtitle", "analysisGoal",
+    allowed_keys = {"schemaVersion", "reportId", "templateId", "title", "subtitle", "analysisGoal", "calendar",
                     "columnRoles", "measureTypes", "semantic_types", "facts", "kpis", "charts", "insights", "filters", "sections",
                     "texts", "kpiPosition", "anchors",
                     "style", "runtime", "source", "provenance", "_chartWarnings", "dataTable", "fieldRoles", "hierarchy",
@@ -1007,6 +1017,11 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     unknown_keys = sorted(set(request) - allowed_keys)
     if unknown_keys:
         raise RequestValidationError(f"unsupported request fields: {unknown_keys}")
+    if request.get("calendar") is not None:
+        try:
+            request["calendar"] = normalize_calendar(request["calendar"], where="calendar")
+        except BusinessCalendarError as exc:
+            raise RequestValidationError(str(exc)) from None
     if request.get("templateId") == "free-v1":
         # free 档按声明渲染，不再有骨架兜底——全空声明会产出一张白纸，这里给
         # 可行动报错而不是让模型事后对着一页空白排查。
@@ -1508,6 +1523,32 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     _kpis_max = 12 if request.get("templateId") == "free-v1" else 4
     if len(request.get("kpis") or []) > _kpis_max:
         raise RequestValidationError(f"kpis may contain at most {_kpis_max} items")
+    # KPI × 聚合级派生指标（2026-10-15）：指标卡主值不支持绑定 datasets.derived.measures
+    # 的公式/窗口节点——编译期 _compute_fact 只认真实列，求不出值会**静默丢卡**
+    # （审计全绿、页面凭空少一张 KPI，decisions.md 只留一行对不上的计数）。给出
+    # 可行动出口而不是放行到丢弃：比率走 kpi.derived:{type:'rate'}（随筛选联动）、
+    # 行级口径走计算列+average、或作者供静态 value。
+    _kpi_derived_names: set = set()
+    for _d in request.get("datasets") or []:
+        if not isinstance(_d, dict):
+            continue
+        for _n in ((_d.get("derived") or {}).get("measures") or []):
+            if isinstance(_n, dict) and _n.get("name"):
+                _kpi_derived_names.add(str(_n["name"]))
+    if _kpi_derived_names:
+        for _ki, _kpi in enumerate(request.get("kpis") or []):
+            if not isinstance(_kpi, dict):
+                continue
+            _km = next((_kpi.get(_k) for _k in ("measure", "column", "field")
+                        if isinstance(_kpi.get(_k), str)), None)
+            if _km and _km in _kpi_derived_names:
+                raise RequestValidationError(
+                    f"kpis[{_ki}]（{_kpi.get('label') or _km}）引用了聚合级派生指标 {_km!r}——"
+                    "指标卡暂不支持直接绑定派生指标，放行会被编译期静默丢弃。三个出口："
+                    "① 比率类改用 kpi.derived:{type:'rate',numerator:{datasetId,column,aggregation},"
+                    "denominator:{…}}（随筛选联动）；"
+                    "② 行级口径改声明 datasets.derived.columns 计算列并在 measureTypes 给 average；"
+                    "③ 或直接提供静态 value（筛选后不会重算）。")
     kpi_problems: list[str] = []
     # 「静态 value KPI × 交互筛选」advisory 的判定要用**谓词非空**：空 dict 形状
     # （{} 或 {"all": []}）是真值但不含任何谓词，旧判定会凭空告诫「筛选后该值
@@ -1659,33 +1700,62 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
                 raise RequestValidationError("anchor.tolerance 必须是 ≥0 的数字")
     measure_types = request.get("measureTypes") or {}
     request["measureTypes"] = _normalize_measure_types(measure_types)
-    # semantic_types productization (docs/semantic-config-enhancement.md §3): the
-    # former free-form field becomes a strict per-column measure declaration that
-    # is normalised and merged into the canonical measureTypes map (explicit
-    # measureTypes win on a column collision). Consumers that still read
-    # semantic_types (intent DSL) see the same object untouched.
+    # Flint annotations describe ALL fields, not just measures
+    # (type-registry.ts:81-151). A time/category label must remain available to
+    # the intent compiler without being forced through the numeric format map.
+    # For measure labels only, mirror the annotation into measureTypes; an
+    # explicit measureTypes declaration still wins on collision.
     semantic_types = request.get("semantic_types") or {}
     if semantic_types:
         if not isinstance(semantic_types, dict):
             raise RequestValidationError("semantic_types must be an object")
+        from semantics import flint_core as _fc
+        from semantics.type_registry import CANONICAL
+        _flint_format = {
+            "Amount": "currency", "Revenue": "currency", "Cost": "currency",
+            "Price": "price", "Percentage": "percent", "PercentageChange": "percent",
+            "Count": "count", "Duration": "duration", "Quantity": "number",
+            "Profit": "number", "Number": "number", "Score": "number",
+            "Temperature": "number", "Sentiment": "number", "Correlation": "number",
+        }
         for column, semantic in list(semantic_types.items()):
             if not isinstance(column, str):
                 raise RequestValidationError("semantic_types keys must be column names")
-            merged = None
             if isinstance(semantic, str):
                 merged = {"type": semantic}
             elif isinstance(semantic, dict):
-                unknown = set(semantic) - {"type", "aggregation", "decimals", "format"}
+                unknown = set(semantic) - {"type", "semanticType", "timeUnit", "aggregation", "decimals", "format", "unit"}
                 if unknown:
                     raise RequestValidationError(f"unsupported semantic_types fields for {column!r}: {sorted(unknown)}")
+                if semantic.get("type") and semantic.get("semanticType") and semantic["type"] != semantic["semanticType"]:
+                    raise RequestValidationError(f"semantic_types[{column!r}] type and semanticType disagree")
                 if semantic.get("format") is not None and semantic["format"] not in {"percent"}:
                     raise RequestValidationError(f"semantic_types[{column!r}].format must be 'percent'")
                 merged = dict(semantic)
+                if "semanticType" in merged:
+                    merged["type"] = merged.pop("semanticType")
             else:
                 raise RequestValidationError(f"semantic_types[{column!r}] must be a string or object")
-            # Canonicalise the type token exactly like measureTypes.
-            single = _normalize_measure_types({column: merged}, f"semantic_types[{column}].measureType")[column]
-            semantic_types[column] = single
+            label = merged.get("type")
+            flint = _fc.canonical_alias(label) if isinstance(label, str) else ""
+            entry = _fc.get_type(flint)
+            if entry and entry["aggRole"] in {"dimension", "identifier"}:
+                if merged.get("timeUnit") and entry["t0"] != "Temporal":
+                    raise RequestValidationError(f"semantic_types[{column!r}].timeUnit requires a temporal type")
+                semantic_types[column] = merged
+                continue
+            if merged.get("timeUnit"):
+                raise RequestValidationError(f"semantic_types[{column!r}].timeUnit requires a temporal type")
+            if entry and flint in _flint_format:
+                measure = dict(merged)
+                measure["type"] = _flint_format[flint]
+                measure["semantic"] = flint
+            elif isinstance(label, str) and label in CANONICAL:
+                measure = dict(merged)
+            else:
+                raise RequestValidationError(f"unknown semantic type {label!r} for {column!r}")
+            single = _normalize_measure_types({column: measure}, f"semantic_types[{column}].measureType")[column]
+            semantic_types[column] = merged
             if column not in request["measureTypes"]:
                 request["measureTypes"][column] = single
         request["semantic_types"] = semantic_types

@@ -28,9 +28,21 @@ FLINT_TYPES: dict[str, dict[str, Any]] = {
     "DateTime":   {"t0": "Temporal", "t1": "DateTime", "visEncodings": ["temporal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Date":       {"t0": "Temporal", "t1": "DateTime", "visEncodings": ["temporal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Time":       {"t0": "Temporal", "t1": "DateTime", "visEncodings": ["temporal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Timestamp":  {"t0": "Temporal", "t1": "DateTime", "visEncodings": ["temporal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
     "Year":       {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["temporal", "ordinal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "integer", "zeroBaseline": "arbitrary", "zeroPad": 0.03},
+    "Quarter":    {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["ordinal"],
+                   "aggRole": "dimension", "domainShape": "cyclic", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
     "Month":      {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["ordinal"],
                    "aggRole": "dimension", "domainShape": "cyclic", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
@@ -40,12 +52,21 @@ FLINT_TYPES: dict[str, dict[str, Any]] = {
     "Day":        {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["ordinal"],
                    "aggRole": "dimension", "domainShape": "cyclic", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Hour":       {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["ordinal"],
+                   "aggRole": "dimension", "domainShape": "cyclic", "diverging": "none",
+                   "formatClass": "integer", "zeroBaseline": "arbitrary", "zeroPad": 0},
     "YearMonth":  {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["temporal", "ordinal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "YearQuarter":{"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["temporal", "ordinal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
     "YearWeek":   {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["temporal", "ordinal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Decade":     {"t0": "Temporal", "t1": "DateGranule", "visEncodings": ["temporal", "ordinal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "integer", "zeroBaseline": "arbitrary", "zeroPad": 0.03},
     "Duration":   {"t0": "Temporal", "t1": "Duration", "visEncodings": ["quantitative"],
                    "aggRole": "additive", "domainShape": "open", "diverging": "none",
                    "formatClass": "unit-suffix", "zeroBaseline": "meaningful", "zeroPad": 0},
@@ -102,6 +123,9 @@ FLINT_TYPES: dict[str, dict[str, Any]] = {
     "Score":      {"t0": "Discrete", "t1": "Score", "visEncodings": ["quantitative", "ordinal"],
                    "aggRole": "intensive", "domainShape": "bounded", "diverging": "conditional",
                    "formatClass": "decimal", "zeroBaseline": "contextual", "zeroPad": 0.05},
+    "ID":         {"t0": "Identifier", "t1": "ID", "visEncodings": ["nominal"],
+                   "aggRole": "identifier", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "arbitrary", "zeroPad": 0},
     # Categorical
     "Category":   {"t0": "Categorical", "t1": "Entity", "visEncodings": ["nominal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
@@ -112,7 +136,40 @@ FLINT_TYPES: dict[str, dict[str, Any]] = {
     "Region":     {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Latitude":   {"t0": "Geographic", "t1": "GeoCoordinate", "visEncodings": ["quantitative", "geographic"],
+                   "aggRole": "dimension", "domainShape": "fixed", "diverging": "none",
+                   "formatClass": "decimal", "zeroBaseline": "arbitrary", "zeroPad": 0.02},
+    "Longitude":  {"t0": "Geographic", "t1": "GeoCoordinate", "visEncodings": ["quantitative", "geographic"],
+                   "aggRole": "dimension", "domainShape": "fixed", "diverging": "none",
+                   "formatClass": "decimal", "zeroBaseline": "arbitrary", "zeroPad": 0.02},
+    "Country":    {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "State":      {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "City":       {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Address":    {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "ZipCode":    {"t0": "Geographic", "t1": "GeoPlace", "visEncodings": ["nominal"],
+                   "aggRole": "identifier", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
     "Status":     {"t0": "Categorical", "t1": "Coded", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Boolean":    {"t0": "Categorical", "t1": "Coded", "visEncodings": ["nominal"],
+                   "aggRole": "dimension", "domainShape": "fixed", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Direction":  {"t0": "Categorical", "t1": "Coded", "visEncodings": ["ordinal", "nominal"],
+                   "aggRole": "dimension", "domainShape": "cyclic", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Range":      {"t0": "Categorical", "t1": "Binned", "visEncodings": ["ordinal"],
+                   "aggRole": "dimension", "domainShape": "open", "diverging": "none",
+                   "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
+    "Unknown":    {"t0": "Categorical", "t1": "Entity", "visEncodings": ["nominal"],
                    "aggRole": "dimension", "domainShape": "open", "diverging": "none",
                    "formatClass": "plain", "zeroBaseline": "none", "zeroPad": 0},
 }
@@ -149,9 +206,12 @@ def infer_vis_category(values: list[Any]) -> str:
             return True
         except (TypeError, ValueError):
             return False
-    import re
-    def looks_like_date(s):
-        return bool(re.match(r"^\d|^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", str(s).strip(), re.I))
+    # Flint semantic-types.ts:259-265 requires a *valid parsed date*, not just
+    # a digit prefix. Use this skill's sole date parser so binned strings such
+    # as "91-95" remain nominal across compile/server/runtime consumers.
+    import date_parse
+    def is_date(v):
+        return date_parse.parts(v) is not None
     def is_jsnull(v):
         try:
             return v != v  # NaN
@@ -164,7 +224,7 @@ def infer_vis_category(values: list[Any]) -> str:
         return "nominal"
     if all(is_number(v) for v in non_null):
         return "quantitative"
-    if all(looks_like_date(v) for v in non_null):
+    if all(is_date(v) for v in non_null):
         return "temporal"
     return "nominal"
 

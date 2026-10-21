@@ -30,14 +30,14 @@ import { pathToFileURL } from 'node:url';
 // serverWarm / runtimeLoaded 是就绪门，任何范围都执行、不计入 skipped。
 const CORE_CHECKS = new Set(['serverWarm', 'runtimeLoaded']);
 const PRESETS = {
-  smoke: ['serverWarm', 'runtimeLoaded', 'noApplyButton', 'perfSane', 'chart:*:painted', 'chart:*:noBadFormatters', 'textFormatBar'],
+  smoke: ['serverWarm', 'runtimeLoaded', 'noApplyButton', 'perfSane', 'touchMatrix', 'chart:*:painted', 'chart:*:noBadFormatters', 'textFormatBar'],
   charts: ['chart:*:*', 'clickDrill', 'condFormat', 'panelNoDuplicateActions'],
   derived: ['derivedConfig', 'kpiPanel', 'kpiRoundTrip'],
   dataconfig: ['derivedConfig', 'columnStats', 'hierFilter'],
   presentation: ['presentationMode', 'presTallCardNoHang', 'presPaging', 'pdfExport', 'pptxBuilds', 'pptxXmlWellFormed'],
   tables: ['detailSearchStats', 'tableColWidth', 'tableFilterPopover', 'detailToolbar', 'tableAutoHeight', 'boundedTable', 'editPolicy', 'gridCard', 'condEngine', 'subMeasures', 'sparkline', 'sessionView'],
   filters: ['filterDefaults', 'hierFilter', 'tableFilterPopover'],
-  layout: ['noBlockOverflow', 'noBlockOverflowNarrow', 'buttonRowHeights', 'toolbarConstraints', 'tableAutoHeight', 'perfSane', 'dragStripPresent', 'cardNotGrab', 'dragStripGrab', 'manualGapInvariant'],
+  layout: ['noBlockOverflow', 'noBlockOverflowNarrow', 'browserMatrix', 'touchMatrix', 'buttonRowHeights', 'toolbarConstraints', 'tableAutoHeight', 'perfSane', 'dragStripPresent', 'cardNotGrab', 'dragStripGrab', 'manualGapInvariant'],
   interact: ['textFormatBar', 'insertBI', 'insertDetail', 'seriesFormReset', 'editPolicy', 'buttonRowHeights', 'panelNoDuplicateActions', 'dragLostGuard'],
 };
 function globRe(pat) {
@@ -1285,6 +1285,95 @@ try {
   } catch (e) {
     checks.noBlockOverflowNarrow = 'skip:' + e.message;
   }
+  // ---- browser matrix: exercise the report shell at phone/tablet/desktop
+  // widths.  This is intentionally a bounded layout contract, not a claim of
+  // Safari engine parity (Safari still needs a host/browser CI lane).
+  if (!want('browserMatrix')) {
+    SKIPPED_CHECKS.push('browserMatrix');
+  } else {
+    const failures = [];
+    for (const width of [390, 768, 1024]) {
+      await command('Emulation.setDeviceMetricsOverride', {
+        width, height: 1400, deviceScaleFactor: 1, mobile: width < 600,
+      });
+      await wait(180);
+      const result = await evaluate(`(() => {
+        const width = window.innerWidth;
+        const doc = document.documentElement;
+        const body = document.body;
+        const overflow = Math.max(doc.scrollWidth, body ? body.scrollWidth : 0) - width;
+        const drawer = document.querySelector('#ai-report-copilot');
+        const drawerWidth = drawer ? Math.round(drawer.getBoundingClientRect().width) : 0;
+        return { overflow, drawerWidth };
+      })()`);
+      if (result.overflow > 12) failures.push(width + ':horizontal-overflow-' + result.overflow);
+      if (width < 600 && result.drawerWidth && result.drawerWidth < width - 8) failures.push(width + ':drawer-not-full-width');
+    }
+    await command('Emulation.clearDeviceMetricsOverride');
+    checks.browserMatrix = failures.length ? failures.slice(0, 5) : true;
+  }
+  // ---- touch matrix: emulate a coarse pointer/touch screen in Chromium.
+  // This is still not Safari/real-device parity, but it catches a distinct
+  // class of regressions that width-only checks miss: a mobile drawer that
+  // renders at the right width but has no touch capability or unusably small
+  // primary controls.  Keep the check bounded and scoped to the Copilot shell
+  // so report-specific chart controls do not create false product failures.
+  if (!want('touchMatrix')) {
+    SKIPPED_CHECKS.push('touchMatrix');
+  } else {
+    const failures = [];
+    try {
+      await command('Emulation.setDeviceMetricsOverride', {
+        width: 390, height: 844, deviceScaleFactor: 2, mobile: true,
+      });
+      await command('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 });
+      await wait(180);
+      const result = await evaluate(`(() => {
+        const root = document.querySelector('#ai-report-copilot');
+        const drawer = root && root.getBoundingClientRect();
+        const controls = root ? [...root.querySelectorAll('button,input,textarea,select')]
+          .filter((node) => getComputedStyle(node).display !== 'none') : [];
+        const smallControls = controls.filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && (rect.width < 24 || rect.height < 24);
+        }).map((node) => ({
+          tag: node.tagName,
+          label: (node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent || '').trim().slice(0, 40),
+          width: Math.round(node.getBoundingClientRect().width),
+          height: Math.round(node.getBoundingClientRect().height),
+        }));
+        return {
+          coarse: window.matchMedia('(pointer: coarse)').matches,
+          maxTouchPoints: navigator.maxTouchPoints || 0,
+          overflow: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth,
+          drawerWidth: drawer ? Math.round(drawer.width) : 0,
+          smallControls,
+        };
+      })()`);
+      if (!result.coarse || result.maxTouchPoints < 1) failures.push('touch-capability-missing');
+      if (result.overflow > 12) failures.push('horizontal-overflow-' + result.overflow);
+      if (result.drawerWidth && result.drawerWidth < 382) failures.push('drawer-not-full-width');
+      if (result.smallControls.length > 0) failures.push('controls-under-24px-' + JSON.stringify(result.smallControls).slice(0, 220));
+    } catch (error) {
+      failures.push('touch-check-error-' + String(error.message || error).slice(0, 120));
+    } finally {
+      try { await command('Emulation.setTouchEmulationEnabled', { enabled: false, maxTouchPoints: 0 }); } catch {}
+      try { await command('Emulation.clearDeviceMetricsOverride'); } catch {}
+    }
+    checks.touchMatrix = failures.length ? failures.slice(0, 5) : true;
+  }
+  checks.accessibilityMatrix = await evalIf('accessibilityMatrix', `(() => {
+    const root = document.querySelector('#ai-report-copilot');
+    if (!root) return true;
+    const bad = [];
+    root.querySelectorAll('button,input,textarea,select').forEach((node) => {
+      const label = (node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent || '').trim();
+      if (!label) bad.push(node.tagName + ':missing-label');
+      if (node.getAttribute('tabindex') === '-1' && node.matches('button,input,textarea,select')) bad.push(node.tagName + ':not-focusable');
+    });
+    if (!root.querySelector('[aria-live="polite"]')) bad.push('missing-live-status');
+    return bad.length ? bad.slice(0, 8) : true;
+  })()`);
   await command('Emulation.clearDeviceMetricsOverride');
   await wait(200);
   // ---- performance: total canvas pixels, chart count, dataset size ----
@@ -2433,9 +2522,13 @@ try {
       const until = async (fn, ms) => { const t0 = Date.now(); while (!fn()) { if (Date.now() - t0 > (ms || 9000)) return false; await new Promise((r) => setTimeout(r, 200)); } return true; };
       AIReportRuntime.setEditing(true);
       if (!await until(() => document.querySelector('.ai-report-filter-savedef'), 9000)) return 'fail:savedef-btn';
-      // 先制造一个选择：把第一个维度下拉设为非空值（若无下拉则空默认也允许存）
+      // 先制造一个选择：把第一个维度下拉设为非空值（若无下拉则空默认也允许存）。
+      // 候选项允许异步到达（2026-10-15 值域活取数兜底：mixed/h_register 路径的
+      // 选项是 renderOneFilterBar 末尾异步补的）——选项还没到就判空会假失败，
+      // 最多等 5s。
       const sel = band.querySelector('select[data-filter-column]');
       if (sel) {
+        await until(() => sel.options.length > 1, 5000);
         const optV = Array.prototype.slice.call(sel.options).find((o) => o.value !== '');
         if (optV) { sel.value = optV.value; sel.dispatchEvent(new Event('change', { bubbles: true })); await new Promise((r) => setTimeout(r, 900)); }
       }

@@ -36,7 +36,7 @@ def build_profile(fields: list[dict[str, Any]]) -> dict[str, Any]:
             ordinals.append(f)
         elif t and (fc.is_categorical(sem)):
             categoricals.append(f)
-        elif t and t["aggRole"] in fc.ADDITIVE:
+        elif t and t["aggRole"] in ("additive", "signed-additive", "intensive"):
             measures.append(f)
         else:
             # No/unknown label -> infer from data values.

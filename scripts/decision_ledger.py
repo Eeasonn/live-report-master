@@ -136,6 +136,26 @@ def build_ledger(spec: dict[str, Any], manifest: dict[str, Any], *, mode: str,
     else:
         cands = manifest.get("filterCandidates") or []
         add(f"- 交互筛选：未声明 → 筛选器卡按维度自动填充（候选 {len(cands) if cands else '≤6'} 列；可在编辑器增删）。")
+    # ---- 对账锚点（2026-10-15）：编译期硬闸的勾稽结果落账 ----
+    # spec_to_report._check_anchors 通过硬闸后把实算/声明经 manifest.quality.anchors
+    # 带出来；这里渲染成人话。手册 §2.4 承诺「实测值与锚点的比对结果记入决策清单」，
+    # 此前只有失败时报错、成功时悄无声息。
+    _anchor_checks = (manifest.get("quality") or {}).get("anchors") or []
+    if _anchor_checks:
+        add("")
+        add("## 对账锚点（构建期已勾稽）")
+        add("")
+        add("以下合计真值在构建时于物化计算列后的真实表上重算（硬闸：不符即编译失败）：")
+        add("")
+        for _a in _anchor_checks:
+            if not isinstance(_a, dict):
+                continue
+            _got = _a.get("actual")
+            _exp = _a.get("declared")
+            _got_s = f"{_got:,.10g}" if isinstance(_got, (int, float)) else str(_got)
+            _exp_s = f"{_exp:,.10g}" if isinstance(_exp, (int, float)) else str(_exp)
+            add(f"- ✅ {_a.get('label')}：{_a.get('measure')} {_a.get('aggregation') or 'sum'}"
+                f" 实算 **{_got_s}**（声明 {_exp_s}）")
     add("")
 
     # ---- 数据集级声明 vs 推断 ----

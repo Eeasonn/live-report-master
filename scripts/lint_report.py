@@ -29,6 +29,11 @@ in ``validate_report.py``; this script covers:
       column — the average is mix-driven, not a price level (2026-10-13)
   L21 Diverging-capable measure (Profit/Sentiment/...) spans its midpoint with
       no conditional format — sign is invisible (2026-10-13)
+  L22 Chart title mentions a real column name the chart never encodes
+      (dimension/breakdown/measures) — the title promises a view the data does
+      not show; likely a missing breakdown declaration or an overreaching title
+      (2026-10-15, offer-dashboard symptom: title 「各国各品牌明细」 over a
+      country-only table)
 """
 
 from __future__ import annotations
@@ -641,16 +646,24 @@ def check_measure_behaviour(chart, findings):
     measure_types = data.get("measureTypes") or {}
     measures = data.get("measures") or []
     aggregation = data.get("aggregation") or "sum"
+    per_agg = data.get("aggregations") if isinstance(data.get("aggregations"), dict) else {}
+    derived = data.get("derivedMeasures") or {}
     non_additive = [m for m in measures if _measure_non_additive_flag(measure_types.get(m))]
     if not non_additive:
         return
-    if aggregation == "sum" and vt not in ("table",):
+    # Flint aggregate.ts:48-55: each encoding owns its aggregate. A chart-level
+    # `sum` is only a legacy fallback. Aggregate-level derived nodes are
+    # evaluated *after* base aggregation (derived_eval.py); they are not raw
+    # rate columns to SUM/AVG, so L17 must not flag them at all.
+    summed = [m for m in non_additive if m not in derived
+              and (per_agg.get(m) or aggregation) == "sum"]
+    if summed and vt not in ("table",):
         findings.append(_finding(
             "L17", SEVERITY_WARN, chart["id"],
-            f"aggregation is sum for rate/percent/price measures {non_additive}; "
+            f"aggregation is sum for rate/percent/price measures {summed}; "
             "summing rates or unit prices across items is semantically meaningless.",
             "use average for rate/percent/price measures (Flint intensive → average).",
-            path="editor.data.aggregation",
+            path="editor.data.aggregations" if per_agg else "editor.data.aggregation",
         ))
     if vt == "stackedBar":
         findings.append(_finding(
@@ -750,6 +763,63 @@ def check_diverging_measure(chart, findings):
         ))
 
 
+# ---------- L22: title promises columns the chart never encodes ----------
+
+# 标题是自由文本，全链路没有第二双眼睛——模型从诉求单带入的维度词容易只落在
+# 标题、不落编码（offer 看板症状：标题「各国各品牌明细数据的聚合表格」、
+# encoding 只有国家）。本检查用**真实列名**在标题里做子串匹配：命中的列必须
+# 出现在该卡的编码槽位（dimension/dimensions/roles.cols/breakdown/measures/
+# dimensionBucket.source）之一，否则 advisory。列宇宙含派生指标名（虚拟列不在
+# editor.data.columns，在 measures 里）。子串匹配天然保守（「各品牌」含「品牌」
+# 才命中），SEVERITY_INFO——多图报告的叙事式标题可能合法引用别卡语境。
+def check_title_encoding_match(chart, findings):
+    title = str(chart.get("title") or "").strip()
+    if not title:
+        return
+    data = (chart.get("editor") or {}).get("data") or {}
+
+    def _names(value):
+        out = []
+        for c in value or []:
+            if isinstance(c, str):
+                out.append(c)
+            elif isinstance(c, dict) and c.get("name"):
+                out.append(str(c["name"]))
+        return out
+
+    encoded: set[str] = set()
+    if data.get("dimension"):
+        encoded.add(str(data["dimension"]))
+    encoded.update(_names(data.get("dimensions")))
+    roles = data.get("roles") or {}
+    encoded.update(_names(roles.get("cols")))
+    if roles.get("breakdown"):
+        encoded.add(str(roles["breakdown"]))
+    encoded.update(_names(data.get("measures")))
+    bucket = data.get("dimensionBucket") or {}
+    if bucket.get("source"):
+        encoded.add(str(bucket["source"]))
+    encoded.update(str(b) for b in (chart.get("breakdowns") or []))
+    if chart.get("breakdown"):
+        encoded.add(str(chart["breakdown"]))
+
+    universe = dict.fromkeys([*_names(data.get("columns")), *_names(data.get("measures"))])
+    unencoded = [c for c in universe
+                 if len(c) >= 2 and c in title and c not in encoded]
+    if not unencoded:
+        return
+    findings.append(_finding(
+        "L22", SEVERITY_INFO, chart.get("id"),
+        f"title mentions column(s) {unencoded} the chart never encodes "
+        "(dimension/breakdown/measures) — the title promises a view the data "
+        "does not show.",
+        "declare the missing dimension via encoding.breakdown / chart.breakdowns "
+        "(table column region) or chart.dimensions (table row region), or rewrite "
+        "the title to describe what is actually plotted.",
+        path="title",
+    ))
+
+
 # ---------- orchestration ----------
 
 class _LintHTMLParser(HTMLParser):
@@ -815,6 +885,7 @@ def lint_html(html: str, packaged: bool = False) -> tuple[list[dict[str, Any]], 
         check_measure_behaviour,
         check_price_mix_average,
         check_diverging_measure,
+        check_title_encoding_match,
     ]
     for chart in charts:
         for checker in chart_checkers:

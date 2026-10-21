@@ -10,16 +10,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# 时间格式模式
-TIME_PATTERNS = [
-    re.compile(r"^\d{4}-\d{1,2}$"),  # 2024-01
-    re.compile(r"^\d{4}/\d{1,2}$"),
-    re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$"),  # 2024-01-15
-    re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$"),
-    re.compile(r"^\d{4}Q[1-4]$"),  # 2024Q1
-    re.compile(r"^\d{4}年\d{1,2}月$"),
-    re.compile(r"^\d{4}年\d{1,2}月\d{1,2}日$"),
-]
+# 时间形态判定不再自带正则：字符串时间值一律交给 scripts/date_parse.py（ONE parser，
+# 见 _temporal_string）。旧 TIME_PATTERNS 是第二套手写正则，只认 2024-01 / 2024/01/15 /
+# 2024Q1 / 2024年1月 几种写法，漏掉周值（w35 / 2026-W35 / 第35周）、点分日期（2026.9.5）、
+# 带连字符季度（2026-Q1）——周值列被判 category 后写进 manifest 列型，server 模式运行时
+# 无行可采样只能跟着判 category，表格列维按指标降序首现乱排（2026-10-19 真机实锤）。
 
 VALID_TYPES = {"category", "measure", "time", "id"}
 
@@ -90,8 +85,15 @@ def _to_number(v: Any) -> float | None:
     return None
 
 
-def _looks_like_time(s: str) -> bool:
-    return any(p.match(s) for p in TIME_PATTERNS)
+def _temporal_string(s: str, name: str = "") -> bool:
+    """字符串形态的时间值？——走 date_parse.grain（与编译侧 _dimension_type /
+    运行时 dimensionKind 同一条规则）：day/month/quarter/week 都算；裸四位年
+    （``2024`` / ``2024年``）只在列名带年提示时算时间，否则一个批次号列会被读成年份。"""
+    import date_parse as _dp
+    g = _dp.grain(str(s).strip())
+    if g == "year":
+        return bool(re.search(r"年|年份|year", str(name or ""), re.I))
+    return g in ("day", "month", "quarter", "week")
 
 
 # Calendar-period ordinal columns: a numeric column named exactly like a period
@@ -204,8 +206,8 @@ def _infer_column_type(values: list[Any], name: str = "") -> str:
     if numeric_count == len(non_blank) or numeric_count / len(non_blank) >= 0.8:
         return "measure"
 
-    # 字符串且像时间 → time
-    if all(isinstance(v, str) and _looks_like_time(v) for v in non_blank):
+    # 字符串且像时间 → time（全部非空值都是时间形态；周值/点分/带连字符季度一并认）
+    if all(isinstance(v, str) and _temporal_string(v, name) for v in non_blank):
         return "time"
 
     # Entity/id key (name hint or high-cardinality) → id (never a dimension).

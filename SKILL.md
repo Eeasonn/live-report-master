@@ -7,18 +7,25 @@ description: Windows-first skill for turning a clean first-row-header Excel/CSV/
 
 把一张二维表（Excel/CSV/JSON）变成一份**可编辑的 BI 报告**。模型只负责「看懂数据、做分析选择」，其余（布局、ECharts、SQL、打包、审计）全部由固定脚本完成。
 
+## 服务器模式 Copilot
+
+服务器模式同时提供报告内的常驻 Copilot 入口：Skill 继续负责确定性构建，Copilot 负责报告打开后的问答、数据依据和受限图表修改。Copilot 的模型配置保存在服务器端，不进入 HTML/manifest；模型只能返回受校验的 typed action，不能直接写 DOM、SQL、ECharts option 或整份 manifest。修改先生成 proposal，服务端 apply/rollback 具备编辑口令、snapshot、hash 冲突保护，浏览器预览不等于发布。长耗时模型调用使用共享 SQLite Job 元数据 + 本进程 worker + 轮询，侧栏「停止等待」会协作式取消 provider socket 和 SQLite 查询 progress handler，回收任务并丢弃迟到结果；每项 Copilot 后台任务有 120 秒硬超时，同类后台模型任务最多并发 4 项，终态记录按数量与 10 分钟 TTL 清理；服务重启后已持久化的运行任务会如实标记 `lost`（不伪造成功）；只有 payload 明确声明 `safe-read`、`safe-export` 或全量 `idempotent-replace` 时，持有 retry token 的用户才能显式重新排队，`append`/`upsert` 和未知副作用始终要求重新发起。Agent typed plan 另有 `/copilot/plan/validate` 与 `/copilot/plan/execute`：执行器按依赖运行只读工具，proposal/写入/导出/通知停在审批点并附 provenance；证据可异步导出 JSON/CSV/Markdown，monitor 只读调度默认不通知。多轮历史按 `chartId` 在客户端与服务端双重隔离，且先过滤再取最近 6 轮；浏览器展示历史最多 80 条，异步结果按 pending 消息对象绑定，避免新对话/历史裁剪后的迟到结果覆盖新消息。完整契约见 `references/copilot-agent.md`。
+
+Agent 语义补充：业务别名必须经过 authored/manifest 或用户显式确认，推断别名不会自动生效；`calendar`/`datasets[].calendar` 只在显式声明时进入 ReportContext 与 Agent 查询，未声明不猜财年，当前 fiscal 只支持月对齐的 `fiscalStartMonth`，不把图表标签推断成业务日历。跨报告影响图谱是 viewer-scoped 的只读预览，跨数据源同名字段不是 join；证据 `confidenceAssessment` 是可解释排序信号，不是概率、授权或因果结论。模型配置页可通过 server-only `/api/copilot/provider-models` 读取 provider 自己声明的 bounded 模型列表，但不会把未知模型静默改名，最终仍须测试真实 Chat Completions。机器可读入口见 `references/capabilities.json`。
+
 ## 模型负责什么
 
 1. 阅读 `profile`，确定分析主题。
 2. 标记列角色（`time`/`dimension`/`measure`/`id`/`ignore`）和数值语义（`measureTypes` 金额/比例/计数）。未标记的列由脚本按 profile 自动推断；`id`/`ignore` 列（订单号、SKU 等实体键）不会被当作维度。profile 的 measure 列可能带 `semanticHint`（Price/Percentage/Revenue/Count…，Flint 语义标签）——这是脚本推出的语义候选，声明 `measureTypes` 时照抄它，不要凭空猜。
 3. 从白名单选 1–6 个图表：维度、指标、聚合方式、排序、TOP K。**先想这句分析要回答什么，再映射到 family**：
-   - **排名/对比** → `bar.rank`（单维度 + 1-3 指标）；占比构成 → `bar.stacked`（加 `breakdown` 看第二维，也为「A×B 计数」的交叉表）。
+   - **排名/对比** → `bar.rank`（单维度 + 1-3 指标）；占比构成 → `bar.stacked`（加 `breakdown` 看第二维，也为「A×B 计数」的交叉表）。**一句话判定**（对齐 Flint「Choosing a bar chart」的 rule of thumb，refs/flint/agent-skills/flint-chart-author/SKILL.md「Step 1」）：读「谁大谁小」→ `bar.rank`（加 `breakdown` 渲染分组柱，直接比大小）；读「部分-整体构成」→ `bar.stacked`（加 `breakdown` 渲染堆叠柱）；两维都要、卡片已多 → 降一张为 `table.aggregate` 证据表，别让报告变成一排双维柱。
    - **趋势/随时间变化** → `line.trend` / `area.trend`（需要时间或有序维度）。
    - **整体占比** → `pie.share` / `donut.share`（切片 ≤8）。
    - **阶段流转** → `funnel.stage`（≥3 有序阶段）。
    - **两个指标的关联** → `scatter.correlation`。
    - **聚合/详情证据** → `table.aggregate` / `table.detail`。
    同表别产出 3 个以上同 family 的图；数据支持（多指标→关系、时间维→趋势、多维度→交叉表）时换 family，否则报告沦为一排单调柱状图。脚本会给密集同 family 的报告打 advisory 提示。
+   **标题写发现句，不写机械式**（Flint「Write a headline」，refs/flint/agent-skills/flint-chart-author/SKILL.md:177）：标题是读者读到的第一行结论——「Q3 华南销售额反超华东」，不是「区域 销售额 对比」；`月份`、`华南` 这类名字自明其类，`1,253 万` 这类数字不自明，标题就是给数字命名业务含义的地方。数据撑不起结论（纯明细表/口径未定）才退回描述式「{指标}按{维度}」。口径四要素（指标口径/统计对象/时间窗/单位）放 `chart.annotation` 或封面副题，不塞进标题；suggest_report 的默认标题是描述式占位，写补丁时应升级为发现句（其中时间范围/榜首事实由脚本确定性算出，可放心引用）。
 4. 写 KPI（最多 4 个）、最多 3 条洞察、筛选条件。KPI 文字必须基于 profile 或脚本算出的 facts；模型可直接提供算好的 KPI 数值（脚本不再覆盖）。KPI 键兼容别名：`factType→type`、`column→measure`、`title→label`、`format→measureType`（`basis` 已废弃），写错旧键也能算出真实值而非「—」。**去重计数类 KPI**（覆盖国家数、活跃门店数、去重客户数）用脚本计算的口径：`{"type": "kpi.metric", "factType": "distinctCount", "dimension": "列"}`（`count` 恒为行数 COUNT(*)，不是去重数）。**不要硬编码 `value`**——静态 value 在用户筛选后不会重算，会与被筛选的图表矛盾；仅无筛选的报告才可直接给 value（声明了 filters 时 validate 会打 advisory）。
 5. **指标可比性审查（绑定维度前必答，Flint 聚合角色纪律）**：把指标绑到某个维度切片前，先回答「**该口径在此切片上是否仍衡量同一业务对象**」。价格/单价/评分/占比是 **intensive（强度量）**——每商品/每行的属性，只在同品类/同型号内可比：跨品类**加总**会被编译期直接拒绝（price 类型 sum 报错），跨品类**平均**虽然算得出来但没有读者（$21 手环与 $3,000 折叠屏的「国家均价」只反映品类构成，不是价格水平，lint L20 会告警）。跨品类看价格的正道：分品类切片对比、价格带/中位数分布、相对官方价的位置（折扣率/价格指数）。可加的销售额/数量/计数（additive）不受此限。
 
@@ -405,6 +412,14 @@ PPTX 导出是**按需生成**，普通 `report_build` 不生成文件。导出�
 - server manifest 不含原始 rows；图表切换经受限 API 重聚合，带防竞态渲染序号。
 - 多报告隔离：dataset id 用 `{reportId}__{datasetId}` 命名空间（如 `sales__primary`），不共用 `primary`。
 
+## Agent 执行回路（意图 → 证据 → 安全发布）
+
+1. **计划**：先读 `references/capabilities.json`，将业务要求逐项标为请求可声明或编辑器动作；未支持的请求语义必须在交付时点明，不可静默近似。读 `refs/flint/src/core/type-registry.ts:81-151` / `field-semantics.ts:421-492` 决定字段类型、轴与聚合，不凭字段名臆断口径。
+2. **编译**：写最小 `report_request.json`；混合 Revenue/Price 用 `chartSpec.encodings.y[].aggregate` 逐条决定 SUM/AVG（Flint `refs/flint/src/core/aggregate.ts:48-55`），不要设置一个图级 average 把金额改错。`chartType:auto` 会同时补维度、指标与图型；显式绑定优先。
+3. **审计/发布**：运行 `report_build.py ... --audit-required`。server/mixed 先用独立 `stg-...` 报告 ID + 数据集 ID 做全量浏览器审计，通过后才注册正式 ID、落入口页；单文件无服务端发布门。禁止传 `--audit-scope` 或 `--skip-audit` 伪装验收。最终注册目前不是事务性写入，不宣称严格原子发布。
+4. **诊断/修复**：读取 `build/build-status.json` 的 `phase/audit/diagnostics` 与 `build/browser-audit.json` 原始检查结果。`infrastructure/retry-audit` 可以重试；`data-truth/manual-review` 必须查真实数据与口径，**不可为消红自行删除检查、改指标或放宽筛选**。修复后重跑完整构建/审计，不把 scoped audit 当发布证据。
+5. **对账/交付**：检查每个点名指标、派生、筛选都在 manifest 且静态/运行时一致；同步更新真实报告文件夹与便携快照。若仍有编辑器专属步骤，明确交付缺口和操作路径。
+
 ## 测试与验收
 
 测试套件不在本 skill 目录内（skill 目录只保留运行所需文件）；它在开发仓库根部的 `tests/run_tests.py`：
@@ -434,6 +449,8 @@ node scripts\\audit_editor.mjs <report.html|server url>
 
 - 请求字段：`references/report-request.schema.json`
 - 请求词汇功能映射表（业务问法→声明键→值域→缺省，写请求前对照）：`references/authoring-feature-map.md`
+- 机器可读能力目录（业务词→请求键/编辑器动作/Agent tool→验收证据）：`references/capabilities.json`。写请求前先匹配业务词；`support=editor` 的能力不得假称已由 JSON 请求实现，必须在交付中明确手动步骤与近似形态；`support=agent` 必须绑定已注册 Tool、权限和可验证 evidence，不得只靠 prompt 宣称已支持。这个区分来自 Flint `refs/flint/src/core/aggregate.ts:5-20` 的声明/预聚合边界与 `refs/flint/src/core/pivot.ts` 的行列变换语义；编辑器现有实现见 `assets/runtime/editor-runtime.js` 的 `tblColDimsOf` / `filterScopeOf`。
+- 请求写法示例（业务一句话 → 最小合法请求片段，均可过 validate_request）：`references/authoring-examples.md`
 - 多源数据宇宙与对齐语义（已实现）：`references/multi-source-alignment.md`
 - 数据源配置（三段式：表列表 + 表与关系 + 字段配置）：`references/data-source-canvas-design.md`
 - 图表语义与白名单：`references/chart-semantics.md`、`references/chart-presets.json`

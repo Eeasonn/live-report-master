@@ -95,9 +95,29 @@ def encoding_type(semantic_type: str | None, values: list | None = None) -> str:
     """Vega/Flint encoding type: 'temporal' | 'ordinal' | 'nominal' | 'quantitative'."""
     e = _resolved_entry(semantic_type)
     if e and e["visEncodings"]:
-        return _ENC_TO_VL.get(e["visEncodings"][0], "nominal")
+        choices = e["visEncodings"]
+        observed = [v for v in (values or []) if v is not None and v != ""]
+        # Flint field-semantics.ts:446-458: dual-encoding types are decided by
+        # observed cardinality, not blindly by the registry's first candidate.
+        if observed and "quantitative" in choices and "ordinal" in choices:
+            return "ordinal" if len({str(v) for v in observed}) <= 12 else "quantitative"
+        if observed and "temporal" in choices and "ordinal" in choices:
+            return "ordinal" if len({str(v) for v in observed}) <= 6 else "temporal"
+        if observed and len(choices) == 1 and choices[0] == "quantitative":
+            if not all(_is_number(v) for v in observed):
+                return _ENC_TO_VL.get(fc.infer_vis_category(observed), "nominal")
+        return _ENC_TO_VL.get(choices[0], "nominal")
     vis = fc.infer_vis_category(values or [])
     return _ENC_TO_VL.get(vis, "nominal")
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return str(value).strip() != "" and float(value) == float(value)
+    except (TypeError, ValueError):
+        return False
 
 
 def additive(semantic_type: str | None) -> bool:

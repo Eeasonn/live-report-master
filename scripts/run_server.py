@@ -26,6 +26,7 @@ _sys.dont_write_bytecode = True
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 # Make the skill package importable when running from any cwd.
@@ -35,11 +36,58 @@ if str(SKILL_DIR) not in sys.path:
 if str(SKILL_DIR / "scripts") not in sys.path:
     sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
-from server.app import run_server                              # noqa: E402
+from server.app import dispatch_queued_job, run_server          # noqa: E402
 from server.loopback import urlopen_loopback                   # noqa: E402
 from server.registry import Registry, DEFAULT_DATA_DIR, DEFAULT_REGISTRY   # noqa: E402
 from server.store import get_engine                            # noqa: E402
 from server.template import TemplateProvider                   # noqa: E402
+
+
+def _select_engine_policy(registry, requested: str) -> tuple[bool, dict[str, object]]:
+    """Choose a startup engine from bounded workload facts.
+
+    The server owns one loaded engine, so this is a workload-class policy—not
+    unsafe per-request engine hopping.  It distinguishes interactive/local
+    reports from large scans and wide aggregate workloads, and returns the
+    reason for health/diagnostic visibility.
+    """
+    entries = registry.raw_entries()
+    total_rows = 0
+    max_rows = 0
+    max_columns = 0
+    for entry in entries:
+        manifest = entry.get("manifest") or {}
+        for dataset in manifest.get("datasets") or []:
+            if not isinstance(dataset, dict):
+                continue
+            rows = int(dataset.get("rowCount") or 0)
+            columns = dataset.get("columns") or []
+            total_rows += rows
+            max_rows = max(max_rows, rows)
+            max_columns = max(max_columns, len(columns))
+    profile = {"totalRows": total_rows, "maxRows": max_rows,
+               "maxColumns": max_columns, "reportCount": len(entries)}
+    if requested == "sqlite":
+        return False, {"requested": requested, "selected": "sqlite",
+                       "workloadClass": "interactive_local", "reason": "explicit sqlite", **profile}
+    if requested == "duckdb":
+        return True, {"requested": requested, "selected": "duckdb",
+                      "workloadClass": "explicit_scan", "reason": "explicit duckdb", **profile}
+    try:
+        import duckdb  # noqa: F401
+        duckdb_available = True
+    except ImportError:
+        duckdb_available = False
+    if not duckdb_available:
+        return False, {"requested": requested, "selected": "sqlite",
+                       "workloadClass": "interactive_local", "reason": "duckdb unavailable",
+                       **profile}
+    if max_rows >= 500_000 or (max_columns >= 32 and max_rows >= 100_000):
+        return True, {"requested": requested, "selected": "duckdb",
+                      "workloadClass": "large_scan_or_wide_aggregate",
+                      "reason": "large scan/wide aggregate workload", **profile}
+    return False, {"requested": requested, "selected": "sqlite",
+                   "workloadClass": "interactive_local", "reason": "bounded local workload", **profile}
 
 
 def _reload_all(registry: Registry, engine, verbose: bool = True) -> None:
@@ -423,8 +471,12 @@ def main() -> int:
                         help="registry file (default: ~/.ai-html-report/registry.json)")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
                         help="snapshot dir for dataset files (default: ~/.ai-html-report/data/)")
-    parser.add_argument("--engine", choices=("auto", "sqlite"), default="sqlite",
-                        help="v1 engine (SQLite only; auto is an alias)")
+    parser.add_argument("--engine", choices=("auto", "sqlite", "duckdb"), default="sqlite",
+                        help="query engine; sqlite is stable default, auto selects DuckDB for large registries when installed")
+    parser.add_argument("--worker", action="store_true",
+                        help="run as a durable queue worker instead of binding an HTTP server")
+    parser.add_argument("--worker-kinds", default="monitor",
+                        help="comma-separated durable job kinds for --worker (default: monitor)")
     parser.add_argument("--register-report", type=Path, action="append", default=None,
                         help="报告文件夹自注册（便携启动器冷启动传参；可重复）。"
                              "把 <folder>/build/manifest.json + build/data/ 注册进本机中央 registry")
@@ -461,10 +513,28 @@ def main() -> int:
             _register_report_folder(registry, _folder.expanduser(), args.port,
                                     verbose=not args.quiet)
 
-    db_path = registry.path.with_name("report.db")
-    engine = create_engine(use_duckdb=False, db_path=db_path)
+    use_duckdb, engine_policy = _select_engine_policy(registry, args.engine)
+    db_path = registry.path.with_name("report.duckdb" if use_duckdb else "report.db")
+    engine = create_engine(use_duckdb=use_duckdb, db_path=db_path)
+    engine.engine_policy = engine_policy
 
     _reload_all(registry, engine, verbose=not args.quiet)
+
+    if args.worker:
+        from server import jobs
+        jobs.configure(registry.path.parent)
+        kinds = [item.strip() for item in str(args.worker_kinds).split(",") if item.strip()]
+        print(f"[ai-report-worker] listening for kinds={kinds}")
+        try:
+            while True:
+                worked = jobs.worker_once(
+                    lambda job, progress: dispatch_queued_job(engine, registry, job, progress),
+                    kinds=kinds, lease_seconds=60)
+                if not worked:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\n[ai-report-worker] shutting down...")
+        return 0
 
     if args.pid_file:
         args.pid_file.parent.mkdir(parents=True, exist_ok=True)

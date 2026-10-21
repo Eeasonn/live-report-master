@@ -28,6 +28,7 @@
     delete k.comparePct;delete k.compareValue;delete k.compareBase;delete k.compareBaseLabel;
   });
   var adapter=global.AIReportChartAdapter,charts=new Map(),datasets=new Map(),renderVersions=new Map(),selected=null,editing=false,activeText=null;
+  var __chartViewportObserver=null;
   // Which dimension columns are shown in the report filter bar. Kept as
   // runtime state so the user can add/remove filter conditions (增减) without
   // re-deriving from manifest.filters on every render.
@@ -6314,7 +6315,57 @@
       renderCardFilterBar(chart.blockId);
     }finally{if(loadCard)setLoading(loadCard,false);}
   }
-  function renderAll(){(manifest.charts||[]).forEach(function(ch){renderChart(ch);renderCardFilterBar(ch.blockId);});(manifest.kpis||[]).forEach(function(kp,i){renderCardFilterBar('block-kpi-'+i);});}
+  function shouldLazyMountCharts(){
+    return !editing && document.body.classList.contains('ai-report-single-page')
+      && (manifest.charts||[]).length>20 && !!global.IntersectionObserver;
+  }
+  function chartNearViewport(host){
+    if(!host||!host.getBoundingClientRect)return true;
+    var r=host.getBoundingClientRect(),margin=800,h=global.innerHeight||800;
+    return r.bottom>=-margin&&r.top<=h+margin;
+  }
+  function ensureChartViewportObserver(){
+    if(__chartViewportObserver||!global.IntersectionObserver)return;
+    __chartViewportObserver=new global.IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        var chart=entry.target&&entry.target.__aiChartRef;if(!chart)return;
+        if(entry.isIntersecting||entry.intersectionRatio>0)renderChart(chart);
+        else releaseInactiveChart(chart);
+      });
+    },{root:null,rootMargin:'800px 0px',threshold:0});
+  }
+  function chartInActiveTab(chart){
+    // Split-tab mode is a real virtualization seam: only the active range is
+    // allowed to own an ECharts/table instance.  Merged single-page mode keeps
+    // every chart mounted because scrolling is continuous and the reader may
+    // jump to any card; this preserves existing DOM/a11y behavior there.
+    if(!tabsEnabled()||document.body.classList.contains('ai-report-single-page'))return true;
+    var host=document.getElementById(chart.elementId||chart.id);
+    var tab=host&&host.closest?host.closest('.grid-stack-item'):null;
+    var tabId=tab&&(tab.getAttribute('data-block-tab')||tabOfElement(tab));
+    return String(tabId||'overview')===String(__activeTab||'overview');
+  }
+  function releaseInactiveChart(chart){
+    var instance=charts.get(chart.id);
+    if(instance){try{instance.dispose();}catch(e){}charts.delete(chart.id);}
+    var host=document.getElementById(chart.elementId||chart.id);
+    if(host&&host.innerHTML)host.innerHTML='';
+  }
+  function renderAll(){
+    var lazy=shouldLazyMountCharts();
+    if(lazy)ensureChartViewportObserver();
+    else if(__chartViewportObserver){__chartViewportObserver.disconnect();__chartViewportObserver=null;}
+    (manifest.charts||[]).forEach(function(ch){
+      var host=document.getElementById(ch.elementId||ch.id);
+      if(lazy&&host){
+        host.__aiChartRef=ch;__chartViewportObserver.observe(host);
+        if(chartNearViewport(host)&&chartInActiveTab(ch))renderChart(ch);
+        else releaseInactiveChart(ch);
+      }else if(chartInActiveTab(ch)){renderChart(ch);renderCardFilterBar(ch.blockId);}
+      else releaseInactiveChart(ch);
+    });
+    (manifest.kpis||[]).forEach(function(kp,i){renderCardFilterBar('block-kpi-'+i);});
+  }
   // ---- 可编辑数据表 (多维表格/轻量 Excel 风格) ----------------
   // A data grid over the primary dataset: search + sort toolbar, add/delete row,
   // and per-cell editing that writes back to dataset.rows and re-aggregates every
@@ -9066,6 +9117,19 @@
   // 都会重建（activateTab 后的 rAF、多选配置切换等都会整条重渲染筛选条），闭包
   // 内缓存会让收窄态闪回全量，直到异步 POST 回来——必须跨渲染存活。
   var FILTER_CASCADE_CACHE={};
+  // server 值域活取数兜底（2026-10-15）的模块级缓存：mixed/h_register 多表注册
+  // 路径不烘 dataset.filterOptions（烘焙只在 serve_report._compiled_manifest 单表
+  // 路径），裸 {column} 筛选声明的下拉会只剩「全部」。拉过一次就跨重渲染存活，
+  // 与 FILTER_CASCADE_CACHE 同一条「闭包会重建、缓存必须模块级」的理由。
+  var FILTER_LIVE_VALUES={};
+  var FILTER_LIVE_PENDING={};
+  var FILTER_LIVE_GENERATION={};
+  function invalidateFilterLiveValues(datasetId){
+    var prefix=String(datasetId||'')+'\u001f';
+    Object.keys(FILTER_LIVE_VALUES).forEach(function(k){if(k.indexOf(prefix)===0)delete FILTER_LIVE_VALUES[k];});
+    Object.keys(FILTER_LIVE_PENDING).forEach(function(k){if(k.indexOf(prefix)===0)delete FILTER_LIVE_PENDING[k];});
+    FILTER_LIVE_GENERATION[datasetId]=(FILTER_LIVE_GENERATION[datasetId]||0)+1;
+  }
   function renderOneFilterBar(host){
     var inlineHost=host.querySelector('.filter-chips');
     var blockId=host.getAttribute('data-filter-block')||'block-filter';
@@ -9079,6 +9143,17 @@
     var columns=(dataset&&dataset.columns||[]).map(function(c){return typeof c==='object'?c.name:c;});
     var roles=manifest.columnRoles||{};
     var dimensionKeySet=Object.keys(manifest.dimensionKeys||{});
+    function filterValueSource(col){
+      if(!dataset)return null;
+      if(dimensionKeySet.indexOf(col)<0){return columns.indexOf(col)>=0?{dataset:dataset,column:col}:null;}
+      var group=(manifest.dimensionKeys||{})[col]||{};
+      var bindings=group.tables||[];
+      var binding=bindings.filter(function(t){return t.datasetId===dataset.id;})[0]||bindings[0];
+      if(!binding||!binding.column)return null;
+      var source=datasetById(binding.datasetId);
+      var sourceCols=(source&&source.columns||[]).map(function(c){return typeof c==='object'?c.name:c;});
+      return source&&sourceCols.indexOf(binding.column)>=0?{dataset:source,column:binding.column}:null;
+    }
     function isFilterable(c){var role=roles[c];return role? role==='dimension' : adapter.dimensionKind(dataset,c)!=='time' && !/^(id|sku|po|batch|code|no|号|批次|单号)/i.test(c);}
     // 筛选列的**控件形态**由列的角色决定（不是所有列都适合「值域下拉」）：
     //   维度 → 值域（下拉/多选）；时间列 → 日期范围；数值指标 → min–max 区间。
@@ -9135,12 +9210,25 @@
         }
       }
       columns.forEach(function(c,i){distinctMap[c]=Object.keys(sets[i]||{}).slice(0,50);});
-    }else if(dataset && dataset.filterOptions){
-      // server 模式没有行数据：编译期嵌在 dataset.filterOptions 上的截断
-      // 去重值（serve_report._compiled_manifest，cap 50 同此处的 slice）是
-      // 筛选下拉/多选菜单的选项来源，否则任何筛选器都只剩「全部」。
-      columns.forEach(function(c){var v=dataset.filterOptions[c];if(Array.isArray(v)&&v.length)distinctMap[c]=v.slice(0,50);});
+    }else if(dataset){
+      // 编译期 filterOptions 与活取缓存都可能只覆盖部分列（尤其是多表注册/
+      // 替换数据后的混合状态），逐列合并；每列仍最多 50 项。
+      columns.forEach(function(c){
+        var baked=dataset.filterOptions&&dataset.filterOptions[c];
+        if(Array.isArray(baked)&&baked.length)distinctMap[c]=baked.slice(0,50);
+        if(dataset.id){
+          var live=FILTER_LIVE_VALUES[dataset.id+'\u001f'+c];
+          if(Array.isArray(live)&&live.length&&!distinctMap[c])distinctMap[c]=live.slice(0,50);
+        }
+      });
     }
+    active.forEach(function(col){
+      if(distinctMap[col]&&distinctMap[col].length)return;
+      var source=filterValueSource(col);
+      if(!source)return;
+      var cached=FILTER_LIVE_VALUES[source.dataset.id+'\u001f'+source.column];
+      if(Array.isArray(cached)&&cached.length)distinctMap[col]=cached.slice(0,50);
+    });
     function valuesFor(col){
       var f=declared.filter(function(x){return x.column===col||x.dimensionKey===col;})[0];
       if(f&&f.value){var v=Array.isArray(f.value)?f.value:[f.value];return v.filter(Boolean);}
@@ -9291,6 +9379,7 @@
       function open(){
         close();menu=document.createElement('div');menu.className='ai-report-filter-multimenu';
         menu.setAttribute('data-filter-col-for',col);
+        menu.setAttribute('data-filter-block',blockId);
         var r=btn.getBoundingClientRect();menu.style.top=(r.bottom+4)+'px';menu.style.left=Math.max(0,Math.min(r.left, global.innerWidth-260))+'px';
         var box=document.createElement('div');box.className='ai-report-filter-multi-box';
         // R4（ux-review-round2 2026-09-25）：顶部搜索行——对齐 openScopeValuesPop 的
@@ -9634,6 +9723,57 @@
     }
     // 初次渲染也要收敛级联（保存过的筛选状态：父列有选值时子列应收窄）。
     refreshCascade();
+    // server 值域兜底（2026-10-15）：无行数据且本列既无预烘焙也无缓存时
+    // （mixed/h_register 或部分 filterOptions），异步活取一次并缓存——读者
+    // 打开即有值可选，不再只剩「全部」。只补 values 控件且无级联上级的列（级联列由
+    // refreshCascade 的 fetchFilteredValues 负责）；作者钉死的候选值（value
+    // 非空）不需要取数。原位补填不 renderAll，避免「取数→重渲→再取数」循环。
+    function fillLiveValues(){
+      if(!dataset||!dataset.id||Array.isArray(dataset.rows))return;
+      active.forEach(function(col){
+        if(filterControlKind(col)!=='values')return;
+        if(cascadeParentOf[col]&&!isDeclaredCol(col))return;
+        if(isDeclaredCol(col)&&valuesFor(col).length)return;
+        if(distinctMap[col]&&distinctMap[col].length)return;
+        var source=filterValueSource(col);
+        if(!source)return;
+        var sourceDs=source.dataset,sourceCol=source.column;
+        var key=sourceDs.id+'\u001f'+sourceCol;
+        if(FILTER_LIVE_VALUES[key]||FILTER_LIVE_PENDING[key])return;
+        var generation=FILTER_LIVE_GENERATION[sourceDs.id]||0;
+        var token={generation:generation};
+        FILTER_LIVE_PENDING[key]=token;
+        adapter.fetchFilteredValues(sourceDs.id,sourceCol,[]).then(function(vals){
+          if(FILTER_LIVE_PENDING[key]===token)delete FILTER_LIVE_PENDING[key];
+          if((FILTER_LIVE_GENERATION[sourceDs.id]||0)!==generation)return;
+          var vs=(vals||[]).filter(function(v){return v!=null&&v!=='';});
+          if(vs.length>50)vs=vs.slice(0,50);
+          FILTER_LIVE_VALUES[key]=vs;
+          if(!vs.length)return;
+          distinctMap[col]=vs.slice();
+          patchFilterColOptions(col,vs);
+        }).catch(function(){if(FILTER_LIVE_PENDING[key]===token)delete FILTER_LIVE_PENDING[key];});
+      });
+    }
+    function patchFilterColOptions(col,vals){
+      // 普通下拉与层级合并控件都用 data-filter-column 标记真实 select；
+      // 按 blockId 找当前 DOM，避免请求期间筛选卡重绘后只更新脱离文档的旧控件。
+      // 层级 select 隐藏在根 item 下，不能按列级 item 定位。
+      var liveHost=document.querySelector('.ai-report-filter[data-filter-block="'+CSS.escape(blockId)+'"]')||host;
+      var sels=liveHost.querySelectorAll('select[data-filter-column="'+CSS.escape(col)+'"]');
+      Array.prototype.forEach.call(sels,function(sel){
+        var curv=sel.value;
+        sel.textContent='';
+        var all=document.createElement('option');all.value='';all.textContent='全部';sel.appendChild(all);
+        vals.forEach(function(v){var o=document.createElement('option');o.value=String(v);o.textContent=valDisp(dataset,col,String(v));sel.appendChild(o);});
+        var has=Array.prototype.some.call(sel.options,function(o){return o.value===curv;});
+        sel.value=has?curv:'';
+        if(sel.__chipSync)sel.__chipSync();
+      });
+      var menu=document.querySelector('.ai-report-filter-multimenu[data-filter-block="'+CSS.escape(blockId)+'"][data-filter-col-for="'+CSS.escape(col)+'"]');
+      if(menu&&menu.__rebuild)menu.__rebuild();
+    }
+    fillLiveValues();
   }
   // ---- 卡片本地筛选（仅影响单个数据卡） ----------------------------------
   // 图表/数值/明细卡右上边的「筛选 ▾」：弹出该卡的筛选编辑（维度+值），写入
@@ -10190,6 +10330,7 @@
       // Merged (合并页签显示): every block visible; the tab trigger is a scroll
       // anchor to the card (or the report head for 概览).
       showAllBlocks();
+      renderAll();
       var target=tabAnchor(viewId);
       if(target&&target.scrollIntoView)target.scrollIntoView({behavior:'smooth',block:'start'});
       markActiveTab(viewId);
@@ -10198,6 +10339,9 @@
     // Split: show only this tab's range (its 页签 card up to the next card).
     hideBlocksFor(viewId);
     markActiveTab(viewId);
+    // Materialize the newly active range after releasing the old range so
+    // hidden tabs do not retain ECharts instances, table DOM, or pending work.
+    renderAll();
     // 页签栏已 sticky，内容紧贴栏底，直接滚动到顶部。
     var el=document.querySelector('[data-tab-view]')||document.documentElement;
     if(el.scrollTo)el.scrollTo({top:0,behavior:'smooth'});else el.scrollTop=0;
@@ -12003,7 +12147,7 @@
     // user understands why switching 指标处理 appears to do nothing, and point
     // them to the raw dataset.
     var preAggNote='';
-    if(!data.datasetId&&data.dimension&&(data.rows||[]).length){ 
+    if(!data.datasetId&&data.dimension&&(data.rows||[]).length){
       var _aggDimIdx=(data.columns||[]).indexOf(data.dimension);
       var _seen={},_preAgg=true;
       (data.rows||[]).forEach(function(r){var k=String(r[_aggDimIdx]??'');if(_seen[k])_preAgg=false;_seen[k]=1;});
@@ -19525,6 +19669,811 @@
     return sb;
   }
 
+  // -------------------------------------------------------------------------
+  // Server-mode report Copilot (first vertical slice)
+  // -------------------------------------------------------------------------
+  var COPILOT_VISIBLE_HISTORY_MAX=80;
+  // Presentational navigation budgets are deliberately independent from the
+  // report/data model.  This follows Flint's explicit capacity/overflow
+  // contract (refs/flint/src/core/filter-overflow.ts:9-20,139-156): a long
+  // report may be searched in memory, but the Copilot drawer never mounts an
+  // unbounded tree (or silently changes the server query semantics).
+  var COPILOT_TREE_MAX_CHAPTERS=24;
+  var COPILOT_TREE_MAX_CARDS=120;
+  var COPILOT_TREE_MAX_SEARCH_CARDS=48;
+  var COPILOT_TREE_MAX_NODES=160;
+  var COPILOT_FILTER_MAX_PREDICATES=10;
+  var COPILOT_FILTER_MAX_VALUES=40;
+  var copilotTaskTimer=null;
+  var copilotState={open:false,history:[],proposal:null,proposalCheck:null,proposalHistory:[],impactGraph:null,config:null,providerModels:[],busy:false,previewBackup:null,settingsOpen:false,cardPickerOpen:false,cardSearch:'',cardTreeExpanded:{report:true},cardTreeFocus:'',runSeq:0,activeRun:null,tasks:[],composerDraft:''};
+  function copilotTrimHistory(){if(copilotState.history.length>COPILOT_VISIBLE_HISTORY_MAX)copilotState.history.splice(0,copilotState.history.length-COPILOT_VISIBLE_HISTORY_MAX);}
+  function copilotChart(){return selected&&selected.chart?selected.chart:null;}
+  function copilotFilterDataset(chart){
+    var data=chart&&chart.editor&&chart.editor.data||{};
+    return data.datasetId?datasetById(data.datasetId):null;
+  }
+  function copilotDatasetColumns(ds){
+    return (ds&&ds.columns||[]).map(function(c){return typeof c==='object'?c.name:c;}).filter(Boolean);
+  }
+  function copilotDimensionColumn(ds,key){
+    var group=(manifest.dimensionKeys||{})[key],tables=group&&group.tables||[];
+    for(var i=0;i<tables.length;i++){
+      if(tables[i]&&tables[i].datasetId===ds.id&&copilotDatasetColumns(ds).indexOf(tables[i].column)>=0)return tables[i].column;
+    }
+    return null;
+  }
+  function copilotMapFilterItem(ds,item,path,errors){
+    if(!item||typeof item!=='object'||Array.isArray(item)){errors.push(path+' 不是 typed filter');return null;}
+    var keys=Object.keys(item);
+    if(keys.indexOf('any')>=0){
+      if(keys.length!==1||!Array.isArray(item.any)||!item.any.length||item.any.length>40){errors.push(path+' any 组无效或超限');return null;}
+      var children=item.any.map(function(child,i){return copilotMapFilterItem(ds,child,path+'.any['+i+']',errors);}).filter(Boolean);
+      return children.length?{any:children}:null;
+    }
+    if(keys.some(function(k){return ['column','dimensionKey','op','value'].indexOf(k)<0;})){
+      errors.push(path+' 含有未声明字段');return null;
+    }
+    var cols=copilotDatasetColumns(ds),col=item.column;
+    if(item.dimensionKey!=null){
+      if(col!=null){errors.push(path+' 不能同时包含 column/dimensionKey');return null;}
+      col=copilotDimensionColumn(ds,String(item.dimensionKey));
+      // A dimension key may be valid for another source table; it is not an
+      // active predicate for this card's dataset, so omit it rather than
+      // sending a virtual/unknown SQL column to the server.
+      if(!col)return null;
+    }
+    if(typeof col!=='string'||!col||cols.indexOf(col)<0){errors.push(path+' 未映射到当前数据集真实列');return null;}
+    if(Array.isArray(item.value)&&item.value.length> COPILOT_FILTER_MAX_VALUES){errors.push(path+' 值域超过 '+COPILOT_FILTER_MAX_VALUES+' 项');return null;}
+    var out={column:col,op:String(item.op||'=').toLowerCase()};
+    if(Object.prototype.hasOwnProperty.call(item,'value'))out.value=item.value;
+    return out;
+  }
+  function copilotFilterLeafCount(item){
+    return item&&Array.isArray(item.any)?item.any.reduce(function(n,x){return n+copilotFilterLeafCount(x);},0):1;
+  }
+  function copilotFilterScopes(chart){
+    var ds=copilotFilterDataset(chart),errors=[],scopes={global:[],tab:[],card:[],local:[]};
+    if(!ds)return {scopes:scopes,errors:['当前卡片没有数据集']};
+    function append(name,raw,path){
+      var list=Array.isArray(raw)?raw:((raw&&typeof raw==='object'&&('all' in raw||'any' in raw))?
+        (raw.all||[]).concat(raw.any&&raw.any.length?[{any:raw.any}]:[]):[]);
+      list.forEach(function(item,i){var mapped=copilotMapFilterItem(ds,item,path+'['+i+']',errors);if(mapped)scopes[name].push(mapped);});
+    }
+    Object.keys(global.__AI_REPORT_FILTERS__||{}).forEach(function(id){
+      var st=global.__AI_REPORT_FILTERS__[id];if(!st)return;
+      var scope=filterScopeOf(id);
+      if(scope==='global'){if(!splitMode())append('global',st.filters||[],id);}
+      else if(blockTab(id)===blockTab(chart.blockId))append('tab',st.filters||[],id);
+    });
+    append('card',cardFilterFor(chart.blockId)||[],'card');
+    // Session column filters are stored as a display-layer dictionary. Use the
+    // existing tableFilterPredicates conversion so Copilot and detail-table
+    // server requests share in/not-in/range/blank/any semantics.
+    append('local',tableFilterPredicates(sessionFiltersOf(chart)),'session');
+    var count=Object.keys(scopes).reduce(function(n,k){return n+scopes[k].reduce(function(m,x){return m+copilotFilterLeafCount(x);},0);},0);
+    if(count>COPILOT_FILTER_MAX_PREDICATES)errors.push('当前会话筛选超过 '+COPILOT_FILTER_MAX_PREDICATES+' 个条件');
+    return {scopes:scopes,errors:errors};
+  }
+  function copilotChartContextKey(chart){
+    var d=chart&&chart.editor&&chart.editor.data||{};
+    var ds=(manifest.datasets||[]).find(function(item){return item&&item.id===d.datasetId;})||{};
+    var meta=manifest.meta||{};
+    try{return JSON.stringify({id:chart&&chart.id||'',datasetId:d.datasetId||'',datasetRevision:{dataRevision:ds.dataRevision===undefined?null:ds.dataRevision,rowCount:ds.rowCount===undefined?null:ds.rowCount,dataAsOf:ds.dataAsOf||meta.dataAsOf||null},dimension:d.dimension||'',dimensions:d.dimensions||[],measures:d.measures||[],filter:d.filter||[],roles:d.roles||{},dimensionBucket:d.dimensionBucket||null,derivedMeasures:d.derivedMeasures||{},filterScopes:copilotFilterScopes(chart).scopes});}
+    catch(e){return String(chart&&chart.id||'');}
+  }
+  function copilotRequestId(){
+    try{if(global.crypto&&typeof global.crypto.randomUUID==='function')return global.crypto.randomUUID().replace(/[^A-Za-z0-9_-]/g,'');}catch(e){}
+    return 'cp-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);
+  }
+  function copilotApi(path,options){return fetch(serverApiBase()+path,Object.assign({headers:{'Content-Type':'application/json'}},options||{})).then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error((j.error&&j.error.message)||('Copilot 请求失败（'+r.status+'）'));return j;});});}
+  function copilotText(v){return v==null?'':String(v);}
+  function copilotViewLabel(v){return v==='line'?'折线图':v==='area'?'面积图':v==='stackedBar'?'堆叠柱图':v==='bar'?'柱状图':v==='table'?'表格':v==='heatmap'?'热力图':v||'图表';}
+  function copilotAggLabel(v){return v==='sum'?'求和':v==='average'?'平均':v==='count'?'计数':v==='countd'?'去重计数':v==='min'?'最小值':v==='max'?'最大值':v==='none'?'原值':v||'未声明';}
+  function copilotGrainLabel(v){return v==='raw'||!v?'原始':v==='day'?'日':v==='week'?'周':v==='month'?'月':v==='quarter'?'季':v==='year'?'年':v;}
+  function copilotCardSection(chart){
+    var sections=Array.isArray(manifest.sections)?manifest.sections:[];
+    var id=chart&&chart.section||'';
+    var direct=sections.filter(function(section){return section&&String(section.id)===String(id);})[0];
+    if(direct)return direct;
+    var chartId=chart&&chart.id;
+    var byChart=sections.filter(function(section){
+      var ids=Array.isArray(section&&section.chartIds)?section.chartIds:[];
+      return chartId&&ids.some(function(value){return String(value)===String(chartId);});
+    })[0];
+    if(byChart)return byChart;
+    var el=chart&&chart.blockId?blockElementForId(chart.blockId):null;
+    var view=el&&el.closest?el.closest('[data-tab-view]'):null;
+    var viewId=view&&view.getAttribute('data-tab-view')||'';
+    return sections.filter(function(section){return section&&String(section.id)===String(viewId);})[0]||null;
+  }
+  function copilotCardTab(chart){
+    var section=copilotCardSection(chart);
+    if(section&&section.title)return String(section.title);
+    var el=chart&&chart.blockId?blockElementForId(chart.blockId):null;
+    var view=el&&el.closest?el.closest('[data-tab-view]'):null;
+    return view&&view.getAttribute('data-tab-label')||'报告';
+  }
+  function copilotCardItems(){
+    return (manifest.charts||[]).filter(function(chart){return chart&&chart.id;}).map(function(chart){
+      var data=(chart.editor&&chart.editor.data)||{};
+      var section=copilotCardSection(chart),tab=copilotCardTab(chart);
+      var sectionId=section&&section.id||tab||'overview';
+      var sectionTitle=section&&section.title||tab||'首页';
+      var title=chart.title||chart.id;
+      return {chart:chart,title:title,view:copilotViewLabel(chart.viewType),tab:tab,sectionId:String(sectionId),sectionTitle:String(sectionTitle),
+              chapterPath:[manifest.title||'报告',String(sectionTitle)].join(' › '),dimension:data.dimension||((data.dimensions||[])[0])||'',measures:Array.isArray(data.measures)?data.measures:[]};
+    });
+  }
+  function copilotTreeNodeId(kind,id){return 'copilot-tree-'+kind+'-'+String(id||'').replace(/[^A-Za-z0-9_-]/g,'_');}
+  function copilotTreeGroups(items,query){
+    var groups=[],byId=Object.create(null),sections=Array.isArray(manifest.sections)?manifest.sections:[];
+    sections.forEach(function(section){
+      if(!section||!section.id)return;
+      var id=String(section.id);if(byId[id])return;
+      var group={id:id,title:String(section.title||id),items:[],source:true};byId[id]=group;groups.push(group);
+    });
+    var other=null;
+    (items||[]).forEach(function(item){
+      var match=!query||[item.title,item.tab,item.view,item.dimension].concat(item.measures||[]).join(' ').toLowerCase().indexOf(query)>=0;
+      if(!match)return;
+      var group=byId[item.sectionId];
+      if(!group){
+        if(!other){other={id:'__other__',title:'其他卡片',items:[],source:false};groups.push(other);}
+        group=other;
+      }
+      group.items.push(item);
+    });
+    // Search should not make an empty chapter look like a result.  In browse
+    // mode empty chapters remain visible so the report outline is honest.
+    if(query)groups=groups.filter(function(group){return group.items.length>0;});
+    return groups;
+  }
+  function copilotTreeExpanded(nodeId,defaultValue){
+    var state=copilotState.cardTreeExpanded||{};
+    return Object.prototype.hasOwnProperty.call(state,nodeId)?!!state[nodeId]:!!defaultValue;
+  }
+  function copilotTreeFocusId(currentId,rootOpen){
+    var wanted=copilotState.cardTreeFocus||currentId;
+    if(!rootOpen)return 'report';
+    return wanted||'report';
+  }
+  function copilotTreeItemHtml(node){
+    return '<button type="button" role="treeitem" tabindex="'+(node.focus?'0':'-1')+'" class="'+(node.className||'ai-cp-tree-item')+'" data-cp-action="'+escapeHtml(node.action||'toggle-card-tree-node')+'" data-cp-tree-node="'+escapeHtml(node.nodeId)+'" data-cp-tree-kind="'+escapeHtml(node.kind)+'"'+(node.cardId?' data-cp-card-id="'+escapeHtml(node.cardId)+'"':'')+' aria-level="'+String(node.level)+'"'+(node.expanded==null?'':' aria-expanded="'+String(!!node.expanded)+'"')+(node.selected==null?'':' aria-selected="'+String(!!node.selected)+'"')+(node.controls?' aria-controls="'+escapeHtml(node.controls)+'"':'')+(node.posinset?' aria-posinset="'+String(node.posinset)+'"':'')+(node.setsize?' aria-setsize="'+String(node.setsize)+'"':'')+' aria-label="'+escapeHtml(node.ariaLabel||node.label)+'">'+(node.marker||'')+'<span class="ai-cp-tree-item-main"><b>'+escapeHtml(node.label)+'</b>'+(node.detail?'<small>'+escapeHtml(node.detail)+'</small>':'')+'</span></button>';
+  }
+  function copilotCardTreeHtml(items){
+    var query=String(copilotState.cardSearch||'').trim().toLowerCase();
+    var groups=copilotTreeGroups(items,query),current=copilotChart(),currentId=current&&current.id;
+    var currentItem=(items||[]).filter(function(item){return item.chart&&item.chart.id===currentId;})[0];
+    var reportNodeId='report',rootOpen=copilotTreeExpanded(reportNodeId,true),focusId=copilotTreeFocusId(currentItem&&copilotTreeNodeId('card',currentId),rootOpen);
+    var chapterLimit=Math.min(COPILOT_TREE_MAX_CHAPTERS,groups.length),omittedGroups=Math.max(0,groups.length-chapterLimit);
+    groups=groups.slice(0,chapterLimit);
+    var renderedNodes=1,renderedCards=0,totalMatched=(groups||[]).reduce(function(n,g){return n+g.items.length;},0),maxCards=query?COPILOT_TREE_MAX_SEARCH_CARDS:COPILOT_TREE_MAX_CARDS;
+    // Search can remove the previously focused card from the visible result
+    // set.  Keep exactly one roving-tabindex entry so the tree never becomes
+    // keyboard-inert after a filter change.
+    var focusValid=focusId===reportNodeId;
+    if(!focusValid&&rootOpen){
+      groups.some(function(group,gi){
+        var chapterNodeId=copilotTreeNodeId('chapter',group.id);
+        if(focusId===chapterNodeId){focusValid=true;return true;}
+        var chapterOpen=query||copilotTreeExpanded(chapterNodeId,!!(currentItem&&currentItem.sectionId===group.id));
+        if(!chapterOpen)return false;
+        var available=Math.max(0,Math.min(group.items.length,maxCards,COPILOT_TREE_MAX_NODES-gi-3));
+        return group.items.slice(0,available).some(function(item){if(focusId===copilotTreeNodeId('card',item.chart&&item.chart.id)) {focusValid=true;return true;}return false;});
+      });
+    }
+    if(!focusValid)focusId=reportNodeId;
+    var rootGroupId='ai-cp-tree-root-group';
+    var chapterHtml=groups.map(function(group,gi){
+      var chapterNodeId=copilotTreeNodeId('chapter',group.id),chapterOpen=query||copilotTreeExpanded(chapterNodeId,!!(currentItem&&currentItem.sectionId===group.id));
+      var groupId='ai-cp-tree-group-'+String(gi),chapterFocus=focusId===chapterNodeId;
+      var chapter=copilotTreeItemHtml({nodeId:chapterNodeId,kind:'chapter',level:2,focus:chapterFocus,action:'toggle-card-tree-node',expanded:chapterOpen,controls:chapterOpen?groupId:'',label:group.title,detail:(query?'搜索结果 · ':'页签 · ')+group.items.length+' 张卡片',ariaLabel:group.title+'，'+(chapterOpen?'已展开':'已折叠'),posinset:gi+1,setsize:groups.length,marker:'<span class="ai-cp-tree-chevron" aria-hidden="true">'+(chapterOpen?'▾':'▸')+'</span>'});
+      renderedNodes+=1;
+      if(!rootOpen||!chapterOpen)return chapter+'<div id="'+groupId+'" role="group" class="ai-cp-tree-group" hidden></div>';
+      var available=Math.max(0,Math.min(group.items.length,maxCards-renderedCards,COPILOT_TREE_MAX_NODES-renderedNodes-1));
+      var cards=group.items.slice(0,available);
+      renderedCards+=cards.length;renderedNodes+=cards.length;
+      var cardHtml=cards.map(function(item,ci){
+        var cardId=item.chart&&item.chart.id||'';var nodeId=copilotTreeNodeId('card',cardId),selectedId=currentId===cardId;
+        var detail=item.chapterPath+' · '+[item.view,item.dimension].filter(Boolean).concat(item.measures&&item.measures.length?item.measures.slice(0,2).join('、'):[]).join(' · ');
+        return copilotTreeItemHtml({nodeId:nodeId,kind:'card',level:3,focus:focusId===nodeId,action:'select-card',cardId:cardId,selected:selectedId,label:item.title,detail:detail,ariaLabel:item.chapterPath+' · '+item.title,posinset:ci+1,setsize:group.items.length,marker:'<span class="ai-cp-tree-card-icon" aria-hidden="true">'+(selectedId?'●':'○')+'</span>',className:'ai-cp-tree-item ai-cp-card-option'+(selectedId?' is-active':'')});
+      }).join('');
+      var omitted=Math.max(0,group.items.length-cards.length);
+      if(omitted)cardHtml+='<div class="ai-cp-tree-overflow" role="status">已隐藏 '+omitted+' 张卡片，请继续搜索以缩小范围</div>';
+      return chapter+'<div id="'+groupId+'" role="group" class="ai-cp-tree-group">'+cardHtml+'</div>';
+    }).join('');
+    var root= copilotTreeItemHtml({nodeId:reportNodeId,kind:'report',level:1,focus:focusId===reportNodeId,action:'toggle-card-tree-node',expanded:rootOpen,controls:rootOpen?rootGroupId:'',label:manifest.title||'报告',detail:query?('搜索「'+query+'」'):((items||[]).length+' 张可交互卡片'),ariaLabel:'报告导航，'+(rootOpen?'已展开':'已折叠'),marker:'<span class="ai-cp-tree-chevron" aria-hidden="true">'+(rootOpen?'▾':'▸')+'</span>'});
+    var status=[];
+    if(omittedGroups)status.push('已隐藏 '+omittedGroups+' 个章节/页签');
+    if(query&&totalMatched>renderedCards)status.push('已显示 '+renderedCards+' / '+totalMatched+' 个搜索结果');
+    if(!query&&renderedCards<totalMatched)status.push('已显示已展开章节中的 '+renderedCards+' 张卡片');
+    if(!groups.length)status.push(query?'没有匹配的卡片':'报告暂无可交互卡片');
+    var statusHtml=status.length?'<div class="ai-cp-tree-status" role="status">'+escapeHtml(status.join(' · '))+'</div>':'';
+    return '<div class="ai-cp-tree" role="tree" aria-label="报告章节与卡片" aria-multiselectable="false" aria-busy="false">'+root+(rootOpen?'<div id="'+rootGroupId+'" role="group" class="ai-cp-tree-root-group">'+chapterHtml+'</div>':'<div id="'+rootGroupId+'" role="group" class="ai-cp-tree-root-group" hidden></div>')+'</div>'+statusHtml;
+  }
+  function copilotPickerHtml(){
+    var items=copilotCardItems();
+    return '<div class="ai-cp-card-picker" id="ai-cp-card-picker"><div class="ai-cp-card-picker-head"><strong>选择要交互的卡片</strong><small>'+items.length+' 张可用卡片 · 可展开章节/页签</small></div><input id="ai-cp-card-search" class="ai-cp-card-search" value="'+escapeHtml(copilotState.cardSearch||'')+'" placeholder="搜索标题、章节、页签、维度或指标" aria-label="搜索报告卡片"><div class="ai-cp-card-options">'+copilotCardTreeHtml(items)+'</div><small class="ai-cp-tree-help">↑↓ 移动 · ←→ 折叠/展开 · Enter 选择</small></div>';
+  }
+  function copilotFocusTreeNode(nodeId){
+    if(!nodeId)return;
+    requestAnimationFrame(function(){
+      var root=document.getElementById('ai-cp-card-picker'),node=root&&root.querySelector('[role="treeitem"][data-cp-tree-node="'+CSS.escape(nodeId)+'"]');
+      if(node&&node.focus)node.focus();
+    });
+  }
+  function copilotTreeVisibleItems(root){
+    return Array.prototype.slice.call(root.querySelectorAll('[role="treeitem"]')).filter(function(node){
+      var hidden=node.closest('[hidden]');return !hidden;
+    });
+  }
+  function copilotTreeKeydown(event){
+    var item=event.target&&event.target.closest?event.target.closest('[role="treeitem"]'):null;
+    var root=event.target&&event.target.closest?event.target.closest('[role="tree"]'):null;
+    if(!item||!root)return;
+    var key=event.key,nodes=copilotTreeVisibleItems(root),index=nodes.indexOf(item),next=null;
+    if(key==='ArrowDown'){next=nodes[Math.min(nodes.length-1,index+1)];}
+    else if(key==='ArrowUp'){next=nodes[Math.max(0,index-1)];}
+    else if(key==='Home'){next=nodes[0];}
+    else if(key==='End'){next=nodes[nodes.length-1];}
+    else if(key==='ArrowRight'){
+      if(item.getAttribute('aria-expanded')==='false'&&item.getAttribute('aria-controls')){
+        copilotAction('toggle-card-tree-node',item);return event.preventDefault();
+      }
+      next=nodes[Math.min(nodes.length-1,index+1)];
+    }else if(key==='ArrowLeft'){
+      if(item.getAttribute('aria-expanded')==='true'){
+        copilotAction('toggle-card-tree-node',item);return event.preventDefault();
+      }
+      var group=item.parentElement&&item.parentElement.closest('[role="group"]');
+      next=group&&group.previousElementSibling&&group.previousElementSibling.getAttribute&&group.previousElementSibling.getAttribute('role')==='treeitem'?group.previousElementSibling:null;
+    }else if(key==='Enter'||key===' '){
+      event.preventDefault();copilotAction(item.getAttribute('data-cp-action'),item);return;
+    }else{return;}
+    if(next&&next!==item){event.preventDefault();next.focus();}
+  }
+  function copilotSelectCard(cardId){
+    var chart=(manifest.charts||[]).find(function(item){return item&&item.id===cardId;});
+    if(!chart)return;
+    var previous=copilotChart(),switchedProposal=!!(copilotState.proposal&&copilotState.proposal.chartId&&copilotState.proposal.chartId!==cardId);
+    if(copilotState.previewBackup&&copilotState.previewBackup.chartId!==cardId)copilotRestorePreviewSilently();
+    if(copilotState.proposal&&copilotState.proposal.chartId&&copilotState.proposal.chartId!==cardId){
+      copilotState.proposal=null;
+      copilotState.proposalCheck=null;
+      copilotState.impactGraph=null;
+      copilotState.history.push({role:'assistant',content:'已切换交互卡片；之前的图表修改提案已清除，请在新卡片上重新提出修改。',chartId:cardId});
+    }
+    selected={kind:'chart',chart:chart,blockId:chart.blockId};
+    document.querySelectorAll('.ai-report-copilot-target').forEach(function(node){node.classList.remove('ai-report-copilot-target');});
+    var el=chart.blockId?blockElementForId(chart.blockId):null;
+    if(el){
+      if(editing)selectBlock(el,false);
+      el.classList.add('ai-report-copilot-target');
+      var tabId=tabOfElement(el);
+      if(tabId)activateTab(tabId);
+      setTimeout(function(){if(el.scrollIntoView)el.scrollIntoView({behavior:'smooth',block:'center'});},0);
+    }
+    if(previous&&previous.id!==chart.id&&!switchedProposal)copilotState.history.push({role:'assistant',content:'已切换交互卡片：'+(chart.title||chart.id)+'。接下来的问题将以这张卡片为准。',chartId:cardId});
+    copilotState.cardPickerOpen=false;copilotState.cardSearch='';copilotState.composerDraft='';copilotRender();
+  }
+  function copilotEvidenceHtml(e,sourceJobId,messageIndex,pageIndex){
+    if(!e||!Array.isArray(e.rows))return '';
+    var cols=Array.isArray(e.columns)?e.columns:[],rows=e.rows,pageSize=6,totalPages=Math.max(1,Math.ceil(rows.length/pageSize));
+    var page=Number.isFinite(Number(pageIndex))?Math.max(0,Math.min(totalPages-1,Number(pageIndex))):0;
+    var sample=rows.slice(page*pageSize,(page+1)*pageSize);
+    var head=cols.map(function(c){return '<th>'+escapeHtml(copilotText(c))+'</th>';}).join('');
+    var body=sample.map(function(row){return '<tr>'+cols.map(function(_,i){var v=row&&row[i];return '<td>'+escapeHtml(v==null||v===''?'—':copilotText(v))+'</td>';}).join('')+'</tr>';}).join('');
+    var note=(e.truncated?'已截断 · ':'')+'服务端返回 '+rows.length+' 组'+(totalPages>1?'，第 '+(page+1)+'/'+totalPages+' 页':'');
+    var meta=[e.datasetId,e.dimension,e.measure,e.aggregation,e.bucket,e.dataAsOf].filter(function(v){return v!==null&&v!==undefined&&v!=='';}).map(copilotText);
+    if(e.filterCount)meta.push('筛选 '+e.filterCount+' 项');
+    if(Array.isArray(e.hierarchyPath)&&e.hierarchyPath.length)meta.push('下钻路径 '+e.hierarchyPath.map(copilotText).join(' › '));
+    // Keep the chat DOM bounded (Flint's aggregate seam leaves data ownership
+    // with the caller; refs/flint/src/core/aggregate.ts:7-20).  Large complete
+    // evidence remains server-owned and is fetched through the existing Job
+    // export seam instead of mounting every row in the drawer.
+    var exportHtml=(sourceJobId&&rows.length>sample.length)
+      ?'<button type="button" class="ai-cp-retry ai-cp-evidence-export" data-cp-action="export-evidence" data-cp-job-id="'+escapeHtml(sourceJobId)+'">↓ 导出完整证据</button>':'';
+    var pageHtml=(messageIndex!=null&&totalPages>1)
+      ?'<div class="ai-cp-evidence-pages"><button type="button" data-cp-action="evidence-page" data-cp-evidence-index="'+escapeHtml(String(messageIndex))+'" data-cp-evidence-page="'+(page-1)+'"'+(page<=0?' disabled':'')+'>上一页</button><span>第 '+(page+1)+'/'+totalPages+' 页</span><button type="button" data-cp-action="evidence-page" data-cp-evidence-index="'+escapeHtml(String(messageIndex))+'" data-cp-evidence-page="'+(page+1)+'"'+(page>=totalPages-1?' disabled':'')+'>下一页</button></div>':'';
+    return '<details class="ai-cp-evidence"'+(rows.length?' open':'')+'><summary><span class="ai-cp-evidence-icon">▤</span><span>实际数据证据</span><small>'+escapeHtml(note)+'</small></summary><div class="ai-cp-evidence-meta">'+escapeHtml(meta.join(' · '))+'</div><div class="ai-cp-evidence-table-wrap"><table><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table></div>'+pageHtml+exportHtml+'</details>'+copilotProvenanceHtml(e.provenance);
+  }
+  function copilotPlanResultHtml(result,sourceJobId){
+    if(!result)return '';
+    var steps=Array.isArray(result.steps)?result.steps:[];
+    var trace=steps.slice(0,16).map(function(step,index){
+      step=step||{};
+      var status=step.status==='done'?'已完成':step.status==='needsApproval'?'待审批':step.status==='skipped'?'已跳过':step.status==='error'?'失败':step.status||'未知';
+      var e=step.evidence&&step.evidence.evidence&&Array.isArray(step.evidence.evidence.rows)?step.evidence.evidence:(step.evidence||null);
+      var detail=(step.status==='done'&&step.evidence)?copilotEvidenceHtml(e,sourceJobId)+copilotProvenanceHtml(step.provenance):'';
+      if(step.error)detail+='<div class="ai-cp-plan-step-error-detail">'+escapeHtml(copilotText(step.error))+'</div>';
+      if(!detail&&step.status==='needsApproval')detail='<div class="ai-cp-plan-step-note">该步骤需要审批，尚未执行。</div>';
+      var open=(step.status==='error'||step.status==='needsApproval')?' open':'';
+      return '<li class="ai-cp-plan-step"><details'+open+'><summary><b>'+escapeHtml(step.tool||step.id||('步骤 '+(index+1)))+'</b><span class="ai-cp-plan-step-status ai-cp-plan-step-'+escapeHtml(step.status||'unknown')+'">'+escapeHtml(status)+'</span></summary>'+detail+'</details></li>';
+    }).join('');
+    if(steps.length>16)trace+='<li class="ai-cp-plan-step-note">其余步骤已折叠（共 '+escapeHtml(String(steps.length))+' 步）。</li>';
+    return '<section class="ai-cp-plan-result"><div class="ai-cp-plan-head"><strong>执行轨迹</strong><small>'+escapeHtml(result.status||'')+' · '+escapeHtml(String(result.elapsedMs||0))+'ms</small></div><ol>'+trace+'</ol></section>';
+  }
+  function copilotPlanPreviewHtml(preview){
+    if(!Array.isArray(preview)||!preview.length)return '';
+    function previewValue(value){
+      if(value===null||value===undefined||value==='')return '—';
+      if(Array.isArray(value))return value.slice(0,6).map(function(item){return copilotText(item);}).join('、')+(value.length>6?' …（共 '+value.length+' 项）':'');
+      if(typeof value==='object')return Object.keys(value).slice(0,5).map(function(key){return key+'：'+copilotText(value[key]);}).join(' · ')+(Object.keys(value).length>5?' …':'');
+      return copilotText(value);
+    }
+    function proposalPreviewHtml(check){
+      if(!check)return '';
+      if(check.valid===false)return '<div class="ai-cp-plan-impact ai-cp-plan-impact-error">无法生成服务端影响预览：'+escapeHtml(copilotText(check.error||'提案校验失败'))+'</div>';
+      var diff=check.diff&&typeof check.diff==='object'?check.diff:{};
+      var diffRows=Object.keys(diff).slice(0,12).map(function(key){
+        var item=diff[key]||{};
+        return '<li><b>'+escapeHtml(copilotText(key))+'</b><span>'+escapeHtml(previewValue(item.before))+'</span><i aria-hidden="true">→</i><strong>'+escapeHtml(previewValue(item.after))+'</strong></li>';
+      }).join('');
+      var impact=check.impact&&typeof check.impact==='object'?check.impact:{};
+      var siblings=Array.isArray(impact.siblingCharts)?impact.siblingCharts.slice(0,8):[];
+      var siblingText=siblings.map(function(item){
+        var shared=Array.isArray(item.sharedFields)&&item.sharedFields.length?' · 共享 '+item.sharedFields.slice(0,4).join('、'):'';
+        return '<li><span>'+escapeHtml(copilotText(item.title||item.chartId||'未命名卡片'))+'</span><small>'+escapeHtml(shared)+'</small></li>';
+      }).join('');
+      var rows=diffRows||'<li class="ai-cp-plan-impact-empty">服务端判断：没有字段变化</li>';
+      var affected=Number(impact.affectedChartCount)||1;
+      return '<details class="ai-cp-plan-impact"><summary>查看变更与影响 <small>约 '+affected+' 张图表</small></summary><div class="ai-cp-plan-impact-count">目标卡片 '+escapeHtml(copilotText(impact.targetChartId||'当前卡片'))+' · 预计影响 '+escapeHtml(String(affected))+' 张相关图表</div><ul class="ai-cp-plan-impact-diff">'+rows+'</ul>'+(siblingText?'<div class="ai-cp-plan-impact-label">共享字段的关联卡片</div><ul class="ai-cp-plan-impact-siblings">'+siblingText+'</ul>':'')+'</details>';
+    }
+    var rows=preview.map(function(item){
+      var checks=[];
+      if(item.proposal)checks.push(item.proposal);
+      if(Array.isArray(item.proposals))checks=checks.concat(item.proposals.slice(0,8));
+      var invalid=item.valid===false||checks.some(function(check){return check&&check.valid===false;});
+      var impactCount=checks.reduce(function(sum,check){return sum+(Number(check&&check.impact&&check.impact.affectedChartCount)||0);},0);
+      var detail=item.error||(invalid?'存在无法校验的提案':(!checks.length?'只读步骤，无写入影响':('预计影响 '+String(impactCount||1)+' 张图表')));
+      var status=invalid?'无法预览':(item.requiresApproval?'待审批':'只读');
+      var details=checks.map(proposalPreviewHtml).join('');
+      return '<li class="ai-cp-plan-preview-row"><div><b>'+escapeHtml(item.stepId||item.tool||'步骤')+'</b><span>'+escapeHtml(status)+' · '+escapeHtml(detail)+'</span></div>'+details+'</li>';
+    }).join('');
+    return '<details class="ai-cp-plan-preview"><summary>执行前影响预览</summary><ul>'+rows+'</ul></details>';
+  }
+  function copilotProvenanceHtml(provenance){
+    if(!provenance)return '';
+    var confidence=provenance.confidence||{};
+    var level=confidence.level||provenance.classification||'unknown';
+    var levelLabel=level==='observed'?'已观测':level==='bounded'?'有界结果':level==='derived'?'规则推导':'未分类';
+    var items=[];
+    var assessment=provenance.confidenceAssessment||{};
+    if(typeof assessment.score==='number'&&isFinite(assessment.score)){
+      var scoreLabel=assessment.label==='high'?'高':assessment.label==='medium'?'中':assessment.label==='low'?'低':'不足';
+      items.push('<li><b>证据评分</b><span>'+escapeHtml(scoreLabel+' · '+Math.round(assessment.score*100)+'%（可解释排序信号，非概率）')+'</span></li>');
+    }
+    if(confidence.basis)items.push('<li><b>依据</b><span>'+escapeHtml(copilotText(confidence.basis))+'</span></li>');
+    (Array.isArray(provenance.assumptions)?provenance.assumptions:[]).slice(0,4).forEach(function(item){items.push('<li><b>假设</b><span>'+escapeHtml(copilotText(item))+'</span></li>');});
+    (Array.isArray(provenance.limitations)?provenance.limitations:[]).slice(0,4).forEach(function(item){items.push('<li><b>限制</b><span>'+escapeHtml(copilotText(item))+'</span></li>');});
+    var inference=provenance.inference||{};
+    if(inference.modelRole){
+      var modelNote=inference.modelRole==='scenario_input'?'模型/用户只提供虚拟情景输入，数值未被观测':'模型只选择已校验的工具与参数，数值来自服务端';
+      items.push('<li><b>模型边界</b><span>'+escapeHtml(modelNote)+'</span></li>');
+    }
+    if(provenance.causalClaim===false)items.push('<li><b>因果</b><span>未作因果声明</span></li>');
+    var refs=Array.isArray(provenance.semanticReferences)?provenance.semanticReferences.slice(0,3):[];
+    if(refs.length)items.push('<li><b>语义依据</b><span>'+escapeHtml(refs.join(' · '))+'</span></li>');
+    if(!items.length)return '';
+    return '<details class="ai-cp-provenance"><summary>证据口径 · '+escapeHtml(levelLabel)+'</summary><ul>'+items.join('')+'</ul></details>';
+  }
+  function copilotTasksHtml(){
+    var tasks=Array.isArray(copilotState.tasks)?copilotState.tasks:[];
+    if(!tasks.length)return '';
+    var rows=tasks.slice(0,12).map(function(task){
+      var status=task.status==='done'?'完成':task.status==='running'?'执行中':task.status==='cancelled'?'已取消':task.status==='error'?'失败':task.status==='lost'?'丢失':task.status||'排队';
+      var active=task.status==='running'||task.status==='queued';
+      var action=active
+        ?'<button type="button" class="ai-cp-task-cancel" data-cp-action="cancel-task" data-cp-job-id="'+escapeHtml(task.id||'')+'" data-cp-retry-token="'+escapeHtml(task.retryToken||'')+'">取消</button>'
+        :(task.status==='lost'&&task.canRecover
+          ?'<button type="button" class="ai-cp-task-cancel" data-cp-action="recover-task" data-cp-job-id="'+escapeHtml(task.id||'')+'" data-cp-retry-token="'+escapeHtml(task.retryToken||'')+'">安全重试</button>'
+          :'');
+      return '<li><span class="ai-cp-task-main"><b>'+escapeHtml(task.kind||'Agent')+'</b><small>'+escapeHtml(task.datasetId||'报告')+' · '+escapeHtml(task.phase||status)+'</small></span><span class="ai-cp-task-status">'+escapeHtml(status)+'</span>'+action+'</li>';
+    }).join('');
+    return '<details class="ai-cp-tasks"><summary>后台任务 <small>'+tasks.length+' 项</small></summary><ul>'+rows+'</ul></details>';
+  }
+  function copilotProposalHistoryHtml(){
+    var items=Array.isArray(copilotState.proposalHistory)?copilotState.proposalHistory:[];
+    if(!items.length)return '';
+    var rows=items.slice(0,16).map(function(item){
+      var stamp=item.createdAt?new Date(Number(item.createdAt)*1000).toLocaleString():'历史操作';
+      var step=item.step?'第 '+escapeHtml(String(item.step))+' 步 · ':'';
+      var canRollback=item.canRollback!==false;
+      var action=canRollback
+        ?'<button type="button" class="ai-cp-task-cancel" data-cp-action="rollback-history" data-cp-snapshot="'+escapeHtml(item.snapshotId||'')+'">回滚</button>'
+        :'<button type="button" class="ai-cp-task-cancel" disabled title="请先回滚更新的步骤">等待前一步</button>';
+      return '<li><span class="ai-cp-task-main"><b>'+step+escapeHtml(stamp)+'</b><small>'+escapeHtml(String(item.snapshotId||'').slice(0,24))+(item.canRedo?' · 可重做':'')+'</small></span>'+action+'</li>';
+    }).join('');
+    return '<details class="ai-cp-tasks ai-cp-proposal-history"><summary>修改历史 <small>'+items.length+' 项</small></summary><ul>'+rows+'</ul></details>';
+  }
+  function copilotProposalDiffHtml(check){
+    if(!check||!check.diff)return '';
+    // The browser renders only the server-owned diff/impact metadata.  It
+    // must not infer aggregation legality or discover additional affected
+    // cards locally; Flint keeps that semantic decision at the caller-owned
+    // aggregate boundary (refs/flint/src/core/aggregate.ts:7-20).
+    function diffLabel(key){return ({chartId:'目标卡片',datasetId:'数据源',dimension:'维度',dimensions:'维度序列',measures:'指标',aggregations:'指标聚合',breakdown:'展开维度',dimensionBucket:'时间分桶',viewType:'图表类型',topN:'TOP-N',filter:'卡片筛选'})[key]||key;}
+    function diffValue(value,key){
+      if(value===null||value===undefined||value==='')return '—';
+      if(key==='aggregations'&&value&&typeof value==='object'&&!Array.isArray(value)){
+        var aggs=Object.keys(value).slice(0,12).map(function(name){return escapeHtml(name)+'：'+escapeHtml(copilotAggLabel(value[name]));});
+        return aggs.length?aggs.join(' · '):'未声明';
+      }
+      if(key==='filter'&&Array.isArray(value))return escapeHtml(String(value.length))+' 项筛选';
+      if(key==='dimensionBucket'&&value&&typeof value==='object')return escapeHtml(copilotGrainLabel(value.bucket||'raw'));
+      if(Array.isArray(value))return escapeHtml(value.slice(0,8).map(function(item){return copilotText(item);}).join('、'))+(value.length>8?' …（共 '+value.length+' 项）':'');
+      if(typeof value==='object')return escapeHtml(Object.keys(value).slice(0,6).map(function(name){return name+':'+copilotText(value[name]);}).join(' · '));
+      return escapeHtml(copilotText(value));
+    }
+    var diffKeys=Object.keys(check.diff).slice(0,24);
+    var items=diffKeys.map(function(key){
+      var d=check.diff[key]||{};
+      return '<li class="ai-cp-diff-row"><b>'+escapeHtml(diffLabel(key))+'</b><span class="ai-cp-diff-before">'+diffValue(d.before,key)+'</span><span class="ai-cp-diff-arrow" aria-hidden="true">→</span><span class="ai-cp-diff-after">'+diffValue(d.after,key)+'</span></li>';
+    }).join('');
+    if(!items)items='<li class="ai-cp-diff-empty">服务端判断：没有有效变化</li>';
+    var impact=check.impact||{},siblings=Array.isArray(impact.siblingCharts)?impact.siblingCharts.slice(0,8):[],tx=check.transaction||{};
+    var scope=tx.crossDataset?'跨数据源事务 · '+(tx.sourceCount||2)+' 个数据源':'同一数据源事务';
+    var approval=check.requiresApproval===false?'无需审批':'需要编辑审批';
+    var affectedCharts=Array.isArray(tx.affectedCharts)?tx.affectedCharts.slice(0,8):[];
+    var impactRows=(affectedCharts.length?affectedCharts:siblings).map(function(item){
+      var fields=item.changedFields||item.sharedFields||[];
+      var fieldText=Array.isArray(fields)&&fields.length?' · '+fields.slice(0,4).map(copilotText).join('、'):'';
+      var datasetText=item.datasetId?' · 数据源 '+copilotText(item.datasetId):'';
+      return '<li><span>'+escapeHtml(copilotText(item.title||item.chartId||'未命名卡片'))+'</span><small>'+escapeHtml(datasetText+fieldText)+'</small></li>';
+    }).join('');
+    var warnings=Array.isArray(check.warnings)?check.warnings.slice(0,4):[];
+    var warningHtml=warnings.length?'<div class="ai-cp-impact-warning"><b>校验提示</b><ul>'+warnings.map(function(item){return '<li>'+escapeHtml(copilotText(item))+'</li>';}).join('')+'</ul></div>':'';
+    var graph=copilotState.impactGraph&&typeof copilotState.impactGraph==='object'?copilotState.impactGraph:null;
+    var graphRows=graph&&Array.isArray(graph.affectedCards)?graph.affectedCards.slice(0,8).map(function(item){return '<li><span>'+escapeHtml(copilotText(item.reportId||''))+' / '+escapeHtml(copilotText(item.chartId||''))+'</span><small>'+escapeHtml((item.sharedFields||[]).slice(0,4).map(copilotText).join('、'))+'</small></li>';}).join(''):'';
+    var graphHtml=graph?'<div class="ai-cp-impact-graph"><b>跨报告影响图谱</b><span>只读 · '+escapeHtml(String(graph.affectedChartCount||0))+' 张受影响卡片</span>'+(graphRows?'<ul>'+graphRows+'</ul>':'<small>当前租户没有更多共享字段卡片</small>')+(graph.truncation&&graph.truncation.truncated?'<small>图谱已按服务端上限截断</small>':'')+'</div>':'';
+    var graphButton=isServerMode()?'<button type="button" class="ai-cp-retry ai-cp-impact-graph-btn" data-cp-action="impact-graph">'+(graph?'刷新跨报告影响图':'查看跨报告影响图')+'</button>':'';
+    var impactHtml='<div class="ai-cp-impact-summary"><span>预计影响 '+escapeHtml(String(impact.affectedChartCount||1))+' 张相关图表</span><span>'+escapeHtml(scope)+'</span><span>'+escapeHtml(approval)+'</span>'+(siblings.length?'<small>共享字段：'+escapeHtml(siblings.slice(0,4).map(function(item){return item.title||item.chartId;}).join('、'))+(siblings.length>4?' 等':'')+'</small>':'')+'</div>'+(impactRows?'<div class="ai-cp-impact-list"><b>影响明细</b><ul>'+impactRows+'</ul></div>':'')+warningHtml+graphButton+graphHtml;
+    return '<details class="ai-cp-proposal-diff" open><summary>服务端校验的修改明细 <small>'+escapeHtml(check.proposalId?check.proposalId.slice(0,10):'')+'</small></summary>'+impactHtml+'<ul>'+items+'</ul></details>';
+  }
+  function copilotFollowupHtml(message){
+    var e=message&&message.evidence||null;
+    if(!e&&message&&message.planResult){
+      var done=(message.planResult.steps||[]).filter(function(step){return step&&step.status==='done'&&step.evidence;});
+      e=done.length?(done[done.length-1].evidence.evidence||done[done.length-1].evidence):null;
+    }
+    var dim=e&&e.dimension?String(Array.isArray(e.dimension)?e.dimension[0]:e.dimension):'';
+    var measure=e&&e.measure?String(e.measure):'';
+    var questions=[measure?'为什么「'+measure+'」会得到这个结果？':'为什么是这个结果？',
+                   dim?'按「'+dim+'」换一个聚合口径再看':'换一个聚合口径再看',
+                   dim?'按「'+dim+'」继续下钻':'继续下钻'];
+    if(e&&e.truncated)questions.push('导出完整证据再核对');
+    return '<div class="ai-cp-followups">'+questions.slice(0,4).map(function(q,i){return '<button type="button" data-cp-action="followup" data-cp-followup="'+escapeHtml(q)+'">'+(i===0?'为什么？':i===1?'换口径':i===2?'继续下钻':'完整证据')+'</button>';}).join('')+'</div>';
+  }
+  function copilotMessageHtml(m,index){
+    var user=m.role==='user',pending=m.pending;
+    var plan=m.plan,planHtml=plan&&Array.isArray(plan.steps)?'<section class="ai-cp-plan"><div class="ai-cp-plan-head"><strong>分析计划</strong><small>'+(plan.steps.length)+' 步'+(m.requiresApproval?' · 含审批':'')+'</small></div><ol>'+plan.steps.map(function(step){return '<li><b>'+escapeHtml(step.tool||step.id||'步骤')+'</b><span>'+escapeHtml(step.requiresApproval?'需要确认':'可自动执行')+'</span></li>';}).join('')+'</ol><small class="ai-cp-plan-end">完成条件：'+escapeHtml(plan.termination||'取得可验证证据')+'</small>'+copilotPlanPreviewHtml(m.planPreview)+(m.planResult?copilotPlanResultHtml(m.planResult,m.jobId):'<button type="button" class="ai-cp-plan-run" data-cp-action="execute-plan" data-cp-plan-index="'+index+'"'+(m.planExecuting?' disabled':'')+'>'+escapeHtml(m.planExecuting?'正在执行…':(m.requiresApproval?'执行可读步骤（审批项暂不执行）':'执行分析计划'))+'</button>')+'</section>':'';
+    var followup=!user&&!pending&&(m.evidence||m.planResult)?copilotFollowupHtml(m):'';
+    return '<div class="ai-cp-message '+(user?'is-user':'is-assistant')+(pending?' is-pending':'')+(m.stale?' is-stale':'')+'"><div class="ai-cp-avatar">'+(user?'你':'✦')+'</div><div class="ai-cp-message-main"><div class="ai-cp-message-label">'+(user?'你':'报告 Copilot')+'</div>'+(m.contextTitle&&!user?'<div class="ai-cp-message-context">针对卡片 · '+escapeHtml(m.contextTitle)+'</div>':'')+'<div class="ai-cp-msg">'+escapeHtml(m.content||'')+'</div>'+planHtml+copilotEvidenceHtml(m.evidence,m.jobId,index,m.evidencePage)+followup+(m.retry?'<button class="ai-cp-retry" data-cp-action="retry" data-cp-retry-index="'+index+'">↻ 重试本次查询</button>':'')+(m.rollbackSnapshot?'<button class="ai-cp-retry" data-cp-action="rollback" data-cp-snapshot="'+escapeHtml(m.rollbackSnapshot)+'">↶ 回滚本次服务端修改</button>':'')+(m.redoSnapshot?'<button class="ai-cp-retry" data-cp-action="redo" data-cp-snapshot="'+escapeHtml(m.redoSnapshot)+'">↷ 重做本次服务端修改</button>':'')+'</div></div>';
+  }
+  // 主入口聚焦“语义改图”而不是泛问答：Flint 将字段身份与 channel/visual
+  // 决策分离（refs/flint/src/core/field-semantics.ts:138-150），pivot 也把
+  // 视图变体建模为可预览的 channel permutation（refs/flint/src/core/pivot.ts:5-15）。
+  function copilotEmptyHtml(cfg){
+    var ready=!!cfg.configured,hasCard=!!copilotChart();
+    var editAction=hasCard?'prompt':'toggle-card-picker';
+    var editPrompt='请帮我修改当前图表：先给我可选修改方案，暂不应用。';
+    var heading=hasCard?'用 Agent 修改当前图表':'用 Agent 修改报告图表';
+    var intro=hasCard?(ready?'描述你想调整的维度、指标、分组或图表类型，Agent 会先给出方案。':'先配置模型，再开始修改当前图表。'):(ready?'先选择一张具体图表，再让 Agent 提出可预览、可确认的修改方案。':'先配置模型并选择一张具体图表，再开始修改。');
+    return '<div class="ai-cp-empty ai-cp-empty-edit"><div class="ai-cp-orb">✦</div><h3>'+heading+'</h3><p>'+intro+'</p><button class="ai-cp-edit-hero" data-cp-action="'+editAction+'"'+(hasCard?' data-cp-prompt="'+escapeHtml(editPrompt)+'"':'')+'><span class="ai-cp-edit-hero-icon">↗</span><span><b>'+(hasCard?'开始修改当前图表':'选择图表后开始修改')+'</b><small>先预览，再确认应用；原始数据不会被修改</small></span></button><button class="ai-cp-empty-select" data-cp-action="toggle-card-picker"><span>▣</span>浏览并选择具体报告卡片</button><div class="ai-cp-suggestions"><button data-cp-action="prompt" data-cp-prompt="按当前筛选，哪个区域的 Sell In 最大？"><span>⌁</span>找出当前筛选下的重点</button><button data-cp-action="prompt" data-cp-prompt="请解释当前图表的指标口径。"><span>?</span>解释当前图表口径</button></div></div>';
+  }
+  function copilotRender(){
+    var el=document.getElementById('ai-report-copilot');if(!el)return;
+    if(!isServerMode()){el.style.display='none';return;}
+    var ch=copilotChart(), data=ch&&ch.editor&&ch.editor.data||{};
+    var title=ch&&ch.title||'未选择图表';
+    var contextTrail=[manifest.title||'报告',copilotCardTab(ch),title].filter(Boolean).join(' › ');
+    var contextMeasures=Array.isArray(data.measures)&&data.measures.length?data.measures.join('、'):'未设置';
+    var contextAgg=copilotAggLabel(data.aggregation||((data.aggregations||{})[data.measures&&data.measures[0]])||'sum');
+    var contextGrain=copilotGrainLabel(data.dimensionBucket&&data.dimensionBucket.bucket);
+    var contextScope=(Array.isArray(data.filter)?data.filter.length:(data.filter&&data.filter.all?data.filter.all.length:0));
+    var cfg=copilotState.config||{};
+    // Keep the full transcript in state for context isolation/retry, but only
+    // mount a bounded tail into the DOM.  Long sessions therefore do not turn
+    // every previous evidence table into a permanent layout/paint cost.
+    var historyStart=Math.max(0,copilotState.history.length-40);
+    var msgs=copilotState.history.slice(historyStart).map(function(item,i){return copilotMessageHtml(item,i+historyStart);}).join('');
+    var proposal=copilotState.proposal;
+    var propHtml=proposal?('<section class="ai-cp-proposal"><div class="ai-cp-card-kicker"><span class="ai-cp-step-dot">2</span>建议的图表修改</div><div class="ai-cp-proposal-title">'+escapeHtml(proposal.viewType==='line'?'折线图':proposal.viewType==='area'?'面积图':proposal.viewType==='stackedBar'?'堆叠柱图':'柱状图')+'</div><div class="ai-cp-proposal-grid"><span>维度<b>'+escapeHtml(proposal.dimension)+'</b></span><span>指标<b>'+escapeHtml(proposal.measure)+'</b></span>'+(proposal.breakdown?'<span>展开<b>'+escapeHtml(proposal.breakdown)+'</b></span>':'')+(proposal.topN?'<span>成员<b>TOP '+escapeHtml(proposal.topN)+'</b></span>':'')+(proposal.bucket&&proposal.bucket!=='raw'?'<span>分桶<b>'+escapeHtml(proposal.bucket)+'</b></span>':'')+'</div>'+copilotProposalDiffHtml(copilotState.proposalCheck)+'<div class="ai-cp-actions"><button class="ai-cp-secondary" data-cp-action="'+(copilotState.previewBackup?'undo-preview':'preview')+'">'+(copilotState.previewBackup?'撤销预览':'预览修改')+'</button><button class="ai-cp-primary" data-cp-action="apply">确认应用</button></div><small class="ai-cp-card-note">先预览，再应用；原始数据不会被修改。</small></section>'):'';
+    var status=cfg.configured?'<span class="ai-cp-status-dot ready"></span>已连接':'<span class="ai-cp-status-dot"></span>未配置';
+    var runStatus=copilotState.busy?'<div class="ai-cp-run-status" role="status" aria-live="polite"><span class="ai-cp-spinner"></span><span>正在读取报告语义并查询服务端</span><small>后台任务</small><button type="button" class="ai-cp-stop" data-cp-action="detach">停止等待</button></div>':'';
+    var settingsStatus=el.dataset.cpStatus||'';
+    var providerModels=(copilotState.providerModels||[]).slice(0,24);
+    var providerModelsHtml=providerModels.length?'<div class="ai-cp-provider-models" aria-label="服务商可用模型">'+providerModels.map(function(item){return '<button type="button" data-cp-action="choose-provider-model" data-cp-model="'+escapeHtml(item.id||'')+'">'+escapeHtml(item.id||'')+'</button>';}).join('')+'</div>':'';
+    var settingsHtml='<div class="ai-cp-settings" data-open="'+String(copilotState.settingsOpen)+'"><div class="ai-cp-settings-head"><div><strong>Agent 模型设置</strong><span>服务器端保存，报告数据不随配置页发送</span></div><button class="ai-cp-icon" data-cp-action="settings" aria-label="关闭设置">×</button></div><div class="ai-cp-provider-hint"><span>推荐 DeepSeek</span><span><button data-cp-action="preset-deepseek">填入 DeepSeek</button><button data-cp-action="load-provider-models">读取可用模型</button></span></div>'+providerModelsHtml+'<label for="ai-cp-model-input">模型 ID</label><input id="ai-cp-model-input" aria-label="模型 ID" value="'+escapeHtml(cfg.model||'')+'" placeholder="例如 deepseek-flash"><label for="ai-cp-mode-input">Agent 模式</label><select id="ai-cp-mode-input" aria-label="Agent 模式"><option value="fast" '+(cfg.agentMode==='fast'?'selected':'')+'>快速 · 低延迟</option><option value="balanced" '+((cfg.agentMode||'balanced')==='balanced'?'selected':'')+'>平衡 · 推荐</option><option value="deep" '+(cfg.agentMode==='deep'?'selected':'')+'>深度 · 先核对口径</option></select><label for="ai-cp-url-input">API 地址</label><input id="ai-cp-url-input" aria-label="API 地址" value="'+escapeHtml(cfg.baseUrl||'https://api.openai.com/v1')+'" placeholder="https://api.deepseek.com"><small class="ai-cp-field-help">填写服务商基础地址，不要附加密钥；系统会自动调用 /chat/completions。</small><label for="ai-cp-key-input">API Key</label><input id="ai-cp-key-input" aria-label="API Key" type="password" placeholder="'+(cfg.hasKey?'已配置，留空保持不变':'sk-…')+'"><small class="ai-cp-field-help">仅保存于本机服务器，不会展示给报告访问者。</small><div class="ai-cp-settings-actions"><button class="ai-cp-secondary" data-cp-action="save-config">保存设置</button><button class="ai-cp-primary" data-cp-action="test-config">测试连接</button><button class="ai-cp-secondary" data-cp-action="clear-api-key">清除 Key</button></div><div class="ai-cp-config-status" role="status" aria-live="polite">'+escapeHtml(settingsStatus)+'</div></div>';
+    var pickerHtml=copilotState.cardPickerOpen?copilotPickerHtml():'';
+    var pickerOpen=!!copilotState.cardPickerOpen;
+    el.innerHTML='<div class="ai-cp-head"><div class="ai-cp-head-main"><div class="ai-cp-logo">✦</div><div><strong>报告 Copilot</strong><small>基于当前报告语义工作</small></div></div><button class="ai-cp-model" data-cp-action="settings" aria-label="打开模型设置">'+status+escapeHtml(cfg.model||'配置模型')+'<span>⌄</span></button><button class="ai-cp-icon" data-cp-action="new" title="新对话" aria-label="新对话">＋</button><button class="ai-cp-icon" data-cp-action="close" title="关闭" aria-label="关闭">×</button></div>'+
+      '<div class="ai-cp-context"><div class="ai-cp-breadcrumb-row"><nav class="ai-cp-breadcrumb" aria-label="当前报告位置" title="'+escapeHtml(contextTrail)+'">'+escapeHtml(contextTrail)+'</nav><button type="button" class="ai-cp-breadcrumb-toggle" data-cp-action="toggle-card-picker" aria-expanded="'+String(pickerOpen)+'" aria-controls="ai-cp-card-picker" aria-label="展开或收起报告章节树">'+(pickerOpen?'收起章节树':'浏览章节树')+'</button></div><div class="ai-cp-context-row"><span class="ai-cp-context-label">上下文</span><button class="ai-cp-card-select" data-cp-action="toggle-card-picker" aria-haspopup="tree" aria-expanded="'+String(pickerOpen)+'" aria-controls="ai-cp-card-picker" aria-label="选择要交互的报告卡片"><span class="ai-cp-card-select-label">交互卡片</span><strong>'+escapeHtml(title)+'</strong><span>⌄</span></button><span class="ai-cp-chip">维度 · '+escapeHtml(data.dimension||'未设置')+'</span><span class="ai-cp-chip">指标 · '+escapeHtml(contextMeasures)+'</span><span class="ai-cp-chip">聚合 · '+escapeHtml(contextAgg)+'</span><span class="ai-cp-chip">粒度 · '+escapeHtml(contextGrain)+'</span><span class="ai-cp-chip">筛选 · '+escapeHtml(contextScope+' 项')+'</span><span class="ai-cp-scope">只读查询 · 当前报告</span></div>'+pickerHtml+'</div>'+
+      runStatus+copilotTasksHtml()+copilotProposalHistoryHtml()+'<div class="ai-cp-body">'+(msgs||copilotEmptyHtml(cfg))+propHtml+'</div>'+
+      '<div class="ai-cp-composer"><div class="ai-cp-composer-box"><textarea id="ai-cp-input" aria-label="向报告 Copilot 提问" placeholder="问数据，追问口径，或描述想修改的图表…">'+escapeHtml(copilotState.composerDraft||'')+'</textarea><div class="ai-cp-composer-footer"><span>Enter 发送 · Shift+Enter 换行</span><button class="ai-cp-send" data-cp-action="send" title="发送" aria-label="发送">↑</button></div></div></div>'+settingsHtml;
+    var composer=el.querySelector('#ai-cp-input');
+    if(composer)composer.addEventListener('input',function(){copilotState.composerDraft=this.value;});
+    var cardSearch=el.querySelector('#ai-cp-card-search');
+    if(cardSearch)cardSearch.addEventListener('input',function(){copilotState.cardSearch=this.value;copilotRender();var next=document.getElementById('ai-cp-card-search');if(next){next.focus();try{next.setSelectionRange(next.value.length,next.value.length);}catch(e){}}});
+    el.dataset.open=String(copilotState.open);document.body.classList.toggle('ai-report-copilot-open',copilotState.open);
+  }
+  function copilotLoadTasks(){if(!isServerMode())return;copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs').then(function(res){copilotState.tasks=res&&Array.isArray(res.tasks)?res.tasks:[];if(copilotState.open)copilotRender();}).catch(function(){});}
+  function copilotLoadProposalHistory(){if(!isServerMode())return;copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/proposals/history').then(function(res){copilotState.proposalHistory=res&&Array.isArray(res.snapshots)?res.snapshots:[];if(copilotState.open)copilotRender();}).catch(function(){});}
+  function copilotLoadImpactGraph(){
+    if(!isServerMode())return;
+    var chart=copilotChart();if(!chart||!chart.id)return;
+    copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/impact-graph?chartId='+encodeURIComponent(chart.id)).then(function(res){
+      copilotState.impactGraph=res||null;if(copilotState.open)copilotRender();
+    }).catch(function(err){copilotState.impactGraph={affectedChartCount:0,truncation:{truncated:false},error:err&&err.message||'图谱加载失败'};if(copilotState.open)copilotRender();});
+  }
+  function copilotStartTaskSync(){
+    if(copilotTaskTimer||!isServerMode())return;
+    // The server is the source of truth; a bounded 3s poll lets a second
+    // report tab observe cancellations/completions without sharing result
+    // payloads through localStorage or merging conversation histories.
+    copilotTaskTimer=setInterval(function(){if(copilotState.open)copilotLoadTasks();},3000);
+  }
+  function copilotStopTaskSync(){if(copilotTaskTimer){clearInterval(copilotTaskTimer);copilotTaskTimer=null;}}
+  function copilotOpen(){copilotState.open=true;copilotRender();copilotLoadTasks();copilotLoadProposalHistory();copilotStartTaskSync();}
+  function copilotCancelRun(run){if(run&&run.jobId)copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(run.jobId)+'/cancel',{method:'POST',body:JSON.stringify({retryToken:run.retryToken||''})}).catch(function(){});}
+  function copilotRecoverTask(jobId,token){
+    if(!jobId||!token)return;
+    copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(jobId)+'/recover',{method:'POST',body:JSON.stringify({retryToken:token})}).then(copilotLoadTasks).catch(function(err){
+      copilotState.history.push({role:'assistant',content:'任务无法安全重试：'+(err.message||'请重新发起请求'),stale:true});copilotRender();
+    });
+  }
+  function copilotExportEvidence(sourceJobId){
+    if(!sourceJobId||!isServerMode())return;
+    var reportId=encodeURIComponent(manifest.reportId||'');
+    var notice={role:'assistant',content:'正在准备完整证据导出…',contextTitle:'当前报告'};
+    copilotState.history.push(notice);copilotRender();
+    copilotApi('/reports/'+reportId+'/copilot/evidence/export',{method:'POST',
+      body:JSON.stringify({jobId:sourceJobId,format:'csv'})}).then(function(res){
+      var exportId=res&&res.jobId;if(!exportId)throw new Error('导出任务未创建');
+      var attempts=0;
+      function poll(){
+        if(++attempts>120){notice.content='完整证据导出等待超时，请稍后重试';notice.stale=true;copilotRender();return;}
+        copilotApi('/reports/'+reportId+'/copilot/jobs/'+encodeURIComponent(exportId)).then(function(job){
+          if(job.status==='done'){
+            var href=serverApiBase()+'/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/evidence/'+encodeURIComponent(exportId);
+            // Use the server-owned download route; no evidence rows are copied
+            // into browser state or the chat transcript.
+            var link=document.createElement('a');link.href=href;link.target='_blank';link.rel='noopener';link.click();
+            notice.content='完整证据已生成并开始下载（CSV）。';copilotRender();return;
+          }
+          if(job.status==='error'||job.status==='cancelled'||job.status==='lost')throw new Error(job.error||'导出任务未完成');
+          setTimeout(poll,Math.max(500,Math.min(3000,Number(job.pollAfterMs)||900)));
+        }).catch(function(err){notice.content='完整证据导出失败：'+(err.message||'请重试');notice.stale=true;copilotRender();});
+      }
+      poll();
+    }).catch(function(err){notice.content='完整证据导出失败：'+(err.message||'请重试');notice.stale=true;copilotRender();});
+  }
+  function copilotExecutePlan(index){
+    var msg=copilotState.history[index];if(!msg||!msg.plan||msg.planExecuting)return;
+    var chartId=String(msg.chartId||''),currentChart=copilotChart(),currentFilterState=copilotFilterScopes(currentChart);
+    if(currentFilterState.errors&&currentFilterState.errors.length){
+      msg.content='计划执行已停止：当前会话筛选无法安全传入 Copilot。'+currentFilterState.errors.join('；');msg.planError=true;copilotRender();return;
+    }
+    var runId=++copilotState.runSeq,requestId=copilotRequestId();
+    msg.planExecuting=true;copilotState.busy=true;
+    copilotState.activeRun={id:runId,chartId:chartId,requestId:requestId,filterScopes:currentFilterState.scopes,planIndex:index};copilotRender();
+    copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/plan/execute',{method:'POST',body:JSON.stringify({plan:msg.plan,planHash:msg.planHash||'',filterScopes:currentFilterState.scopes,requestId:requestId})}).then(function(res){
+      if(res&&res.jobId){msg.jobId=res.jobId;copilotState.activeRun.jobId=res.jobId;copilotState.activeRun.retryToken=res.retryToken||'';return copilotPollJob(res.jobId,runId,{pending:true});}
+      return res;
+    }).then(function(res){
+      msg.planExecuting=false;
+      if(res){msg.planResult=res;msg.content=res.answer||'计划执行完成。';}
+      else{msg.content='计划执行已停止等待，服务端任务不会再回写当前会话。';msg.stale=true;}
+    }).catch(function(err){msg.planExecuting=false;msg.content='计划执行失败：'+err.message;msg.planError=true;}).then(function(){
+      if(copilotState.activeRun&&copilotState.activeRun.id===runId){copilotState.activeRun=null;copilotState.busy=false;}
+      copilotRender();
+    });
+  }
+  function copilotPollJob(jobId,runId,responseMessage){
+    return new Promise(function(resolve,reject){
+      var settled=false;
+      function finish(fn,arg){if(settled)return;settled=true;fn(arg);}
+      function tick(){
+        // “停止等待” detaches only the browser turn. The server job may still
+        // finish, but its result is never applied to a later card/session.
+        if(!copilotState.activeRun||copilotState.activeRun.id!==runId){finish(resolve,null);return;}
+        copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(jobId)).then(function(job){
+          if(job.retryToken&&copilotState.activeRun&&copilotState.activeRun.id===runId)copilotState.activeRun.retryToken=job.retryToken;
+          if(job.status==='done'){if(responseMessage)responseMessage.jobId=jobId;finish(resolve,job.result||{});return;}
+          if(job.status==='error'){finish(reject,new Error(job.error||'Copilot 后台任务失败'));return;}
+          if(job.status==='cancelled'){finish(reject,new Error(job.error||'Copilot 后台任务已取消'));return;}
+          if(job.status==='lost'){finish(reject,new Error(job.error||'服务进程已退出，Copilot 任务未完成，请重试'));return;}
+          var pending=responseMessage;
+          if(pending&&pending.pending){pending.content=job.phase==='模型处理中'?'正在等待模型返回…':'正在等待服务端查询…';copilotRender();}
+          var delay=Math.max(500,Math.min(5000,Number(job.pollAfterMs)||900));
+          setTimeout(tick,delay);
+        }).catch(function(err){finish(reject,err);});
+      }
+      tick();
+    });
+  }
+  function copilotSend(){
+    var input=document.getElementById('ai-cp-input');var msg=input&&input.value.trim();if(!msg||copilotState.busy)return;
+    var startChart=copilotChart(),requestChartId=startChart&&startChart.id||'',requestChartTitle=startChart&&startChart.title||'当前报告';
+    var requestFilterState=copilotFilterScopes(startChart);
+    if(requestFilterState.errors&&requestFilterState.errors.length){
+      copilotState.history.push({role:'assistant',content:'当前会话筛选无法安全传入 Copilot：'+requestFilterState.errors.join('；')+'。请减少筛选或重新选择卡片。',chartId:requestChartId,stale:true});
+      copilotRender();return;
+    }
+    var requestFilterScopes=requestFilterState.scopes;
+    var runId=++copilotState.runSeq;
+    var requestContextKey=copilotChartContextKey(startChart);
+    var requestId=copilotRequestId();
+    copilotState.activeRun={id:runId,chartId:requestChartId,title:requestChartTitle,contextKey:requestContextKey,filterScopes:requestFilterScopes,requestId:requestId};
+    copilotState.composerDraft='';copilotState.busy=true;copilotState.history.push({role:'user',content:msg,chartId:requestChartId,contextKey:requestContextKey});var responseMessage={role:'assistant',content:'正在读取报告语义并查询服务端数据…',pending:true,contextTitle:requestChartTitle,chartId:requestChartId,contextKey:requestContextKey};copilotState.history.push(responseMessage);copilotTrimHistory();
+    copilotState.proposal=null;copilotState.proposalCheck=null;copilotRender();
+    // Visible history may span several cards; only the current card's segment
+    // is sent to the server. This is the second isolation gate (the server
+    // applies the same chartId filter) and prevents a follow-up on card B from
+    // inheriting a fabricated/ambiguous answer from card A.
+    var h=copilotState.history.filter(function(item){return item!==responseMessage&&item&&String(item.chartId||'')===requestChartId&&(!item.contextKey||item.contextKey===requestContextKey);});
+    copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot',{method:'POST',body:JSON.stringify({message:msg,chartId:requestChartId,contextKey:requestContextKey,filterScopes:requestFilterScopes,history:h,async:true,requestId:requestId})}).then(function(res){
+      if(res&&res.jobId){
+        if(copilotState.activeRun&&copilotState.activeRun.id===runId){copilotState.activeRun.jobId=res.jobId;copilotState.activeRun.retryToken=res.retryToken||'';return copilotPollJob(res.jobId,runId,responseMessage);}
+        // The user may have started a new conversation before the 202 response
+        // arrived. Cancel the server job immediately; otherwise the browser
+        // has no jobId left with which to honor the user's stop action.
+        copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(res.jobId)+'/cancel',{method:'POST'}).catch(function(){});
+        return null;
+      }
+      return res; // older server: preserve the synchronous response contract
+    }).then(function(res){
+      if(!res)return;
+      var currentChart=copilotChart(),stale=!copilotState.activeRun||copilotState.activeRun.id!==runId||(currentChart&&currentChart.id||'')!==requestChartId||copilotChartContextKey(currentChart)!==requestContextKey;
+      var responseIndex=copilotState.history.indexOf(responseMessage);
+      if(responseIndex<0)return;
+      if(stale){
+        copilotState.history[responseIndex]={role:'assistant',content:'此前卡片的查询已完成，但当前交互卡片已经变化；结果仅供查看，图表提案不会自动应用。',evidence:res.evidence||null,contextTitle:requestChartTitle,chartId:requestChartId,stale:true};
+      }else{
+        copilotState.history[responseIndex]={role:'assistant',content:res.answer||'已完成。',evidence:res.evidence||null,jobId:responseMessage.jobId||'',plan:res.plan||null,planPreview:res.preview||[],planHash:res.planHash||'',requiresApproval:!!res.requiresApproval,diff:res.diff||null,proposalCheck:res.proposalCheck||null,contextTitle:requestChartTitle,chartId:requestChartId};
+        if(res.kind==='proposal'){copilotState.proposal=res.proposal||null;copilotState.proposalCheck=res.proposalCheck||null;}
+      }
+    }).catch(function(err){
+      var responseIndex=copilotState.history.indexOf(responseMessage);
+      if(responseIndex<0)return;
+      var currentChart=copilotChart(),stale=!copilotState.activeRun||copilotState.activeRun.id!==runId||(currentChart&&currentChart.id||'')!==requestChartId||copilotChartContextKey(currentChart)!==requestContextKey;
+      copilotState.history[responseIndex]={role:'assistant',content:(stale?'此前卡片的查询失败：':'无法完成：')+err.message,retry:true,contextTitle:requestChartTitle,chartId:requestChartId,stale:stale};
+    }).then(function(){
+      if(copilotState.activeRun&&copilotState.activeRun.id===runId){copilotState.activeRun=null;copilotState.busy=false;}
+      copilotRender();
+    });
+  }
+  function copilotPreview(){
+    var p=copilotState.proposal,ch=copilotChart();if(!p||!ch||copilotState.previewBackup)return;
+    if(p.chartId&&p.chartId!==ch.id){copilotState.proposal=null;copilotState.history.push({role:'assistant',content:'当前交互卡片已变化，旧的图表修改提案已取消。',chartId:ch.id});copilotRender();return;}
+    copilotState.previewBackup={chartId:ch.id,editor:JSON.parse(JSON.stringify(ch.editor||{})),viewType:ch.viewType};copilotMutatePreview(p,ch);copilotState.history.push({role:'assistant',content:'已在当前图表上显示预览；确认后才会写入当前报告。',chartId:ch.id});copilotRender();
+  }
+  function copilotRestorePreviewSilently(){
+    var b=copilotState.previewBackup;if(!b)return;
+    var ch=(manifest.charts||[]).find(function(item){return item&&item.id===b.chartId;});
+    if(ch){ch.editor=b.editor;ch.viewType=b.viewType;renderChart(ch);}
+    copilotState.previewBackup=null;
+  }
+  function copilotMutatePreview(p,ch){
+    var d=ensureEditorData(ch);d.dimension=p.dimension;d.dimensions=[p.dimension];d.measures=[p.measure];
+    // A derived measure is a virtual aggregate output. Keep the dependency
+    // closure on the chart when Copilot moves one onto a different card;
+    // otherwise renderChart would treat it as a physical SQL column and show
+    // an empty series.
+    if(p.derivedMeasures&&typeof p.derivedMeasures==='object')d.derivedMeasures=JSON.parse(JSON.stringify(p.derivedMeasures));else delete d.derivedMeasures;
+    d.roles=d.roles||{};if(p.breakdown)d.roles.breakdown=p.breakdown;else delete d.roles.breakdown;if(p.bucket&&p.bucket!=='raw')d.dimensionBucket={source:p.dimension,bucketed:p.dimension,bucket:p.bucket};else delete d.dimensionBucket;d.breakdownTopN=Number(p.topN)||0;d.aggregateLimit=p.topN?5000:undefined;if(!d.aggregateLimit)delete d.aggregateLimit;ch.viewType=p.viewType||'bar';markChartDirty(ch);renderChart(ch);
+  }
+  function copilotUndoPreview(){
+    var b=copilotState.previewBackup;if(!b)return;copilotRestorePreviewSilently();copilotState.history.push({role:'assistant',content:'已撤销预览，报告配置未改变。',chartId:b.chartId});copilotRender();
+  }
+  function copilotApply(){
+    var p=copilotState.proposal,ch=copilotChart();if(!p||!ch)return;
+    if(p.chartId&&p.chartId!==ch.id){copilotRestorePreviewSilently();copilotState.proposal=null;copilotState.history.push({role:'assistant',content:'当前交互卡片已变化，旧的图表修改提案未应用。',chartId:ch.id});copilotRender();return;}
+    if(!copilotState.previewBackup)copilotMutatePreview(p,ch);
+    if(!isServerMode()){
+      copilotState.previewBackup=null;syncManifest();copilotState.history.push({role:'assistant',content:'已在当前会话中应用修改。请在顶部“保存与分享”中保存，或继续告诉我如何调整。',chartId:ch.id});copilotState.proposal=null;copilotState.proposalCheck=null;copilotRender();return;
+    }
+    copilotState.busy=true;copilotRender();
+    copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/proposals/apply',{method:'POST',body:JSON.stringify({proposal:p,proposalId:copilotState.proposalCheck&&copilotState.proposalCheck.proposalId,password:serverEditPassword()})}).then(function(res){
+      if(res&&res.manifest){manifest=res.manifest;var next=(manifest.charts||[]).find(function(item){return item&&item.id===p.chartId;});if(next)selected={kind:'chart',chart:next,blockId:next.blockId};if(typeof renderAll==='function')renderAll();}
+      copilotState.previewBackup=null;copilotState.history.push({role:'assistant',content:'已通过服务端事务应用修改，并生成可回滚快照：'+(res.snapshotId||'已保存')+'。',rollbackSnapshot:res.snapshotId||'',chartId:ch.id});copilotState.proposal=null;copilotState.proposalCheck=null;copilotLoadProposalHistory();
+    }).catch(function(err){copilotRestorePreviewSilently();copilotState.history.push({role:'assistant',content:'服务端事务应用失败，已撤销本地预览：'+err.message,chartId:ch.id,stale:true});}).then(function(){copilotState.busy=false;copilotRender();});}
+  function copilotLoadConfig(){if(!isServerMode())return;copilotApi('/copilot/config').then(function(c){copilotState.config=c;copilotRender();}).catch(function(){});}
+  function copilotLoadProviderModels(){
+    if(!isServerMode())return;
+    var root=document.getElementById('ai-report-copilot');
+    if(root)root.dataset.cpStatus='正在读取服务商模型列表…';
+    copilotRender();
+    copilotApi('/copilot/provider-models').then(function(res){
+      copilotState.providerModels=res&&Array.isArray(res.models)?res.models:[];
+      var count=copilotState.providerModels.length;
+      if(root)root.dataset.cpStatus=count?'已读取 '+count+' 个可用模型':'服务商未返回模型列表';
+      copilotRender();
+    }).catch(function(err){if(root)root.dataset.cpStatus=err&&err.message||'读取模型列表失败';copilotRender();});
+  }
+  function copilotAction(action,el){
+    if(action==='close'){copilotState.open=false;copilotStopTaskSync();copilotRender();return;}
+    if(action==='new'){var newRun=copilotState.activeRun;copilotCancelRun(newRun);copilotRestorePreviewSilently();copilotState.runSeq+=1;copilotState.activeRun=null;copilotState.busy=false;copilotState.history=[];copilotState.proposal=null;copilotState.proposalCheck=null;copilotState.impactGraph=null;copilotState.cardPickerOpen=false;copilotState.cardSearch='';copilotState.composerDraft='';copilotRender();return;}
+    if(action==='detach'){var detachRun=copilotState.activeRun;copilotState.runSeq+=1;copilotState.activeRun=null;copilotState.busy=false;var detachedMsg=copilotState.history.slice().reverse().find(function(m){return m&&m.pending;});if(detachedMsg){detachedMsg.pending=false;detachedMsg.content='正在取消后台任务；结果不会应用到当前会话。';detachedMsg.stale=true;}copilotRender();copilotCancelRun(detachRun);return;}
+    if(action==='send'){copilotSend();return;}
+    if(action==='followup'){var followInput=document.getElementById('ai-cp-input');if(followInput){copilotState.composerDraft=el.getAttribute('data-cp-followup')||'';followInput.value=copilotState.composerDraft;copilotSend();}return;}
+    if(action==='cancel-task'){var taskId=el.getAttribute('data-cp-job-id')||'',taskToken=el.getAttribute('data-cp-retry-token')||'';copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(taskId)+'/cancel',{method:'POST',body:JSON.stringify({retryToken:taskToken})}).then(copilotLoadTasks).catch(function(){});return;}
+    if(action==='recover-task'){copilotRecoverTask(el.getAttribute('data-cp-job-id')||'',el.getAttribute('data-cp-retry-token')||'');return;}
+    if(action==='export-evidence'){copilotExportEvidence(el.getAttribute('data-cp-job-id')||'');return;}
+    if(action==='impact-graph'){copilotLoadImpactGraph();return;}
+    if(action==='evidence-page'){
+      var evidenceIndex=Number(el.getAttribute('data-cp-evidence-index')),evidencePage=Number(el.getAttribute('data-cp-evidence-page'));
+      if(Number.isInteger(evidenceIndex)&&Number.isInteger(evidencePage)&&copilotState.history[evidenceIndex]){
+        copilotState.history[evidenceIndex].evidencePage=Math.max(0,evidencePage);copilotRender();
+      }
+      return;
+    }
+    if(action==='execute-plan'){copilotExecutePlan(Number(el.getAttribute('data-cp-plan-index')));return;}
+    var root=document.getElementById('ai-report-copilot');if(!root)return;
+    if(action==='settings'){copilotState.settingsOpen=!copilotState.settingsOpen;copilotRender();return;}
+    if(action==='toggle-card-picker'){copilotState.cardPickerOpen=!copilotState.cardPickerOpen;copilotState.settingsOpen=false;copilotRender();return;}
+    if(action==='toggle-card-tree-node'){
+      var treeNode=el&&el.getAttribute?el.getAttribute('data-cp-tree-node'):'';
+      if(!treeNode)return;
+      copilotState.cardTreeExpanded=copilotState.cardTreeExpanded||{};
+      var wasExpanded=copilotTreeExpanded(treeNode,treeNode==='report');
+      copilotState.cardTreeExpanded[treeNode]=!wasExpanded;
+      copilotState.cardTreeFocus=treeNode;
+      copilotRender();copilotFocusTreeNode(treeNode);return;
+    }
+    if(action==='select-card'){copilotSelectCard(el.getAttribute('data-cp-card-id')||'');return;}
+    if(action==='apply'){copilotApply();return;}
+    if(action==='preview'){copilotPreview();return;}
+    if(action==='undo-preview'){copilotUndoPreview();return;}
+    if(action==='rollback'||action==='rollback-history'){
+      var snapshot=el.getAttribute('data-cp-snapshot');
+      copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/proposals/rollback',{method:'POST',body:JSON.stringify({snapshotId:snapshot,password:serverEditPassword()})}).then(function(res){
+        if(res&&res.manifest){manifest=res.manifest;var restored=(manifest.charts||[]).find(function(item){return item&&item.id===copilotChart().id;});if(restored)selected={kind:'chart',chart:restored,blockId:restored.blockId};if(typeof renderAll==='function')renderAll();}
+        copilotState.history.push({role:'assistant',content:'已回滚服务端 proposal 快照，可继续重做。',redoSnapshot:(res&&res.redoSnapshot)||snapshot,chartId:copilotChart()&&copilotChart().id});copilotLoadProposalHistory();copilotRender();
+      }).catch(function(err){copilotState.history.push({role:'assistant',content:'回滚失败：'+err.message,stale:true,chartId:copilotChart()&&copilotChart().id});copilotRender();});return;
+    }
+    if(action==='redo'){
+      var redoSnapshot=el.getAttribute('data-cp-snapshot');
+      copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/proposals/redo',{method:'POST',body:JSON.stringify({snapshotId:redoSnapshot,password:serverEditPassword()})}).then(function(res){
+        if(res&&res.manifest){manifest=res.manifest;var redone=(manifest.charts||[]).find(function(item){return item&&item.id===copilotChart().id;});if(redone)selected={kind:'chart',chart:redone,blockId:redone.blockId};if(typeof renderAll==='function')renderAll();}
+        copilotState.history.push({role:'assistant',content:'已重做服务端 proposal 修改。',rollbackSnapshot:res&&res.snapshotId||'',chartId:copilotChart()&&copilotChart().id});copilotRender();
+      }).catch(function(err){copilotState.history.push({role:'assistant',content:'重做失败：'+err.message,stale:true,chartId:copilotChart()&&copilotChart().id});copilotRender();});return;
+    }
+    if(action==='retry'){
+      var retryIndex=Number(el.getAttribute('data-cp-retry-index')),failed=Number.isInteger(retryIndex)?copilotState.history[retryIndex]:null;
+      var targetChartId=failed&&String(failed.chartId||'')||'',last=null;
+      for(var ri=retryIndex-1;ri>=0;ri--){var candidate=copilotState.history[ri];if(candidate&&candidate.role==='user'&&String(candidate.chartId||'')===targetChartId){last=candidate;break;}}
+      if(last){
+        var activeCard=copilotChart();
+        if(targetChartId&&(!activeCard||activeCard.id!==targetChartId))copilotSelectCard(targetChartId);
+        var retryRoot=document.getElementById('ai-report-copilot'),retryInput=retryRoot&&retryRoot.querySelector('#ai-cp-input');
+        if(retryInput){copilotState.composerDraft=last.content||'';retryInput.value=copilotState.composerDraft;copilotSend();}
+      }
+      return;
+    }
+    if(action==='save-config'){
+      var model=root.querySelector('#ai-cp-model-input').value.trim(),url=root.querySelector('#ai-cp-url-input').value.trim(),key=root.querySelector('#ai-cp-key-input').value,mode=root.querySelector('#ai-cp-mode-input').value;
+      copilotApi('/copilot/config',{method:'POST',body:JSON.stringify({model:model,baseUrl:url,apiKey:key,agentMode:mode})}).then(function(c){copilotState.config=c;root.dataset.cpStatus='设置已保存';copilotRender();}).catch(function(e){root.dataset.cpStatus=e.message;copilotRender();});return;
+    }
+    if(action==='test-config'){root.dataset.cpStatus='正在测试连接…';copilotRender();copilotApi('/copilot/test',{method:'POST'}).then(function(){root.dataset.cpStatus='连接正常';copilotRender();}).catch(function(e){root.dataset.cpStatus=e.message;copilotRender();});return;}
+    if(action==='clear-api-key'){
+      if(!window.confirm('清除服务器保存的 API Key？清除后需要重新配置才能调用模型。'))return;
+      var clearModel=root.querySelector('#ai-cp-model-input').value.trim(),clearUrl=root.querySelector('#ai-cp-url-input').value.trim(),clearMode=root.querySelector('#ai-cp-mode-input').value;
+      copilotApi('/copilot/config',{method:'POST',body:JSON.stringify({model:clearModel,baseUrl:clearUrl,agentMode:clearMode,clearApiKey:true})}).then(function(c){copilotState.config=c;root.dataset.cpStatus='已清除服务器保存的 API Key';copilotRender();}).catch(function(e){root.dataset.cpStatus=e.message;copilotRender();});return;
+    }
+    if(action==='load-provider-models'){copilotLoadProviderModels();return;}
+    if(action==='choose-provider-model'){
+      var chosen=el.getAttribute('data-cp-model')||'',modelInput=root.querySelector('#ai-cp-model-input');
+      if(modelInput)modelInput.value=chosen;
+      root.dataset.cpStatus=chosen?'已选择模型 '+chosen+'，请保存设置后测试连接':'模型 ID 为空';
+      var chosenStatus=root.querySelector('.ai-cp-config-status');
+      if(chosenStatus)chosenStatus.textContent=root.dataset.cpStatus;
+      return;
+    }
+    if(action==='preset-deepseek'){var mi=root.querySelector('#ai-cp-model-input'),ui=root.querySelector('#ai-cp-url-input');if(mi)mi.value='deepseek-flash';if(ui)ui.value='https://api.deepseek.com';el.dataset.cpStatus='已填入 DeepSeek 参数，请输入 API Key 后保存';var st=root.querySelector('.ai-cp-config-status');if(st)st.textContent=el.dataset.cpStatus;return;}
+    if(action==='prompt'){var prompt=root.querySelector('#ai-cp-input');if(prompt){copilotState.composerDraft=el.getAttribute('data-cp-prompt')||'';prompt.value=copilotState.composerDraft;prompt.focus();}return;}
+  }
+
   // server 模式：服务端持有全部源表，直接请它用同一个 merge_tables.materialize 物化成
   // 真实宽表（POST /api/reports/:id/materialize-relation），回来就是可查的数据集。
   function serverMaterializeRelation(rel){
@@ -21568,6 +22517,7 @@ if(rfEl){
     var url=serverApiUrl('/reports/'+encodeURIComponent(manifest.reportId||'')+'/datasets/'+encodeURIComponent(ds.id)+'/replace?'+q);
     var st={phase:'upload',collapsed:false,pct:0,startedAt:Date.now(),
       dsId:ds.id,   // B3：任务条按数据集一卡（并发直传互不覆盖）
+      canRecover:false,
       rowsBefore:(ds.rowCount!=null)?ds.rowCount:null,   // R2：失败态对比基准（操作前行数）
       title:((_mode==='upsert'?'增量合并':(_mode==='append'?'追加新行':'全量替换'))+' · '+(ds.label||ds.id)),
       detail:'正在上传 '+_sizeMb+'MB…'};
@@ -21589,6 +22539,7 @@ if(rfEl){
     var done;
     function start(){
       st.phase='upload';st.pct=0;st.error=null;st.startedAt=Date.now();
+      st.jobId=null;st.retryToken='';st.cancelPending=false;st.canRecover=false;
       st.jobPhase=''; // 上次失败尝试残留的服务端阶段不得带进重试的 process 态（展示 1.2s 陈旧文案）
       st.serverRows=null;   // R2：重试后旧的行数核对结论作废，失败时重新拉
       st.detail='正在上传 '+_sizeMb+'MB…';
@@ -21599,6 +22550,7 @@ if(rfEl){
         dataTaskCardRender(st);
       }).then(function(res){
         if(res&&res.jobId){
+          st.jobId=res.jobId;st.retryToken=res.retryToken||'';
           st.phase='process';st.pct=null;st.detail='';
           dataTaskCardRender(st);
           return pollReplaceJob(ds,res.jobId,st);
@@ -21631,11 +22583,28 @@ if(rfEl){
       });
       return done;
     }
+    function recover(){
+      if(!st.jobId||!st.canRecover)return Promise.resolve(null);
+      st.phase='process';st.pct=null;st.error=null;st.detail='正在安全重试服务端任务…';st.canRecover=false;
+      dataTaskCardRender(st);
+      var recoverUrl=serverApiUrl('/reports/'+encodeURIComponent(manifest.reportId||'')+'/datasets/'+encodeURIComponent(ds.id)+'/replace/jobs/'+encodeURIComponent(st.jobId)+'/recover');
+      return fetch(recoverUrl,{method:'POST',headers:{'Content-Type':'application/json','X-Edit-Password':serverEditPassword()},body:JSON.stringify({retryToken:st.retryToken||''})})
+        .then(function(r){return r.json().catch(function(){return {};}).then(function(body){if(!r.ok)throw new Error((body.error&&body.error.message)||('HTTP '+r.status));return body;});})
+        .then(function(){return pollReplaceJob(ds,st.jobId,st);})
+        .then(function(res){
+          applyResult(res);st.phase='done';st.detail='服务端任务已恢复并完成，共 '+((res&&res.rowCount)!=null?res.rowCount:'?')+' 条记录。';dataTaskCardRender(st);notify(st.title+' 完成：'+st.detail,'success');return res;
+        })
+        .catch(function(err){st.phase='error';st.error=(err&&err.message)||String(err);dataTaskCardRender(st);return null;});
+    }
     card.__aiTaskRetry=start;
     // 返回内部 promise（终态已在上面收尾、必 resolve）：三个调用点的
     // .catch(function(){}) 契约不变——曾因漏 return 让调用点对 undefined.catch
     // 抛 TypeError（真机探针抓到）。
-    return start();
+    var initialRun=start();
+    // start() renders once with canRecover=false; restore the durable recovery
+    // callback after that initial render so a later lost response can expose it.
+    card.__aiTaskRecover=recover;
+    return initialRun;
   }
   // R2：失败态就地查询服务端行数（GET /datasets/:id/schema，读端点无需编辑口令）。
   // 读不到（服务重启/网络断）返回 null——任务条维持旧文案，绝不打假数字。
@@ -21663,8 +22632,9 @@ if(rfEl){
       xhr.send(file);
     });
   }
-  // 轮询后台任务直到 done/error。404 = 服务已重启（job 只在内存）→ 如实报错，
-  // 让作者用行数确认，绝不轮询出假成功；单次轮询 15s 无响应同样报错。
+  // 轮询后台任务直到 done/error/lost。job 元数据跨 server 进程共享；lost 表示
+  // owner 进程确认退出，绝不自动重放写入。404 代表未知/过期；单次轮询 15s
+  // 无响应同样报错。
   function pollReplaceJob(ds,jobId,st){
     var url=serverApiUrl('/reports/'+encodeURIComponent(manifest.reportId||'')+'/datasets/'+encodeURIComponent(ds.id)+'/replace/jobs/'+encodeURIComponent(jobId));
     return new Promise(function(resolve,reject){
@@ -21683,15 +22653,30 @@ if(rfEl){
         ]).then(function(res){
           if(!res.ok)throw new Error(((res.body&&res.body.error&&res.body.error.message)||('HTTP '+res.status)));
           var j=res.body||{};
+          if(j.retryToken)st.retryToken=j.retryToken;
+          st.canRecover=!!j.canRecover;
           if(j.status==='done'){finish(resolve,j.result||{});return;}
           if(j.status==='error'){finish(reject,new Error(j.error||'数据更新失败'));return;}
+          if(j.status==='lost'){finish(reject,new Error(j.error||'服务进程已退出，任务未完成；可安全重试的任务请点击“安全重试”'));return;}
           st.phase='process';
           st.jobPhase=j.phase||'';
           dataTaskCardRender(st);
+          // Dataset replacement has a deliberately stable 1.2s cadence:
+          // unlike Copilot polling, this task is a single upload pipeline and
+          // must not fan out into many different browser timers.
           setTimeout(tick,1200);
         }).catch(function(err){finish(reject,err);});
       })();
     });
+  }
+  function cancelServerReplaceJob(st){
+    if(!st||!st.jobId||!st.dsId||st.cancelPending)return;
+    st.cancelPending=true;st.detail='正在请求取消…';dataTaskCardRender(st);
+    var url=serverApiUrl('/reports/'+encodeURIComponent(manifest.reportId||'')+'/datasets/'+encodeURIComponent(st.dsId)+'/replace/jobs/'+encodeURIComponent(st.jobId)+'/cancel');
+    fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Edit-Password':serverEditPassword()},body:JSON.stringify({retryToken:st.retryToken||''})})
+      .then(function(r){return r.json().catch(function(){return {};}).then(function(body){if(!r.ok)throw new Error((body.error&&body.error.message)||('HTTP '+r.status));return body;});})
+      .then(function(){st.phase='error';st.error='数据更新任务已取消；未宣称回滚，请核对当前行数。';dataTaskCardRender(st);})
+      .catch(function(err){st.cancelPending=false;st.detail='取消失败：'+err.message;dataTaskCardRender(st);});
   }
   // B3（2026-09-26 审视）：任务条按数据集多实例——右下角一个固定堆叠容器，
   // 每个数据集一张卡（data-task-ds 键）。旧的 body 级单卡在两个数据集并发直传时
@@ -21716,6 +22701,12 @@ if(rfEl){
         else if(ev.target.closest('[data-task-retry]')){
           if(typeof card.__aiTaskRetry==='function')card.__aiTaskRetry();
         }
+        else if(ev.target.closest('[data-task-recover]')){
+          if(typeof card.__aiTaskRecover==='function')card.__aiTaskRecover();
+        }
+        else if(ev.target.closest('[data-task-cancel]')){
+          if(typeof card.__aiTaskCancel==='function')card.__aiTaskCancel();
+        }
       });
     }
     var dsKey=String(dsId==null?'':dsId);
@@ -21732,6 +22723,8 @@ if(rfEl){
     // 常驻任务条：终态不自动消失（notify 的 4s toast 正是 W35 静默失败的根因）。
     var card=ensureDataTaskCard(st&&st.dsId);
     card.__aiTaskState=st;
+    card.__aiTaskCancel=st&&st.jobId?function(){cancelServerReplaceJob(st);}:null;
+    if(st&&st.phase==='done')card.__aiTaskRecover=null;
     var running=st.phase==='upload'||st.phase==='process';
     // 收起态只属于进行中（收起按钮也只在 running 渲染）：带着 collapsed 进终态
     // 会把错误详情/重试按钮（或成功勾稽数字）藏进 display:none 且无入口展开。
@@ -21776,7 +22769,8 @@ if(rfEl){
           +escapeHtml(rowsNote)+'</div>')
         :'')
       +bar
-      +(st.phase==='error'?'<div class="ai-task-actions"><button type="button" class="ai-report-secondary" data-task-retry>重试</button></div>':'')
+      +(running&&st.jobId?'<div class="ai-task-actions"><button type="button" class="ai-report-secondary" data-task-cancel>取消任务</button></div>':'')
+      +(st.phase==='error'?'<div class="ai-task-actions">'+(st.canRecover?'<button type="button" class="ai-report-secondary" data-task-recover>安全重试服务端任务</button>':'')+'<button type="button" class="ai-report-secondary" data-task-retry>重新上传</button></div>':'')
       +'</div>';
   }
   // 只读文件头部（≤64KB）解析表头列名——全量替换直传前的列集预检，几 KB 的
@@ -22216,8 +23210,9 @@ if(rfEl){
   // 拼版画板（draft:true）的创作面能力——成品报告只长真实卡，菜单里不再出现；
   // 转正后 draft 消失，这两项随 isComposeDraft() 自动退场。
   +(isComposeDraft()?'<button type="button" data-runtime-action="open-gallery"><span class="m-icon">拼</span>示例画廊…</button><button type="button" data-runtime-action="add-compose"><span class="m-icon">占</span>占位块</button>':'')
-  +'<button type="button" data-runtime-action="add-bi"><span class="m-icon">柱</span>图表</button><button type="button" data-runtime-action="add-text"><span class="m-icon">文</span>文本</button><button type="button" data-runtime-action="add-grid"><span class="m-icon">田</span>表格</button><button type="button" data-runtime-action="add-filter"><span class="m-icon">筛</span>筛选器</button></div></div>'+'</div>'+'<button type="button" id="ai-report-present" class="ai-tb-btn" title="按 16:9 分页预览并放映" data-runtime-action="presentation-mode"><span class="m-icon" style="width:auto;height:auto;background:transparent;color:inherit">▣</span>汇报模式</button><button type="button" id="ai-report-edit-toggle" class="ai-tb-btn" data-active="false"><span class="ai-tb-btn-label">编辑模式</span></button></div><input id="ai-report-data-file" type="file" accept=".xlsx,.csv,.tsv,.json" style="display:none"><aside id="ai-report-runtime-panel"></aside></div>');
+  +'<button type="button" data-runtime-action="add-bi"><span class="m-icon">柱</span>图表</button><button type="button" data-runtime-action="add-text"><span class="m-icon">文</span>文本</button><button type="button" data-runtime-action="add-grid"><span class="m-icon">田</span>表格</button><button type="button" data-runtime-action="add-filter"><span class="m-icon">筛</span>筛选器</button></div></div>'+'</div>'+'<button type="button" id="ai-report-present" class="ai-tb-btn" title="按 16:9 分页预览并放映" data-runtime-action="presentation-mode"><span class="m-icon" style="width:auto;height:auto;background:transparent;color:inherit">▣</span>汇报模式</button><button type="button" id="ai-report-edit-toggle" class="ai-tb-btn" data-active="false"><span class="ai-tb-btn-label">编辑模式</span></button><button type="button" class="ai-tb-btn ai-report-copilot-toggle ai-report-agent-edit-toggle" title="用 Agent 修改当前图表" data-runtime-action="copilot-open">✦ Agent 改图</button></div><input id="ai-report-data-file" type="file" accept=".xlsx,.csv,.tsv,.json" style="display:none"><aside id="ai-report-runtime-panel"></aside><aside id="ai-report-copilot" data-open="false"></aside></div>');
   applyChartThemeFull(manifest.chartTheme||'default');applyShellTheme(manifest.chartTheme||'default');
+  copilotLoadConfig();copilotRender();
   populateThemeMenu();
   document.getElementById('ai-report-edit-toggle').addEventListener('click',function(){
     // 编辑模式 ⇄ 阅读模式：纯切态，不带任何保存/下载副作用。
@@ -22490,6 +23485,7 @@ if(rfEl){
     var actionEl=event.target&&event.target.closest?event.target.closest('[data-runtime-action]'):null;
     var action=actionEl?actionEl.getAttribute('data-runtime-action'):null;if(!action)return;
     if(action==='close'){document.getElementById('ai-report-runtime-panel').dataset.open='false';syncPanelClass();exitFocus();}
+    else if(action==='copilot-open'){copilotOpen();}
     else if(action==='download')download();
     else if(action==='share-editable')shareOpEditable();
     else if(action==='share-readonly')shareOpReadonly();
@@ -22514,6 +23510,18 @@ if(rfEl){
     // 「管理规则」按钮只带 data-bi-control-action（W1 附带修复：挂在 document 级
     // data-runtime-action 分发上永远收不到，真机点不开规则弹窗）。
     else if(action==='delete-block')deleteBlock(actionEl.getAttribute('data-block-id'));
+  });
+  document.getElementById('ai-report-copilot').addEventListener('click',function(event){
+    var btn=event.target.closest('[data-cp-action]');if(btn)copilotAction(btn.getAttribute('data-cp-action'),btn);
+  });
+  document.getElementById('ai-report-copilot').addEventListener('keydown',function(event){
+    if(event.key==='Enter'&&!event.shiftKey&&event.target.id==='ai-cp-input'){event.preventDefault();copilotSend();}
+    if(event.target&&event.target.closest&&event.target.closest('[role="tree"]')){copilotTreeKeydown(event);if(event.defaultPrevented)return;}
+    if(event.key==='Escape'){
+      if(copilotState.cardPickerOpen){copilotState.cardPickerOpen=false;copilotRender();event.preventDefault();event.stopPropagation();}
+      else if(copilotState.settingsOpen){copilotState.settingsOpen=false;copilotRender();event.preventDefault();event.stopPropagation();}
+      else if(copilotState.open){copilotState.open=false;copilotRender();event.preventDefault();event.stopPropagation();}
+    }
   });
   // In-panel download-variant buttons (openBlock panel).
   document.getElementById('ai-report-runtime-panel').addEventListener('click',function(event){
@@ -23809,6 +24817,8 @@ if(rfEl){
           // 服务端数据换了：示例值缓存必须失效（否则字段配置里还显示旧值），
           // 所有卡片重新渲染（明细/聚合表按需重拉行）。
           try{Object.keys(sampleCache).forEach(function(k){delete sampleCache[k];});}catch(e){}
+          invalidateFilterLiveValues(ds.id);
+          delete ds.filterOptions;
           invalidateColumnStats(ds);
           if(opts.mode==='upsert'&&opts.keyCols){
             // 服务端已把 primaryKey 写进 manifest/注册表；本页内存镜像同步，
@@ -23845,6 +24855,7 @@ if(rfEl){
         return dIdxA.map(function(i){return (i>=0&&i<r.length)?r[i]:null;});
       });
       ds.rows=baseA.concat(deltaA);
+      invalidateFilterLiveValues(ds.id);
       invalidateColumnStats(ds);
       applyDerivedToDataset(ds);
       applyDimGroupsToDataset(ds);
@@ -23876,6 +24887,7 @@ if(rfEl){
         return;
       }
       ds.rows=mergedOut.rows;
+      invalidateFilterLiveValues(ds.id);
       invalidateColumnStats(ds);
       applyDerivedToDataset(ds);
       applyDimGroupsToDataset(ds);
@@ -23891,6 +24903,7 @@ if(rfEl){
     }
     // singlefile：就地替换内存行（这就是渲染与保存的真源）。
     ds.rows=newTable.rows;
+    invalidateFilterLiveValues(ds.id);
     invalidateColumnStats(ds);
     applyDerivedToDataset(ds);
     applyDimGroupsToDataset(ds);

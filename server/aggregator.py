@@ -12,6 +12,12 @@ from __future__ import annotations
 
 import re
 import time
+import copy
+import json
+import threading
+import weakref
+from collections import OrderedDict
+from dataclasses import replace
 from typing import Any, Optional
 
 from .store import Engine
@@ -29,9 +35,178 @@ from .types import AggregateRequest, AggregateResponse
 NON_EMPTY_IDENT = re.compile(r"^[^\x00]+$")
 
 SUPPORTED_AGG = {"sum", "average", "count", "countd", "min", "max", "none"}
+# Hard query-safety ceilings.  They protect the server without becoming a
+# hidden visual overflow rule: callers get a typed error and can narrow the
+# request.  Flint still owns grouping/aggregation semantics
+# (``refs/flint/src/core/aggregate.ts:7-20``); these limits only bound work.
+MAX_SCAN_ROWS = 2_000_000
+MAX_GROUPS = 100_000
 # 数值聚合：TEXT 列（任一脏值即整列 TEXT）上这类聚合曾经被静默重定向成 count
 # ——见 _measure_operand。
 NUMERIC_AGGS = {"sum", "average", "min", "max"}
+
+# Bounded read cache for repeated chart/Copilot queries.  Flint's aggregation
+# contract keeps callers responsible for requesting the right grain and
+# aggregation (refs/flint/src/core/aggregate.ts); this cache only reuses an
+# already validated, deterministic response.  The engine revision is part of
+# the key, so a same-sized replace cannot return stale numbers.  Small limits
+# are intentional: never retain a 20k-row table response in the server cache.
+_AGG_CACHE_MAX = 64
+_AGG_CACHE_TTL = 5.0
+_AGG_CACHE_LOCK = threading.Lock()
+_AGG_CACHES: weakref.WeakKeyDictionary[Any, OrderedDict] = weakref.WeakKeyDictionary()
+_AGG_CACHE_STATS = {"hits": 0, "misses": 0, "puts": 0, "evictions": 0}
+_AGG_INFLIGHT: dict[tuple[int, tuple[Any, ...]], threading.Event] = {}
+def _record_query_pattern(engine: Engine, table_name: str, request: AggregateRequest) -> None:
+    """Record a bounded, value-free semantic query shape.
+
+    The implementation lives in ``index_advisor`` so the observation and the
+    approval/apply path share one contract.  Keeping this hook at the validated
+    aggregate boundary means malformed SQL-like input never becomes advice.
+    """
+    from .index_advisor import record_query_shape
+    record_query_shape(engine, table_name, request)
+
+
+def index_suggestions(engine: Engine, table_name: str | None = None, *, min_observations: int = 2) -> dict[str, Any]:
+    """Compatibility wrapper for the read-only advisor endpoint."""
+    from .index_advisor import suggestions_for_engine
+    return suggestions_for_engine(engine, table_name, min_observations=min_observations)
+
+
+def explain_index_candidate(engine: Engine, table_name: str, column: str) -> dict[str, Any]:
+    """Compatibility wrapper for the bounded, read-only plan probe."""
+    from .index_advisor import explain_candidate
+    return explain_candidate(engine, table_name, column)
+
+
+def _inflight_claim(engine: Engine, key: tuple[Any, ...] | None, cancel_check=None) -> bool:
+    """Coalesce identical concurrent reads without changing aggregate semantics."""
+    if key is None:
+        return True
+    marker = (id(engine), key)
+    with _AGG_CACHE_LOCK:
+        event = _AGG_INFLIGHT.get(marker)
+        if event is None:
+            _AGG_INFLIGHT[marker] = threading.Event()
+            return True
+    deadline = time.monotonic() + 30.0
+    while not event.wait(0.05):
+        if cancel_check is not None and cancel_check():
+            raise AggregationCancelled("查询已取消")
+        if time.monotonic() >= deadline:
+            # A crashed owner must not strand later readers forever. Remove
+            # only this exact event; a new caller may claim the key.
+            with _AGG_CACHE_LOCK:
+                if _AGG_INFLIGHT.get(marker) is event:
+                    _AGG_INFLIGHT.pop(marker, None)
+            return True
+    return False
+
+
+def _inflight_finish(engine: Engine, key: tuple[Any, ...] | None) -> None:
+    if key is None:
+        return
+    marker = (id(engine), key)
+    with _AGG_CACHE_LOCK:
+        event = _AGG_INFLIGHT.pop(marker, None)
+        if event is not None:
+            event.set()
+
+
+def _canonical_filter_for_cache(value: Any) -> Any:
+    """Canonicalize only predicate ordering for cache/in-flight identity.
+
+    Filter conjunction/disjunction is commutative, but range/value arrays are
+    not: ``[low, high]`` must stay in that order.  Keep those arrays intact and
+    sort only the predicate lists under the outer AND and ``any`` groups.  This
+    changes no Flint aggregation or filter semantics; it only lets equivalent
+    requests share the bounded read cache and in-flight owner
+    (refs/flint/src/core/aggregate.ts:7-20).
+    """
+    def stable(item: Any) -> str:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True,
+                          default=str, separators=(",", ":"))
+
+    def visit(item: Any, *, predicate_list: bool = False) -> Any:
+        if isinstance(item, list):
+            children = [visit(child) for child in item]
+            return sorted(children, key=stable) if predicate_list else children
+        if not isinstance(item, dict):
+            return item
+        result = {}
+        for key, child in item.items():
+            # These are predicate groups; all other arrays are values whose
+            # order can be part of the operator contract (between/daterange).
+            result[key] = visit(child, predicate_list=key in {"all", "any"})
+        return result
+
+    return visit(value, predicate_list=isinstance(value, list))
+
+
+def _aggregate_cache_key(engine: Engine, table_name: str,
+                         request: AggregateRequest) -> tuple[Any, ...] | None:
+    limit = 500 if request.limit is None else int(request.limit)
+    if request.offset or limit > 500:
+        return None
+    shape = json.dumps({
+        "table": table_name,
+        "revision": getattr(engine, "revision", 0),
+        "request": {
+            "groupBy": request.group_by,
+            "measures": request.measures,
+            "bucket": request.bucket,
+            "filter": _canonical_filter_for_cache(request.filter),
+            "orderBy": request.order_by,
+            "limit": limit,
+            "topKOther": request.top_k_other,
+            "addMask": request.add_mask,
+        },
+    }, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return (table_name, getattr(engine, "revision", 0), shape)
+
+
+def _aggregate_cache_get(engine: Engine, key: tuple[Any, ...] | None) -> AggregateResponse | None:
+    if key is None:
+        return None
+    now = time.monotonic()
+    with _AGG_CACHE_LOCK:
+        cache = _AGG_CACHES.get(engine)
+        item = cache.get(key) if cache else None
+        if not item:
+            _AGG_CACHE_STATS["misses"] += 1
+            return None
+        created, response = item
+        if now - created > _AGG_CACHE_TTL:
+            cache.pop(key, None)
+            _AGG_CACHE_STATS["misses"] += 1
+            return None
+        cache.move_to_end(key)
+        _AGG_CACHE_STATS["hits"] += 1
+        hit = copy.deepcopy(response)
+        hit.elapsed_ms = 0
+        return hit
+
+
+def _aggregate_cache_put(engine: Engine, key: tuple[Any, ...] | None,
+                         response: AggregateResponse) -> None:
+    if key is None:
+        return
+    with _AGG_CACHE_LOCK:
+        _AGG_CACHE_STATS["puts"] += 1
+        cache = _AGG_CACHES.setdefault(engine, OrderedDict())
+        cache[key] = (time.monotonic(), copy.deepcopy(response))
+        cache.move_to_end(key)
+        while len(cache) > _AGG_CACHE_MAX:
+            cache.popitem(last=False)
+            _AGG_CACHE_STATS["evictions"] += 1
+    _inflight_finish(engine, key)
+
+
+def aggregate_cache_summary() -> dict[str, int]:
+    """Return bounded cache counters for health/diagnostics, not row data."""
+    with _AGG_CACHE_LOCK:
+        return dict(_AGG_CACHE_STATS)
 
 # WP-11 总计计算方式：per-measure 合计聚合覆盖（对标 QBI）。合计回**全量过滤
 # 原始行**重算（SQL 上就是不带 GROUP BY 的 overall 聚合），不是对分组值二次聚合。
@@ -46,6 +221,24 @@ class AggregationError(ValueError):
     """Raised on malformed aggregate requests. Maps to HTTP 400."""
 
 
+class AggregationCancelled(TimeoutError):
+    """A bounded aggregate was interrupted by its Agent cancellation token."""
+
+
+def _budget_int(value: Any, field: str, ceiling: int) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise AggregationError(f"{field} must be a positive integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AggregationError(f"{field} must be a positive integer") from exc
+    if number < 1 or number > ceiling:
+        raise AggregationError(f"{field} must be between 1 and {ceiling}")
+    return number
+
+
 def _quote(name: str) -> str:
     """Quote an identifier; raise on unsafe names."""
     if not isinstance(name, str) or not NON_EMPTY_IDENT.match(name):
@@ -53,7 +246,8 @@ def _quote(name: str) -> str:
     return f'"{name.replace(chr(34), chr(34) * 2)}"'
 
 
-def _bucket_expr(source: str, bucket: str, engine: Optional[Engine] = None) -> tuple[str, str]:
+def _bucket_expr(source: str, bucket: str, engine: Optional[Engine] = None,
+                 calendar: Any = None) -> tuple[str, str]:
     """Return (sql_fragment, display_label_template).
 
     SQLite strftime format strings:
@@ -92,6 +286,16 @@ def _bucket_expr(source: str, bucket: str, engine: Optional[Engine] = None) -> t
     col = _quote(source)
     has_norm = bool(engine is not None and getattr(engine, "supports_date_norm", False))
     dialect = str(getattr(engine, "engine_name", "sqlite") or "sqlite").lower()
+    try:
+        from .agent_extensions import normalize_calendar
+        calendar_cfg = normalize_calendar(calendar)
+    except ValueError as exc:
+        raise AggregationError(f"invalid calendar declaration: {exc}") from None
+    fiscal = calendar_cfg.get("kind") == "fiscal"
+    if fiscal and bucket == "week":
+        raise AggregationError("fiscal calendar does not redefine week numbering; use Gregorian ISO week or fiscal month/quarter/year")
+    if fiscal and not bool(engine is not None and getattr(engine, "supports_calendar_norm", False)):
+        raise AggregationError("当前引擎不支持显式 fiscal calendar")
     if not has_norm:
         date_col = col
     elif dialect.startswith("duck"):
@@ -103,6 +307,33 @@ def _bucket_expr(source: str, bucket: str, engine: Optional[Engine] = None) -> t
                     f"try_cast({col} AS TIMESTAMP)) AS TIMESTAMP)")
     else:
         date_col = f"ai_date({col})"
+    if fiscal and bucket != "day":
+        start_month = int(calendar_cfg["fiscalStartMonth"])
+        if dialect.startswith("duck"):
+            fiscal_date = (f"CAST(ai_fiscal_date(CAST({col} AS VARCHAR), {start_month}) "
+                           "AS TIMESTAMP)")
+            year = f"strftime({fiscal_date}, '%Y')"
+            month = f"strftime({fiscal_date}, '%m')"
+            if bucket == "year":
+                return f"'FY' || {year}", "FY%Y"
+            if bucket == "month":
+                return f"'FY' || {year} || '-M' || {month}", "FY%Y-M%m"
+            if bucket == "quarter":
+                return (f"'FY' || {year} || '-Q' || "
+                        f"CAST((CAST({month} AS INTEGER) + 2) // 3 AS VARCHAR)"), "FY%Y-Q"
+        else:
+            fiscal_date = f"ai_fiscal_date({col}, {start_month})"
+            year = f"strftime('%Y', {fiscal_date})"
+            month = f"strftime('%m', {fiscal_date})"
+            if bucket == "year":
+                return f"CASE WHEN {year} IS NULL THEN NULL ELSE printf('FY%s', {year}) END", "FY%Y"
+            if bucket == "month":
+                return (f"CASE WHEN {year} IS NULL THEN NULL ELSE "
+                        f"printf('FY%s-M%s', {year}, {month}) END"), "FY%Y-M%m"
+            if bucket == "quarter":
+                return (f"CASE WHEN {year} IS NULL THEN NULL ELSE "
+                        f"printf('FY%s-Q%d', {year}, (CAST({month} AS INTEGER) + 2) / 3) END"), "FY%Y-Q"
+        raise AggregationError(f"unsupported fiscal bucket: {bucket!r}")
     if bucket == "quarter":
         # 参数顺序两种方言相反：SQLite 是 strftime(format, value)，duckdb 是
         # strftime(value, format)。季度 = 年份 + ceil(month/3)。
@@ -482,24 +713,309 @@ def _order_clause(orders: list[dict[str, str]], fallback_col: Optional[str]) -> 
     return "ORDER BY " + ", ".join(parts), []
 
 
-def aggregate_multi(engine: Engine, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Batch several single-table aggregation sub-requests in ONE HTTP round-trip
-    (P6). Each sub-request is ``{datasetId, groupBy, measures, filter, bucket,
-    orderBy, limit, offset}``; the cross-table caller merges the aligned rows
-    client-side — the alignment stays a logical client operation (see
-    references/multi-source-alignment.md §6.2)."""
-    out: list[dict[str, Any]] = []
-    for sub in requests:
+def _aggregate_multi_canonical(value: Any) -> str:
+    """Canonicalize a parsed request field for conservative batch matching."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      default=str, separators=(",", ":"))
+
+
+def _aggregate_multi_measure_key(measure: Any) -> str | None:
+    """Return the part of a measure that can affect row ordering.
+
+    ``totalCalc`` is deliberately excluded: it only changes the ungrouped
+    metadata aggregate, never the grouped row values used by ORDER BY.  All
+    other keys are retained, making an unknown future measure option a reason
+    not to merge rather than a reason to guess.
+    """
+    if not isinstance(measure, dict):
+        return None
+    value = dict(measure)
+    value.pop("totalCalc", None)
+    return _aggregate_multi_canonical(value)
+
+
+def _aggregate_multi_order_contract(request: AggregateRequest) -> tuple[Any, ...]:
+    """Describe the SQL ordering that must remain identical after merging.
+
+    Flint's aggregation contract groups by caller-owned dimensions and emits
+    derived aggregate fields (``refs/flint/src/core/aggregate.ts:7-20``).
+    Because the existing SQL path orders by the first matching measure alias,
+    two otherwise identical requests with different default first measures
+    are *not* safely mergeable: one combined ORDER BY cannot preserve both
+    row orders.  This contract makes that distinction explicit.
+    """
+    if not request.group_by:
+        # A no-dimension aggregate has at most one grouped row, so measure
+        # ordering cannot affect the response order.
+        return ("single-row",)
+    if not request.order_by:
+        first = request.measures[0] if request.measures else None
+        return ("default", _aggregate_multi_measure_key(first))
+    ordered: list[tuple[Any, ...]] = []
+    for order in request.order_by:
+        column = order.get("column") if isinstance(order, dict) else None
+        first_matching = next(
+            (measure for measure in request.measures
+             if isinstance(measure, dict) and measure.get("column") == column),
+            None,
+        )
+        # The SQL builder maps a measure-name order to its first measure alias;
+        # dimensions remain raw/grouped columns.  Preserve that first-wins
+        # choice when deciding whether a batch is safe.
+        ordered.append((
+            column,
+            order.get("direction", "desc") if isinstance(order, dict) else None,
+            _aggregate_multi_measure_key(first_matching),
+        ))
+    return ("explicit", *ordered)
+
+
+def _aggregate_multi_total_calc_map(request: AggregateRequest) -> dict[str, Any]:
+    """Mirror aggregate()'s last-declaration-wins totalCalc map."""
+    result: dict[str, Any] = {}
+    for measure in request.measures:
+        if not isinstance(measure, dict):
+            continue
+        column = measure.get("column")
+        if column and measure.get("totalCalc") is not None:
+            result[column] = measure.get("totalCalc")
+    return result
+
+
+def _aggregate_multi_shape_key(request: AggregateRequest) -> tuple[Any, ...]:
+    """Fields that must be equal for one grouped SQL result to serve all rows."""
+    return (
+        _aggregate_multi_canonical(request.group_by),
+        _aggregate_multi_canonical(request.bucket),
+        _aggregate_multi_canonical(request.filter),
+        _aggregate_multi_canonical(request.order_by),
+        request.limit,
+        request.offset,
+        request.top_k_other,
+        request.max_scan_rows,
+        request.max_groups,
+        _aggregate_multi_order_contract(request),
+    )
+
+
+def _aggregate_multi_can_merge(base: AggregateRequest,
+                               candidate: AggregateRequest) -> bool:
+    """Return True only when splitting one aggregate is semantically lossless."""
+    if _aggregate_multi_shape_key(base) != _aggregate_multi_shape_key(candidate):
+        return False
+    # SQL does not promise a stable order among ties.  Adding another measure
+    # to the SELECT list can change that incidental order, so a grouped query
+    # must either have an explicit order or remain on the original path.  An
+    # order covering every grouping dimension gives each group a deterministic
+    # tuple key; a measure-only order does not.
+    if base.group_by:
+        if not base.order_by:
+            return False
+        ordered_columns = {
+            item.get("column") for item in base.order_by if isinstance(item, dict)
+        }
+        if not set(base.group_by).issubset(ordered_columns):
+            return False
+    # ``topKOther`` changes the row shape, not just a cell value.  A merged
+    # query can only project the tail row back losslessly when each child has
+    # the same per-measure addMask; otherwise one child may have no ``其他``
+    # row while the combined query necessarily has one.  Be conservative and
+    # keep those requests on the established one-at-a-time path.
+    if base.top_k_other and _aggregate_multi_mask(base) != _aggregate_multi_mask(candidate):
+        return False
+    # aggregate() caps one SQL response at 12 measures.  Falling back here is
+    # preferable to changing that established validation/response contract.
+    if len(base.measures) + len(candidate.measures) > 12:
+        return False
+    # aggregate() stores totalCalc by column, with last declaration winning.
+    # A conflicting declaration in two sub-requests would make one combined
+    # overall aggregate overwrite the other.  Keep those requests isolated.
+    base_totals = _aggregate_multi_total_calc_map(base)
+    candidate_totals = _aggregate_multi_total_calc_map(candidate)
+    for column in base_totals.keys() & candidate_totals.keys():
+        if base_totals[column] != candidate_totals[column]:
+            return False
+    return True
+
+
+def _aggregate_multi_mask(request: AggregateRequest) -> list[Any] | None:
+    """Pad a per-measure addMask so concatenation cannot shift a later slot."""
+    if request.add_mask is None:
+        return [None] * len(request.measures)
+    values = list(request.add_mask[:len(request.measures)])
+    values.extend([None] * (len(request.measures) - len(values)))
+    return values
+
+
+def _aggregate_multi_split(response: AggregateResponse, request: AggregateRequest,
+                           measure_start: int) -> dict[str, Any]:
+    """Project one request's columns/rows/metadata from a merged response."""
+    dimension_count = len(request.group_by)
+    measure_count = len(request.measures)
+    measure_end = measure_start + measure_count
+    result = response.to_dict()
+    result["columns"] = list(response.columns[:dimension_count]) + [
+        response.columns[dimension_count + index]
+        for index in range(measure_start, measure_end)
+        if dimension_count + index < len(response.columns)
+    ]
+    result["rows"] = [
+        list(row[:dimension_count]) + [
+            row[dimension_count + index] if dimension_count + index < len(row) else None
+            for index in range(measure_start, measure_end)
+        ]
+        for row in response.rows
+    ]
+
+    source = response.aggregates if isinstance(response.aggregates, dict) else {}
+    total_calc = _aggregate_multi_total_calc_map(request)
+    needed_by_column: dict[str, list[str]] = {}
+
+    def add_key(column: Any, key: Any) -> None:
+        if not isinstance(column, str) or not isinstance(key, str):
+            return
+        keys = needed_by_column.setdefault(column, [])
+        if key not in keys:
+            keys.append(key)
+
+    # Reconstruct the same aggregate metadata that a standalone aggregate()
+    # call would expose.  In particular, filtered measures intentionally have
+    # no overall entry, while every effective non-count measure also exposes
+    # the implicit filtered-row count.
+    for measure in request.measures:
+        if not isinstance(measure, dict) or bool(measure.get("filters")):
+            continue
+        column = measure.get("column")
+        requested = measure.get("aggregation", "sum")
+        available = source.get(column) if isinstance(column, str) else None
+        available_keys = available.keys() if isinstance(available, dict) else ()
+        effective = requested
+        # TEXT columns with no parseable numeric values are intentionally
+        # redirected by _measure_operand() to count.  Detect that existing
+        # response shape without probing the table a second time.
+        if effective not in available_keys and requested in NUMERIC_AGGS \
+                and "count" in available_keys:
+            effective = "count"
+        if effective != "none":
+            add_key(column, effective)
+            if effective != "count":
+                add_key(column, "count")
+            if column in total_calc:
+                add_key(column, total_calc[column])
+
+    result["aggregates"] = {
+        column: {key: source[column][key] for key in keys if key in source[column]}
+        for column, keys in needed_by_column.items()
+        if isinstance(source.get(column), dict)
+    }
+    return result
+
+
+def aggregate_multi(engine: Engine, requests: list[dict[str, Any]], *,
+                    cancel_check=None, timeout_seconds: float | None = None) -> list[dict[str, Any]]:
+    """Batch safe same-shape requests while preserving each response contract.
+
+    The endpoint still accepts heterogeneous requests.  Requests sharing one
+    dataset and the complete grouping/filter/bucket/order/page/budget shape are
+    merged into one ``aggregate()`` call; each output is then projected back
+    to its original measure positions.  Any uncertainty (especially default
+    ordering or conflicting totalCalc) deliberately falls back to one call per
+    request.  This follows Flint's caller-owned grouping/aggregation contract
+    rather than inventing a cross-dataset alignment (``refs/flint/src/core/aggregate.ts:7-20``).
+    """
+    deadline = time.monotonic() + float(timeout_seconds) if timeout_seconds is not None else None
+
+    parsed: list[tuple[int, str, AggregateRequest]] = []
+    for index, sub in enumerate(requests):
+        if cancel_check is not None and cancel_check():
+            raise AggregationCancelled("查询已取消")
+        if not isinstance(sub, dict):
+            raise AggregationError("aggregate-multi sub-request must be an object")
         dsid = sub.get("datasetId")
         if not isinstance(dsid, str) or not dsid:
             raise AggregationError("aggregate-multi sub-request requires datasetId")
-        agg_req = parse_request(sub)
-        resp = aggregate(engine, dsid, agg_req)
-        out.append(resp.to_dict())
-    return out
+        parsed.append((index, dsid, parse_request(sub)))
+
+    batches: list[list[tuple[int, str, AggregateRequest]]] = []
+    for item in parsed:
+        for batch in batches:
+            batch_measure_count = sum(len(existing[2].measures) for existing in batch)
+            if (batch[0][1] == item[1]
+                    and batch_measure_count + len(item[2].measures) <= 12
+                    and all(_aggregate_multi_can_merge(existing[2], item[2])
+                            for existing in batch)):
+                batch.append(item)
+                break
+        else:
+            batches.append([item])
+
+    out: list[dict[str, Any] | None] = [None] * len(parsed)
+    for batch in batches:
+        if cancel_check is not None and cancel_check():
+            raise AggregationCancelled("查询已取消")
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise AggregationCancelled("aggregate-multi 超过时间预算")
+        if len(batch) == 1:
+            index, dsid, agg_req = batch[0]
+            response = aggregate(engine, dsid, agg_req, cancel_check=cancel_check,
+                                 timeout_seconds=remaining if remaining is not None else None)
+            out[index] = response.to_dict()
+            continue
+
+        # Concatenating measures is the only transformation sent to SQL.  All
+        # caller-owned dimensions, predicates, bucket, order, pagination,
+        # TOP-K/addMask, totalCalc and hard budgets stay in the shared shape.
+        _, dsid, base = batch[0]
+        merged_measures: list[dict[str, Any]] = []
+        merged_mask: list[Any] = []
+        explicit_mask = False
+        starts: dict[int, int] = {}
+        for index, _sub_dsid, request in batch:
+            starts[index] = len(merged_measures)
+            merged_measures.extend(request.measures)
+            mask = _aggregate_multi_mask(request)
+            merged_mask.extend(mask or [])
+            explicit_mask = explicit_mask or any(value is not None for value in mask or [])
+        merged_request = replace(
+            base,
+            measures=merged_measures,
+            add_mask=merged_mask if explicit_mask else None,
+        )
+        response = aggregate(engine, dsid, merged_request,
+                             cancel_check=cancel_check,
+                             timeout_seconds=remaining if remaining is not None else None)
+        for index, _sub_dsid, request in batch:
+            if cancel_check is not None and cancel_check():
+                raise AggregationCancelled("查询已取消")
+            out[index] = _aggregate_multi_split(response, request, starts[index])
+
+    return [item for item in out if item is not None]
 
 
-def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> AggregateResponse:
+def aggregate(engine: Engine, table_name: str, request: AggregateRequest, *,
+              cancel_check=None, timeout_seconds: float | None = None) -> AggregateResponse:
+    """Run an aggregation and always release an in-flight ownership marker.
+
+    The implementation publishes the marker on the normal cache-put path, but
+    a SQL/validation exception can happen before that point.  Keeping the
+    release in this narrow wrapper prevents identical waiters from being held
+    for the full 30-second stale-owner timeout after a failed query.
+    """
+    try:
+        key = _aggregate_cache_key(engine, table_name, request)
+    except Exception:
+        key = None
+    try:
+        return _aggregate_impl(engine, table_name, request,
+                               cancel_check=cancel_check,
+                               timeout_seconds=timeout_seconds)
+    finally:
+        _inflight_finish(engine, key)
+
+
+def _aggregate_impl(engine: Engine, table_name: str, request: AggregateRequest, *,
+                    cancel_check=None, timeout_seconds: float | None = None) -> AggregateResponse:
     """Run an aggregation request against the engine.
 
     Aggregates map: the response includes sum/mean/min/max/count for each
@@ -507,6 +1023,21 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
     truth validation and consistent meta display.
     """
     start = time.monotonic()
+    if cancel_check is not None and cancel_check():
+        raise AggregationCancelled("查询已取消")
+    def _execute(sql: str, params: tuple = ()):
+        try:
+            return engine.execute(sql, params, cancel_check=cancel_check,
+                                  timeout_seconds=timeout_seconds)
+        except TypeError as exc:
+            # Keep lightweight test/dialect adapters that implement the old
+            # two-argument Engine seam usable; real SQLite/DuckDB engines use
+            # the cancellable keyword path above.
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return engine.execute(sql, params)
+        except (TimeoutError, KeyboardInterrupt) as exc:
+            raise AggregationCancelled(str(exc) or "查询已取消") from exc
     info = engine.table_info(table_name)
     if info is None:
         raise AggregationError(f"table {table_name!r} not loaded")
@@ -565,6 +1096,20 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
         if order.get("column") not in available_cols:
             raise AggregationError(f"orderBy column {order.get('column')!r} not found in table")
 
+    _record_query_pattern(engine, table_name, request)
+    cache_key = _aggregate_cache_key(engine, table_name, request)
+    cached = _aggregate_cache_get(engine, cache_key)
+    if cached is not None:
+        return cached
+    if not _inflight_claim(engine, cache_key, cancel_check=cancel_check):
+        # The owner publishes through _aggregate_cache_put before waking us.
+        cached = _aggregate_cache_get(engine, cache_key)
+        if cached is not None:
+            return cached
+        # Defensive retry if a waiter was released without a cache value.
+        return aggregate(engine, table_name, request, cancel_check=cancel_check,
+                         timeout_seconds=timeout_seconds)
+
     # build SELECT
     select_parts: list[str] = []
     result_cols: list[str] = []
@@ -573,7 +1118,8 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
     # group-by dimensions (with possible bucket substitution)
     for dim in group_by:
         if bucket_dim and dim == bucket_dim and request.bucket:
-            expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine)
+            expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine,
+                                   request.bucket.get("calendar"))
             select_parts.append(f"{expr} AS {_quote(dim)}")
         else:
             select_parts.append(_quote(dim))
@@ -640,13 +1186,41 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
     from_sql = f'FROM {_quote(table_name)}'
     where_sql, where_params = _filter_clause(request.filter, available_cols, engine)
 
+    # Agent/query budgets are hard boundaries.  For an unfiltered table the
+    # loaded row count is authoritative and avoids a second full scan.  With a
+    # predicate, probe only up to max+1 matching rows so a request cannot pull
+    # an unbounded evidence set merely to discover it is too large.  This is a
+    # work-safety guard, not Flint's overflow behavior: the request fails
+    # explicitly instead of silently dropping rows (Flint overflow warnings are
+    # the presentation-layer contract in
+    # ``refs/flint/src/core/filter-overflow.ts:9-20``).
+    budget_report: dict[str, Any] = {}
+    if request.max_scan_rows is not None:
+        max_scan = _budget_int(request.max_scan_rows, "maxScanRows", MAX_SCAN_ROWS)
+        assert max_scan is not None
+        if not request.filter:
+            matched_rows = int(info.row_count)
+        else:
+            probe = _execute(
+                f"SELECT 1 {from_sql} {where_sql} LIMIT {max_scan + 1}",
+                tuple(where_params),
+            )
+            matched_rows = len(probe)
+        budget_report.update({"maxScanRows": max_scan, "matchedRowsChecked": matched_rows})
+        if matched_rows > max_scan:
+            raise AggregationError(
+                f"query budget exceeded: filtered rows exceed maxScanRows={max_scan}; "
+                "请缩小 timeWindow 或筛选范围"
+            )
+
     # GROUP BY clause
     group_sql = ""
     if group_by:
         group_cols = []
         for dim in group_by:
             if bucket_dim and dim == bucket_dim and request.bucket:
-                expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine)
+                expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine,
+                                       request.bucket.get("calendar"))
                 group_cols.append(expr)
             else:
                 group_cols.append(_quote(dim))
@@ -670,11 +1244,19 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
     requested_limit = 500 if request.limit is None else int(request.limit)
     if requested_limit < 1 or requested_limit > 20000:
         raise AggregationError("limit must be between 1 and 20000")
+    if request.max_groups is not None:
+        max_groups = _budget_int(request.max_groups, "maxGroups", MAX_GROUPS)
+        assert max_groups is not None
+        budget_report["maxGroups"] = max_groups
+        # Fetch one sentinel group so the response can fail closed rather than
+        # returning a visually plausible but incomplete member set.
+        if group_sql:
+            requested_limit = min(requested_limit, max_groups + 1)
     offset = max(0, int(request.offset or 0))
     limit_sql = f"LIMIT {requested_limit} OFFSET {offset}"
 
     sql = f"SELECT {', '.join(select_parts)} {from_sql} {where_sql} {group_sql} {order_sql} {limit_sql}"
-    rows = engine.execute(sql, tuple(select_params) + tuple(where_params))
+    rows = _execute(sql, tuple(select_params) + tuple(where_params))
 
     truncated = len(rows) >= requested_limit
     truncated_reason = "result limited; use offset pagination or a smaller Top-N" if truncated else None
@@ -689,9 +1271,21 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
         try:
             count_sql = (f"SELECT COUNT(*) AS n FROM (SELECT 1 {from_sql} {where_sql} "
                          f"{group_sql}) AS _grp")
-            group_total = int(engine.execute(count_sql, tuple(where_params))[0]["n"] or 0)
+            group_total = int(_execute(count_sql, tuple(where_params))[0]["n"] or 0)
+        except AggregationCancelled:
+            raise
         except Exception:  # never fail the response for a cosmetic count
             group_total = len(rows)
+
+    if request.max_groups is not None and group_sql:
+        max_groups = _budget_int(request.max_groups, "maxGroups", MAX_GROUPS)
+        assert max_groups is not None
+        budget_report["groupsChecked"] = group_total
+        if group_total > max_groups:
+            raise AggregationError(
+                f"query budget exceeded: grouped result has more than maxGroups={max_groups}; "
+                "请增加筛选条件或改用 TOP-N"
+            )
 
     # Convert rows to JSON-friendly (datetime -> isoformat, etc.)
     cleaned: list[list[Any]] = []
@@ -725,7 +1319,8 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
             and group_by and group_total > len(cleaned) and any(add_mask)):
         dim0 = group_by[0]
         if bucket_dim and dim0 == bucket_dim and request.bucket:
-            dim0_expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine)
+            dim0_expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine,
+                                        request.bucket.get("calendar"))
         else:
             dim0_expr = _quote(dim0)
         # 尾行谓词：排除「已显示」的维度值。NULL 维度行必须显式处理——
@@ -753,7 +1348,7 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
             if bd is None:
                 omitted = group_total - len(cleaned)
                 tail_sql = f"SELECT {', '.join(agg_exprs)} {from_sql} {tail_where}"
-                tail = engine.execute(tail_sql, tuple(select_params) + tuple(where_params) + tuple(str_labels))
+                tail = _execute(tail_sql, tuple(select_params) + tuple(where_params) + tuple(str_labels))
                 trow = tail[0] if tail else None
                 # 位置别名 _t{i}：行值按请求 measure 顺序取（同名 (列,聚合) 重复请求
                 # 也各占一列，与主查询对齐契约一致）。
@@ -765,22 +1360,25 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
                 # 矩阵（dim × breakdown）：尾部按 breakdown 各补一行；「N 项」=
                 # 被省略的**主维度**标签数（group_total 是 dim×bd 组数，需另数主维度）。
                 shown_dims = {str(r[0]) for r in cleaned}
-                dim_total = int(engine.execute(
+                dim_total = int(_execute(
                     f"SELECT COUNT(*) AS n FROM (SELECT 1 {from_sql} {where_sql} GROUP BY {dim0_expr}) AS _d",
                     tuple(where_params))[0]["n"] or 0)
                 omitted = max(0, dim_total - len(shown_dims))
                 if bd == bucket_dim and request.bucket:
-                    bd_expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine)
+                    bd_expr, _ = _bucket_expr(request.bucket["source"], request.bucket.get("bucket", "month"), engine,
+                                              request.bucket.get("calendar"))
                 else:
                     bd_expr = _quote(bd)
                 tail_sql = (f"SELECT {bd_expr} AS {_quote(bd)}, {', '.join(agg_exprs)} "
                             f"{from_sql} {tail_where} GROUP BY {bd_expr}")
-                for trow in engine.execute(tail_sql, tuple(select_params) + tuple(where_params) + tuple(str_labels)):
+                for trow in _execute(tail_sql, tuple(select_params) + tuple(where_params) + tuple(str_labels)):
                     tvals = list(trow.values())
                     # 第一列 = bd 值，其后按 _t{i} 顺序 = measure_aggs 顺序
                     cleaned.append([f"其他（{omitted} 项）", _jsonable(tvals[0])] + [
                         _jsonable(v) for v in tvals[1:]])
                 other_merged = {"omitted": omitted}
+        except AggregationCancelled:
+            raise
         except Exception:
             other_merged = None  # 合并失败回退纯截断，绝不让响应 500
 
@@ -820,8 +1418,25 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
             select_exprs.append("COUNT(*)")
         exprs_sql = ", ".join(f"{e} AS _o{i}" for i, e in enumerate(select_exprs))
         try:
-            res_row = engine.execute(f"SELECT {exprs_sql} {from_sql} {where_sql}", tuple(where_params))
+            # Keep the ungrouped metadata pass on the same cancellation/timeout
+            # seam as the grouped pass.  A merged F01 query must not become
+            # uncancellable merely because it has reached totalCalc metadata.
+            res_row = engine.execute(
+                f"SELECT {exprs_sql} {from_sql} {where_sql}", tuple(where_params),
+                cancel_check=cancel_check, timeout_seconds=timeout_seconds)
             vals = list(res_row[0].values()) if res_row else [None] * len(select_exprs)
+        except TypeError as exc:
+            # Keep lightweight legacy test/dialect adapters usable without
+            # adding a second SQL execution path to the overall batch.
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            res_row = getattr(engine, "execute")(
+                f"SELECT {exprs_sql} {from_sql} {where_sql}", tuple(where_params))
+            vals = list(res_row[0].values()) if res_row else [None] * len(select_exprs)
+        except (TimeoutError, KeyboardInterrupt) as exc:
+            raise AggregationCancelled(str(exc) or "查询已取消") from exc
+        except AggregationCancelled:
+            raise
         except Exception:
             # 求值失败按旧行为兜底：主聚合 0.0、totalCalc None、count 0（绝不 500）。
             vals = [None] * len(select_exprs)
@@ -836,7 +1451,7 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
                     overall.setdefault(col, {})["count"] = cnt_f
 
     elapsed_ms = int((time.monotonic() - start) * 1000)
-    return AggregateResponse(
+    response = AggregateResponse(
         columns=result_cols,
         rows=cleaned,
         aggregates=overall,
@@ -845,8 +1460,11 @@ def aggregate(engine: Engine, table_name: str, request: AggregateRequest) -> Agg
         group_count=len(cleaned) + offset,
         group_total=group_total,
         other_merged=other_merged,
+        query_budget=budget_report or None,
         elapsed_ms=elapsed_ms,
     )
+    _aggregate_cache_put(engine, cache_key, response)
+    return response
 
 
 def _jsonable(value: Any) -> Any:
@@ -929,6 +1547,17 @@ def parse_request(payload: dict[str, Any]) -> AggregateRequest:
         if not isinstance(add_mask, list) or any(v is not None and not isinstance(v, bool) for v in add_mask):
             add_mask = None
 
+    budget = payload.get("queryBudget")
+    budget = budget if isinstance(budget, dict) else {}
+    max_scan_rows = _budget_int(
+        payload.get("maxScanRows", budget.get("maxScanRows")),
+        "maxScanRows", MAX_SCAN_ROWS,
+    )
+    max_groups = _budget_int(
+        payload.get("maxGroups", budget.get("maxGroups")),
+        "maxGroups", MAX_GROUPS,
+    )
+
     return AggregateRequest(
         group_by=group_by,
         measures=measures,
@@ -939,4 +1568,6 @@ def parse_request(payload: dict[str, Any]) -> AggregateRequest:
         offset=offset,
         top_k_other=top_k_other,
         add_mask=add_mask,
+        max_scan_rows=max_scan_rows,
+        max_groups=max_groups,
     )

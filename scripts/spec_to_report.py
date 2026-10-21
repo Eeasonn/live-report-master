@@ -1353,12 +1353,13 @@ def _bucket_static_rows(chart: dict, rows: list, cols: list, dim: str, bucket: s
         return rows
     agg = chart.get("aggregation", "sum")
     measures = list(chart.get("measures") or [])
+    per_aggs = chart.get("aggregations") or {}
     if dim not in cols or not measures:
         return rows
     # 不可加聚合不能从预聚合行重分桶（average = 日均值的无权平均、countd =
     # 每日去重数求和，都是假数）：有原始表时把时间列替换成桶标签，让
     # _deterministic_rows（唯一聚合实现）直接在目标粒度上重算。
-    if agg in ("average", "countd") and raw_table:
+    if (agg in ("average", "countd") or any(v in ("average", "countd", "min", "max") for v in per_aggs.values())) and raw_table:
         bt = _bucketed_table(raw_table, dim, bucket)
         if bt is not None and bt.get("rows"):
             bd = (chart.get("roles") or {}).get("breakdown")
@@ -1366,7 +1367,8 @@ def _bucket_static_rows(chart: dict, rows: list, cols: list, dim: str, bucket: s
             _max_ms = len(cols) - 1 - (1 if bd and bd in cols else 0)
             try:
                 return _deterministic_rows(bt, dim, _ms[:max(1, _max_ms)], agg, bd,
-                                           filters, limit=5000, sort_and_limit=False)
+                                           filters, limit=5000, sort_and_limit=False,
+                                           aggregations=per_aggs)
             except ValueError:
                 pass
     di = cols.index(dim)
@@ -2123,6 +2125,7 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
             "dimension": dim,
             "measures": c.get("measures") or [],
             "aggregation": c.get("aggregation", "sum"),
+            **({"aggregations": dict(c["aggregations"])} if c.get("aggregations") else {}),
             "measureTypes": c.get("measureTypes") or {},
             "filter": c.get("filter") or [],
             "crossTable": c["_crossTable"],
@@ -2223,6 +2226,7 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
             # multi 分支行数都读它——请求声明 1–3 个行维必须透传，else 分支已有同款）。
             **({"dimensions": list(c["dimensions"])} if c.get("dimensions") else {}),
             "aggregation": c.get("aggregation", "sum"),
+            **({"aggregations": dict(c["aggregations"])} if c.get("aggregations") else {}),
             # 占比堆叠透传（2026-10-13）：运行时 breakdownSeries 与静态 option 同闸。
             **({"stackMode": c["stackMode"]} if c.get("stackMode") else {}),
             "measureTypes": semantic_types,
@@ -2261,6 +2265,7 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
             # 行维度有序列表（P2 三维交叉表，行区第 2 个 = 行头嵌套外层→内层）
             **({"dimensions": list(c["dimensions"])} if c.get("dimensions") else {}),
             "aggregation": c.get("aggregation", "sum"),
+            **({"aggregations": dict(c["aggregations"])} if c.get("aggregations") else {}),
             **({"stackMode": c["stackMode"]} if c.get("stackMode") else {}),
             # Raw time dimension: declare its grain so the runtime groups and
             # labels by the same bucket the compiler used (and so a window derived
@@ -2648,6 +2653,13 @@ def build_manifest(spec: dict, charts: list[dict], placed: list[tuple[dict, int,
     # them out of the default grid prevents a long, low-signal report tail.
     style = spec.get("style") or {}
     accent = {"blue": "#5645d4", "teal": "#2a9d99", "orange": "#dd5b00", "purple": "#7b3ff2"}.get(style.get("accent"), "#5645d4")
+    # 对账锚点勾稽结果（2026-10-15）：声明了 anchors 的构建在编译期硬闸通过后
+    # 把实算/声明落进 quality.anchors，decision_ledger 渲染进 decisions.md——
+    # 手册承诺的「比对结果记入决策清单」，不再只有失败时才说话。空则不加键。
+    _quality_out = dict((spec.get("provenance") or {}).get("quality") or {})
+    _anchor_checks = (spec.get("provenance") or {}).get("anchorChecks") or []
+    if _anchor_checks:
+        _quality_out["anchors"] = _anchor_checks
     manifest = {
         "schemaVersion": 3,
         "reportId": spec.get("reportId", "report"),
@@ -2663,7 +2675,7 @@ def build_manifest(spec: dict, charts: list[dict], placed: list[tuple[dict, int,
         "source": spec.get("source", {}),
         "filters": spec.get("filters", []),
         "filterCandidates": spec.get("filterCandidates", []),
-        "quality": (spec.get("provenance") or {}).get("quality", {}),
+        "quality": _quality_out,
         "blocks": blocks,
         "charts": chart_entries,
         "datasets": spec.get("datasets", []),
@@ -4310,7 +4322,13 @@ def validate_chart_shape(c: dict) -> list[str]:
 _ANCHOR_AGGS = {"sum", "average", "count", "min", "max"}
 
 
-def _check_anchors(spec: dict, tables_by_id: dict, datasets: list) -> list[str]:
+def _anchor_fmt(v: float) -> str:
+    """锚点数字的人类格式：``,.4g`` 对 127,994 这类整数会退化成科学计数法
+    （4 位有效数字装不下 → 1.28e+05），``,.10g`` 日常量级保持千分位原样。"""
+    return f"{v:,.10g}"
+
+
+def _check_anchors(spec: dict, tables_by_id: dict, datasets: list) -> list[dict]:
     """构建期勾稽：``request.anchors`` 声明的合计真值对真实表断言，不符即失败。
 
     brief-template v2 把「对账锚点」（1–3 个合计真值）写进口径槽，此前只靠
@@ -4319,13 +4337,18 @@ def _check_anchors(spec: dict, tables_by_id: dict, datasets: list) -> list[str]:
     1e-6)，可显式 `tolerance`）→ 编译失败并给出实算/声明两个数——宁可构建
     失败，不可带着错数据交付。行级计算列派生在锚点之前完成，所以锚点可以
     引用计算列。
+
+    返回**结构化记录**（label/measure/aggregation/declared/actual/dataset）而非
+    文本行：调用方打印构建日志，并经 spec.provenance.anchorChecks 落进
+    manifest.quality.anchors → decision_ledger 渲染进 decisions.md（手册承诺的
+    「比对结果记入决策清单」，2026-10-15 起不再只有失败时才说话）。
     """
     anchors = spec.get("anchors") or []
     if not anchors:
         return []
     if not datasets:
         raise ValueError("对账锚点（anchors）需要至少一个数据集")
-    notes: list[str] = []
+    records: list[dict] = []
     for i, a in enumerate(anchors):
         label = str(a.get("label") or f"锚点{i + 1}")[:60]
         measure = a["measure"]
@@ -4378,11 +4401,12 @@ def _check_anchors(spec: dict, tables_by_id: dict, datasets: list) -> list[str]:
             and float(tol) >= 0 else max(abs(exp) * 1e-6, 1e-6)
         if abs(got - exp) > tol:
             raise ValueError(
-                f"对账锚点「{label}」不符：{measure} {agg} 实算 {got:,.4g}，"
-                f"声明 {exp:,.4g}（差 {got - exp:+,.4g}）。数据与口径不一致，拒绝编译"
+                f"对账锚点「{label}」不符：{measure} {agg} 实算 {_anchor_fmt(got)}，"
+                f"声明 {_anchor_fmt(exp)}（差 {got - exp:+,.10g}）。数据与口径不一致，拒绝编译"
                 "——请核对锚点数值或数据文件。")
-        notes.append(f"{label}: {measure} {agg} = {got:,.4g} ✓")
-    return notes
+        records.append({"label": label, "measure": measure, "aggregation": agg,
+                        "declared": exp, "actual": got, "dataset": raw})
+    return records
 
 
 def infer_measure_types(columns):
@@ -4670,7 +4694,8 @@ def _row_filter(row: list[Any], columns: list[str], filters: Any) -> bool:
 
 def _deterministic_rows(table: dict, dimension: str | None, measures: list[str], aggregation: str,
                         breakdown: str | None = None, filters: Any = None, limit: int = 500,
-                        sort_and_limit: bool = True, series_filters: Any = None) -> list[list[Any]]:
+                        sort_and_limit: bool = True, series_filters: Any = None,
+                        aggregations: dict[str, str] | None = None) -> list[list[Any]]:
     """Group + aggregate to one row per dimension value (the ONE aggregation path).
 
     ``sort_and_limit=False`` returns every group in first-appearance order without
@@ -4707,14 +4732,15 @@ def _deterministic_rows(table: dict, dimension: str | None, measures: list[str],
         if series_filters:
             grouped = [r for r in grouped if _row_filter(r, columns, series_filters)]
         values: list[Any] = list(key)
-        for mi in mis:
-            if mi is None or aggregation == "count":
+        for measure, mi in zip(measures, mis):
+            method = (aggregations or {}).get(measure, aggregation)
+            if mi is None or method == "count":
                 # Row-count semantics (parity with server COUNT(*) and the JS
                 # runtime): the metric is the number of records in the group,
                 # never a null-count of the measure column.
                 value = len(grouped)
             else:
-                if aggregation == "countd":
+                if method == "countd":
                     # 去重计数（对标 Quick BI BI_COUNTD）：组内**原始值**去重、
                     # 只排 NULL（'' 是合法去重值）——与服务端 COUNT(DISTINCT col)、
                     # 运行时 Set 同一契约。走 float() 管道会把 '001'/'1' 折叠成
@@ -4737,9 +4763,9 @@ def _deterministic_rows(table: dict, dimension: str | None, measures: list[str],
                         except (TypeError, ValueError):
                             pass
                     if not nums: value = None
-                    elif aggregation == "average": value = sum(nums) / len(nums)
-                    elif aggregation == "min": value = min(nums)
-                    elif aggregation == "max": value = max(nums)
+                    elif method == "average": value = sum(nums) / len(nums)
+                    elif method == "min": value = min(nums)
+                    elif method == "max": value = max(nums)
                     else: value = sum(nums)
             values.append(value)
         out.append(values)
@@ -4796,7 +4822,8 @@ def _measure_default_agg(measure_types: dict, col: str, chart_agg: str) -> str:
 
 def _rows_with_derived(table: dict, dimension: str | None, measures: list[str], nodes: list[dict],
                        aggregation: str, breakdown: str | None, filters: Any, limit: int,
-                       measure_types: dict, dimension_bucket: dict | None) -> list[list[Any]]:
+                       measure_types: dict, dimension_bucket: dict | None,
+                       aggregations: dict[str, str] | None = None) -> list[list[Any]]:
     """Grouped rows for a chart whose measures include aggregate-level derived ones.
 
     Order matters and mirrors the runtime: aggregate → **evaluate derived** → sort →
@@ -4808,7 +4835,7 @@ def _rows_with_derived(table: dict, dimension: str | None, measures: list[str], 
     import derived_eval
     by_name = {n["name"]: n for n in nodes}
     used = [n for n in nodes if n["name"] in set(measures)]
-    default_agg = {m: _measure_default_agg(measure_types, m, aggregation)
+    default_agg = {m: (aggregations or {}).get(m) or _measure_default_agg(measure_types, m, aggregation)
                    for m in measures if m not in by_name}
     # 求值集 = 图上指标沿 ref 引用**传递闭包**（公式引用的派生指标也要先算出来）；
     # required_aggregations 同样沿闭包收集依赖——declared 名单曾经把「已声明但不在
@@ -5063,12 +5090,31 @@ def _derive_col_sum(table: dict, col: str, filters: Any = None) -> float | None:
     return sum(vals) if vals else None
 
 
+def _resolve_kpi_dataset(dsid: Any, ds_tables: dict, where: str) -> Any:
+    """KPI 派生槽位的 datasetId 解析（2026-10-15）。
+
+    背景：validate_request 对不匹配 SAFE_ID_RE 的声明 id（如中文名）会确定性
+    改写（单表 → 'primary'）并原地变更 spec——作者随后在 KPI derived 里写的
+    仍是**原 id**，直接 ``ds_tables[dsid]`` 会以 KeyError 栈炸编译而不是可行动
+    报错。单表构建自动落到唯一表（带日志，宽容优先）；多表构建给可行动报错
+    （列出可用 id，静默猜是错误数字的温床）。"""
+    if dsid in ds_tables:
+        return dsid
+    if len(ds_tables) == 1:
+        only = next(iter(ds_tables))
+        print(f"[kpi] {where}: datasetId {dsid!r} 未解析到数据集，"
+              f"单表构建自动落到 {only!r}（声明的 datasets[].id 被归一或拼错时以实际表为准）")
+        return only
+    known = ", ".join(sorted(str(k) for k in ds_tables))
+    raise ValueError(f"{where}: datasetId {dsid!r} 不存在（可用：{known}）——请与 datasets[].id 一致")
+
+
 def _compute_cross_rate(num: dict, den: dict, ds_tables: dict, dimension_keys: dict, spec: dict) -> float | None:
     """Cross-table rate (P3): numerator/denominator aggregate on DIFFERENT
     tables (e.g. 售罄率 = SellOut(sales) / SellIn(stock)). Each side is
     ``{datasetId, column, aggregation}``; filters cascade per table."""
     def side(spec_side: dict) -> float | None:
-        dsid = spec_side.get("datasetId")
+        dsid = _resolve_kpi_dataset(spec_side.get("datasetId"), ds_tables, "KPI derived.rate")
         col = spec_side.get("column")
         agg = spec_side.get("aggregation", "sum")
         tbl = ds_tables[dsid]
@@ -5417,6 +5463,16 @@ def _ds_primary_key(declared_ds: list, did: str) -> list[str] | None:
     return None
 
 
+def _ds_calendar(declared_ds: list, did: str, top_level: Any = None) -> dict | None:
+    """Return the explicit dataset calendar, with top-level primary fallback."""
+    for x in declared_ds:
+        if isinstance(x, dict) and x.get("id") == did and x.get("calendar") is not None:
+            return dict(x["calendar"])
+    if top_level is not None and (not declared_ds or did == (declared_ds[0].get("id") if isinstance(declared_ds[0], dict) else None)):
+        return dict(top_level) if isinstance(top_level, dict) else None
+    return None
+
+
 def _normalize_ctx(spec: dict, table: dict, tables: dict | None = None) -> dict:
     """Per-dataset compilation context for P1 (unrelated tables in one report).
 
@@ -5738,12 +5794,21 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
         _expanded = []
         for c in spec.get("charts", []):
             if isinstance(c, dict) and c.get("chartSpec"):
-                if (c.get("datasetId") or primary_id) != primary_id:
-                    raise ValueError(f"intent DSL (chartSpec) 图表 {c.get('id', '?')} 暂只支持主数据集")
-                compiled = compile_chart_spec(c["chartSpec"], semantic_types, table)
+                intent_dsid = c.get("datasetId") or primary_id
+                if intent_dsid not in ds_tables:
+                    raise ValueError(f"intent DSL (chartSpec) 图表 {c.get('id', '?')} 的 datasetId {intent_dsid!r} 不存在")
+                # The same semantic chart intent is legal on every ordinary
+                # dataset, not just the primary. Local declarations override
+                # report defaults so identically named columns on different
+                # tables need not share a measure type.
+                intent_semantics = dict(semantic_types)
+                intent_semantics.update(ds_mt.get(intent_dsid) or {})
+                compiled = compile_chart_spec(c["chartSpec"], intent_semantics, ds_tables[intent_dsid])
                 _i = len(_expanded) + 1
                 nc = dict(compiled)
                 nc["id"] = c.get("id", f"chart-{_i}")
+                if c.get("datasetId"):
+                    nc["datasetId"] = intent_dsid
                 nc["presetId"] = VIEW_TO_PRESET.get(compiled.get("viewType"), compiled.get("viewType"))
                 nc["title"] = compiled.get("title") or c.get("title", "")
                 # preserve any author-supplied overrides the compiler didn't emit
@@ -5777,7 +5842,7 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
         _enc0 = chart.get("encoding")
         if isinstance(_enc0, dict):
             encoding = dict(_enc0)
-            for _ck in ("dimension", "dimensions", "measures", "aggregation", "breakdown", "breakdowns",
+            for _ck in ("dimension", "dimensions", "measures", "aggregation", "aggregations", "breakdown", "breakdowns",
                         "sort", "limit", "topK", "topKOther", "pagination", "bucket", "measureTypes", "roles"):
                 if _ck not in encoding and chart.get(_ck) is not None:
                     encoding[_ck] = chart[_ck]
@@ -5914,6 +5979,7 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                 # 记录型数据：没有指标列时，行数（COUNT(*)）就是指标。
                 measures = [COUNT_MEASURE]
         authored_agg = encoding.get("aggregation")
+        per_aggs = dict(encoding.get("aggregations") or {})
         if authored_agg is None:
             if measures and measures[0] == COUNT_MEASURE:
                 agg = "count"
@@ -5952,9 +6018,10 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                     _bucket = (db or {}).get("bucket") or _raw_time_bucket(tbl, dim, rl.get(dim))
                     rows = _rows_with_derived(tbl, dim, measures[:2], _der_nodes, agg, breakdown, chart_filters,
                                               int(encoding.get("limit", 500)), chart_mt,
-                                              {"bucket": _bucket} if _bucket else None)
+                                              {"bucket": _bucket} if _bucket else None, per_aggs)
                 else:
-                    rows = _deterministic_rows(tbl, dim, measures[:2], agg, breakdown, chart_filters, int(encoding.get("limit", 500)))
+                    rows = _deterministic_rows(tbl, dim, measures[:2], agg, breakdown, chart_filters,
+                                               int(encoding.get("limit", 500)), aggregations=per_aggs)
                 data_columns = ([dim] if dim else ["维度"]) + measures[:2]
             else:
                 # 无维度兜底：行首用**行号**（旧版误用外层 enumerate 的图表序号，
@@ -5974,9 +6041,10 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                 _bucket = (db or {}).get("bucket") or _raw_time_bucket(tbl, dim, rl.get(dim))
                 rows = _rows_with_derived(tbl, dim, measures, _der_nodes, agg, breakdown, chart_filters,
                                           int(encoding.get("limit", 500)), chart_mt,
-                                          {"bucket": _bucket} if _bucket else None)
+                                          {"bucket": _bucket} if _bucket else None, per_aggs)
             else:
-                rows = _deterministic_rows(tbl, dim, measures, agg, breakdown, chart_filters, int(encoding.get("limit", 500)))
+                rows = _deterministic_rows(tbl, dim, measures, agg, breakdown, chart_filters,
+                                           int(encoding.get("limit", 500)), aggregations=per_aggs)
             data_columns = ([dim] if dim else []) + ([breakdown] if breakdown else []) + [_measure_name(m) for m in measures]
         # Strategy preference: a multi-measure grouped bar is expressed as a
         # bar+line composite (first measure bars, second measure line) so two
@@ -6018,7 +6086,7 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                               "layout": dict(chart["layout"]) if isinstance(chart.get("layout"), dict) else {},
                               "datasetId": dsid,
                               "viewType": view, "dimension": dim, "measures": measures,
-                              "aggregation": agg, "measureTypes": chart_mt,
+                              "aggregation": agg, "aggregations": per_aggs, "measureTypes": chart_mt,
                               # 占比堆叠（2026-10-13 语义批）：图级 stackMode 透传，
                               # 运行时 breakdownSeries 与静态 option 同闸。
                               **({"stackMode": encoding["stackMode"]} if encoding.get("stackMode") == "normalize" else {}),
@@ -6213,8 +6281,13 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                 raise ValueError(str(exc)) from None
         # 对账锚点（brief-template v2 口径槽的 P2 断言）：物化计算列之后的真实表上
         # 勾稽，不符即编译失败——抽查变硬闸，锚点数值不再靠 Agent 手工核对。
-        for _n in _check_anchors(spec, tables_by_id, datasets):
-            print(f"[anchor] {_n}")
+        # 勾稽结果（2026-10-15）同时落 spec.provenance.anchorChecks →
+        # manifest.quality.anchors → decisions.md「对账锚点」节（手册承诺口径）。
+        _anchor_records = _check_anchors(spec, tables_by_id, datasets)
+        for _a in _anchor_records:
+            print(f"[anchor] {_a['label']}: {_a['measure']} {_a['aggregation']} = {_anchor_fmt(_a['actual'])} ✓")
+        if _anchor_records:
+            spec.setdefault("provenance", {})["anchorChecks"] = _anchor_records
         primary_raw = datasets[0].get("raw") or datasets[0]["id"]
         primary_table = tables_by_id[primary_raw]
         authored_mt = dict(spec.get("measureTypes") or {})
@@ -6259,6 +6332,9 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                       "columnTypes": dict((t.get("meta") or {}).get("types") or {}),
                       "columnStats": _column_stats_for(raw, t),
                       "columnRoles": dict(ctx["roles"].get(d.get("raw") or d["id"]) or {})}
+                _calendar_decl = _ds_calendar(declared_ds, d.get("raw") or d["id"], spec.get("calendar"))
+                if _calendar_decl:
+                    ds["calendar"] = _calendar_decl
                 # Row-level derived columns must ride along in REMOTE (mixed /
                 # server) mode too: the server holds no rows in the manifest, so
                 # the declaration is the only way it can re-materialise the same
@@ -6296,6 +6372,9 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                   "columnTypes": dict((t.get("meta") or {}).get("types") or {}),
                   "columnStats": _column_stats_for(raw, t),
                   "columnRoles": dict(ctx["roles"].get(d.get("raw") or d["id"]) or {})}
+            _calendar_decl = _ds_calendar(declared_ds, d.get("raw") or d["id"], spec.get("calendar"))
+            if _calendar_decl:
+                ds["calendar"] = _calendar_decl
             # Keep the whitelist formulas so the runtime recomputes the
             # materialised column after data updates / grid edits. The
             # manifest shape is the canonical ``{"columns": [...]}`` slot

@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 import re
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -225,9 +226,44 @@ def profile_shape(profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_status(path: Path, status: str, *, mode: str, messages: list[str]) -> None:
+def _audit_diagnostics(report: dict | None) -> list[dict[str, str]]:
+    """Stable, machine-readable findings for a planning/repair Agent.
+
+    Human-readable audit messages remain evidence, never executable repair
+    instructions. The Agent may retry transient infrastructure failures, but
+    must not rewrite measures or filters to make a red data-truth check green.
+    """
+    if not report:
+        return []
+    findings = []
+    if report.get('error'):
+        findings.append({'check': 'audit-runner', 'kind': 'infrastructure',
+                         'detail': str(report['error'])[:1000], 'repair': 'retry-audit'})
+    for name, value in (report.get('checks') or {}).items():
+        if value is True or value is None or (isinstance(value, str) and value.startswith('skip:')):
+            continue
+        # Data-truth/semantic mismatches are unsafe to auto-repair. Rendering
+        # and CDP timeouts may be retried, but never silently published.
+        kind = 'data-truth' if any(s in name.lower() for s in ('datatruth', 'semantic', 'formatter')) else 'behavior'
+        findings.append({'check': str(name), 'kind': kind, 'detail': str(value)[:1000],
+                         'repair': 'manual-review' if kind == 'data-truth' else 'inspect-runtime'})
+    if not report.get('passed') and not findings:
+        findings.append({'check': 'audit-runner', 'kind': 'infrastructure',
+                         'detail': str(report.get('scope') or 'no executed checks')[:1000],
+                         'repair': 'retry-audit'})
+    return findings
+
+
+def _write_status(path: Path, status: str, *, mode: str, messages: list[str],
+                  audit: dict | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"status": status, "mode": mode, "messages": messages},
+    payload = {"status": status, "mode": mode, "messages": messages,
+               "phase": "publish" if status == "ready" else "audit" if status == "needs_audit" else "failed"}
+    if audit is not None:
+        payload["audit"] = {"passed": bool(audit.get("passed")),
+                            "scope": audit.get("scope"), "aborted": bool(audit.get("aborted"))}
+        payload["diagnostics"] = _audit_diagnostics(audit)
+    path.write_text(json.dumps(payload,
                                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -320,13 +356,74 @@ def _audit_report(node: str, audit_target: str, workdir: Path) -> dict:
     try:
         audit = run([node, str(SCRIPTS / "audit_editor.mjs"), audit_target], cwd=workdir, timeout=1200)
     except subprocess.TimeoutExpired:
-        return {"passed": False,
-                "error": "browser audit timed out after 1200s（headless 进程组已收割）；"
-                         "产物已生成，请清理残留 Chrome 后单独重跑审计确认"}
+        report = {"passed": False,
+                  "error": "browser audit timed out after 1200s（headless 进程组已收割）；"
+                           "产物已生成，请清理残留 Chrome 后单独重跑审计确认"}
+        (workdir / "browser-audit.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return report
     try:
-        return json.loads(audit.stdout)
+        report = json.loads(audit.stdout)
     except Exception:
-        return {"passed": False, "error": audit.stdout[-1000:] or audit.stderr[-1000:]}
+        report = {"passed": False, "error": audit.stdout[-1000:] or audit.stderr[-1000:]}
+    (workdir / "browser-audit.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
+def _unregister_staged_report(server_base: str, report_id: str) -> None:
+    """Best-effort cleanup of an isolated canary, never the published id."""
+    req = urllib.request.Request(
+        server_base.rstrip('/') + '/api/admin/registry/unregister',
+        data=json.dumps({'reportId': report_id}).encode('utf-8'),
+        headers={'Content-Type': 'application/json'}, method='POST')
+    with urlopen_loopback(req, timeout=30) as resp:
+        resp.read()
+    # h_unregister drops engine tables but deliberately retains normal report
+    # snapshots for recovery. A one-shot canary has no recovery value: remove
+    # only its random, private namespace after confirmed unregister, otherwise
+    # every 335k-row audit would leak another ~40 MiB in the central state.
+    for path in (_state_home() / 'data').glob(report_id + '__*'):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _register_single_server(server_base: str, table_path: Path, spec_path: Path,
+                            report_id: str, profile_json: Path, inherit_argv: list[str],
+                            workdir: Path) -> subprocess.CompletedProcess:
+    return run([sys.executable, str(SCRIPTS / 'serve_report.py'), '--server', server_base,
+                'register', '--data', str(table_path), '--spec', str(spec_path),
+                '--report-id', report_id, "--profile", str(profile_json),
+                '--mode', 'server'] + inherit_argv, cwd=workdir, timeout=1200)
+
+
+def _post_registry_payload(server_base: str, payload: bytes) -> dict:
+    req = urllib.request.Request(server_base.rstrip('/') + '/api/admin/registry/register',
+                                 data=payload, headers={'Content-Type': 'application/json'},
+                                 method='POST')
+    with urlopen_loopback(req, timeout=300) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def _canary_multi_body(body: dict, stage_id: str) -> dict:
+    """Clone only metadata; raw 335k-row tables remain shared until POST completes."""
+    final_id = body['reportId']
+    ids = {d['id']: d['id'].replace(final_id + '__', stage_id + '__', 1)
+           for d in body['datasets']}
+    def remap(value):
+        if isinstance(value, str):
+            return ids.get(value, value)
+        if isinstance(value, list):
+            return [remap(v) for v in value]
+        if isinstance(value, dict):
+            return {k: remap(v) for k, v in value.items()}
+        return value
+    manifest = remap(body['manifest'])
+    manifest['reportId'] = stage_id
+    return {'reportId': stage_id, 'title': body['title'], 'manifest': manifest,
+            'multi': True,
+            'datasets': [{k: (v if k == 'table' else remap(v)) for k, v in d.items()}
+                         for d in body['datasets']]}
 
 
 def _safe_report_id(title: str) -> str:
@@ -625,8 +722,8 @@ Write-Host "[打开报告] 便携版 Python 就绪：$pyDir"
 # 整个报告文件夹可直接打包发给同事——本机没有 Python 会自动下载便携版（一次）。
 # 环境变量：LRM_PYTHON=指定 Python 路径  LRM_PORT=覆盖端口  LRM_STATE_HOME=状态目录  LRM_NO_OPEN=1 只启动不开浏览器
 set -u
-cd "$(dirname "$0")/build" 2>/dev/null || exit 1
 HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE/build" 2>/dev/null || exit 1
 PORT="__PORT__"
 URL="__URL__"
 HEALTH="__HEALTH__"
@@ -755,8 +852,18 @@ if not errorlevel 1 goto serveok
 set /a TRIES+=1
 if %TRIES% lss 100 goto waitup
 :serveok
+rem 大数据集首次装载需要几十秒：等报告 URL 就绪再开浏览器（上限 3 分钟）。
+set /a UTRIES=0
+:urlwait
 powershell -NoProfile -Command "try{(Invoke-WebRequest -Uri '%URL%' -UseBasicParsing -TimeoutSec 3).StatusCode}catch{exit 1}" >nul 2>&1
-if errorlevel 1 echo [打开报告] 提示：%URL% 尚未就绪或端口被其他报告服务占用。可设 LRM_PORT=其他端口 重新运行本启动器。
+if not errorlevel 1 goto urlok
+set /a UTRIES+=1
+if %UTRIES% lss 180 (
+  timeout /t 1 /nobreak >nul
+  goto urlwait
+)
+echo [打开报告] 提示：%URL% 3 分钟内未就绪（大数据集首装可能更久，可稍后刷新浏览器）；也可能是端口被其他报告服务占用——可设 LRM_PORT=其他端口 重新运行本启动器。
+:urlok
 if "%LRM_NO_OPEN%"=="1" exit /b 0
 start "AI Report" "%URL%"
 exit /b 0
@@ -783,7 +890,7 @@ goto :eof
     win_path = report_dir / f"{label}.cmd"
     sh_path = report_dir / f"{label}.sh"
     mac_path.write_text(mac, encoding="utf-8")
-    win_path.write_text(win, encoding="utf-8")
+    win_path.write_bytes(win.replace("\n", "\r\n").encode("utf-8"))  # cmd.exe 需要 CRLF
     sh_path.write_text(mac, encoding="utf-8")  # Linux 与 macOS 同一脚本（uname 分支已覆盖）
     (report_dir / "_bootstrap_python.ps1").write_text(ps1, encoding="utf-8")
     for p in (mac_path, sh_path):
@@ -1357,9 +1464,15 @@ def main() -> int:
     ap.add_argument("--title", default=None,
                     help="with --draft: 草稿标题（缺省「拼版草稿」）")
     args = ap.parse_args()
+    stage_audit = None  # populated only by the single-table server canary path
 
     if args.draft:
         return _run_draft_mode(args)
+
+    if args.audit_required and args.skip_audit:
+        ap.error('--audit-required cannot be combined with --skip-audit')
+    if args.audit_required and (args.audit_scope or os.environ.get('AI_AUDIT_SCOPE')):
+        ap.error('--audit-required requires the full audit; omit --audit-scope / AI_AUDIT_SCOPE')
 
     # 范围化审计：--audit-scope 经环境变量透传给 audit_editor.mjs（run() 会复制
     # os.environ），三个审计调用点无需各自改动。缺省不设置 = 全量审计。
@@ -1683,6 +1796,7 @@ def main() -> int:
             except Exception as exc:
                 messages.append(f"sidecar artifact warning: {exc}")
             status = "ready"
+            report = None
             if args.skip_audit:
                 status = "needs_audit"
                 messages.append("browser audit skipped by request")
@@ -1696,7 +1810,7 @@ def main() -> int:
                     if not report.get("passed"):
                         status = "failed" if args.audit_required else "needs_audit"
                         messages.append(f"browser audit failed or deferred: {report}")
-            _write_status(status_path, status, mode=mode, messages=messages)
+            _write_status(status_path, status, mode=mode, messages=messages, audit=report)
             print(f"=== DONE ({mode}, {status}): {out} ===")
             return 0 if status != "failed" else 2
         # ---- MIXED / 全远端 server：小表内联，大表（或 force_server 下全部）登记到本地服务 ----
@@ -1749,18 +1863,8 @@ def main() -> int:
             return 1
         if lint.stdout.strip():
             messages.extend(lint.stdout.strip().splitlines()[-10:])
-        # mixed 与全远端 server 同一交付口径（2026-09-20 用户反馈）：`out` 只写
-        # **指引入口页**（URL/口令/管理页/重启方法），不再打包半能离线打开的数据
-        # HTML——只要有一张表在服务端，双击文件打开必然「数据加载不出来」。
-        result = run([sys.executable, str(SCRIPTS / "package_report.py"),
-                      "--html", str(draft), "--out", str(out),
-                      "--server-url", server_base,
-                      "--mode", ("server" if force_server else "singlefile"),
-                      "--marker-only"], cwd=workdir)
-        if result.returncode != 0:
-            _write_status(status_path, "failed", mode=mode, messages=[result.stderr[-2000:]])
-            print(result.stderr[-2000:], file=sys.stderr)
-            return 1
+        # Do not replace the public marker before the publish gate has passed.
+        # It is written after successful registry promotion below.
         # 注册本报告的远端（server）数据集（复用全机唯一活着的 server）。
         try:
             _ensure_server(server_base, workdir)
@@ -1813,15 +1917,64 @@ def main() -> int:
             payload_ds.append(item)
         body = {"reportId": report_id, "title": manifest.get("title") or title,
                 "manifest": manifest, "multi": True, "datasets": payload_ds}
-        reg = urllib.request.Request(server_base.rstrip("/") + "/api/admin/registry/register",
-                                     data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"})
+        # Multi-dataset canary: every dataset id in the manifest/payload is
+        # namespaced to stage_id, never the live id. Persist the final payload
+        # to disk and release the huge rows before launching Chrome; after a
+        # green audit, promote by registering the untouched original payload.
+        if args.audit_required and not args.skip_audit:
+            node = shutil.which('node')
+            if not node:
+                _write_status(status_path, 'failed', mode=mode,
+                              messages=['Node.js not found; required pre-publish audit unavailable'])
+                return 2
+            stage_id = ('stg-' + report_id[:58].rstrip('-') + '-' + secrets.token_hex(5))[:79]
+            final_payload = workdir / 'pending-registration.json'
+            final_payload.write_bytes(json.dumps(body, ensure_ascii=False).encode('utf-8'))
+            try:
+                stage_body = _canary_multi_body(body, stage_id)
+                _post_registry_payload(server_base, json.dumps(stage_body, ensure_ascii=False).encode('utf-8'))
+                stage_body = None
+                payload_ds = None
+                body = None
+                _release_build_memory()
+                stage_audit = _audit_report(node, f'{server_base.rstrip("/")}/reports/{stage_id}', workdir)
+                if not stage_audit.get('passed'):
+                    final_payload.unlink(missing_ok=True)
+                    _write_status(status_path, 'failed', mode=mode,
+                                  messages=['pre-publish canary audit failed; published report unchanged'],
+                                  audit=stage_audit)
+                    return 2
+            except Exception as exc:
+                final_payload.unlink(missing_ok=True)
+                _write_status(status_path, 'failed', mode=mode,
+                              messages=[f'canary registration/audit failed: {exc}; published report unchanged'])
+                return 1
+            finally:
+                try:
+                    _unregister_staged_report(server_base, stage_id)
+                except Exception as exc:
+                    messages.append(f'canary cleanup warning: {exc}')
+            reg_payload = final_payload.read_bytes()
+            final_payload.unlink(missing_ok=True)
+        else:
+            reg_payload = json.dumps(body, ensure_ascii=False).encode('utf-8')
         try:
-            with urlopen_loopback(reg, timeout=300) as resp:
-                reg_ok = json.loads(resp.read().decode("utf-8"))
+            reg_ok = _post_registry_payload(server_base, reg_payload)
         except Exception as exc:
             _write_status(status_path, "failed", mode=mode, messages=[f"注册远端数据集失败：{exc}"])
             print(f"注册远端数据集失败：{exc}", file=sys.stderr)
+            return 1
+        reg_payload = None
+        # mixed/server output is a marker only, never a half-working offline
+        # report. Write it *after* a successful registry promotion.
+        result = run([sys.executable, str(SCRIPTS / "package_report.py"),
+                      "--html", str(draft), "--out", str(out),
+                      "--server-url", server_base,
+                      "--mode", ("server" if force_server else "singlefile"),
+                      "--marker-only"], cwd=workdir)
+        if result.returncode != 0:
+            _write_status(status_path, "failed", mode=mode, messages=[result.stderr[-2000:]])
+            print(result.stderr[-2000:], file=sys.stderr)
             return 1
         messages.append(f"mixed 登记远端数据集：{reg_ok.get('datasetIds')}")
         _ship_portable_data(workdir, report_id)
@@ -1851,9 +2004,13 @@ def main() -> int:
         table = None
         _release_build_memory()
         status = "ready"
+        report = None
         if args.skip_audit:
             status = "needs_audit"
             messages.append("browser audit skipped by request")
+        elif stage_audit is not None:
+            report = stage_audit
+            messages.append("pre-publish canary passed full browser audit")
         else:
             node = shutil.which("node")
             if not node:
@@ -1864,7 +2021,7 @@ def main() -> int:
                 if not report.get("passed"):
                     status = "failed" if args.audit_required else "needs_audit"
                     messages.append(f"browser audit failed or deferred: {report}")
-        _write_status(status_path, status, mode=mode, messages=messages)
+        _write_status(status_path, status, mode=mode, messages=messages, audit=report)
         print(f"=== DONE ({mode}, {status}): {out} | {audit_target} ===")
         if status != "failed":
             _print_server_access(server_base, report_id)
@@ -2033,12 +2190,47 @@ def main() -> int:
             _write_status(status_path, "failed", mode=mode, messages=[str(exc)])
             print(str(exc), file=sys.stderr)
             return 1
+        # Agent publish gate: an --audit-required server build first registers
+        # an isolated canary id, runs the full browser audit against it, and
+        # only then touches the published report id. The temporary dataset id
+        # is namespaced by the canary, so a red audit cannot overwrite the
+        # current report's SQLite table or registry entry. Flint's per-encoding
+        # aggregate contract (refs/flint/src/core/aggregate.ts:48-55) is one
+        # reason a static manifest check is insufficient: live reaggregation
+        # must be exercised before publishing.
+        stage_audit = None
+        if args.audit_required and not args.skip_audit:
+            node = shutil.which('node')
+            if not node:
+                _write_status(status_path, 'failed', mode=mode,
+                              messages=['Node.js not found; required pre-publish audit unavailable'])
+                return 2
+            stage_id = ('stg-' + report_id[:58].rstrip('-') + '-' + secrets.token_hex(5))[:79]
+            try:
+                staged = _register_single_server(server_base, table_path, spec_path,
+                                                 stage_id, profile_json, inherit_argv, workdir)
+                if staged.returncode != 0:
+                    _write_status(status_path, 'failed', mode=mode,
+                                  messages=[f'canary registration failed: {staged.stderr[-2000:]}'])
+                    return 1
+                stage_audit = _audit_report(node, f'{server_base}/reports/{stage_id}', workdir)
+                if not stage_audit.get('passed'):
+                    _write_status(status_path, 'failed', mode=mode,
+                                  messages=['pre-publish canary audit failed; published report unchanged'],
+                                  audit=stage_audit)
+                    return 2
+            except subprocess.TimeoutExpired:
+                _write_status(status_path, 'failed', mode=mode,
+                              messages=['canary registration timed out; published report unchanged'])
+                return 1
+            finally:
+                try:
+                    _unregister_staged_report(server_base, stage_id)
+                except Exception as exc:
+                    messages.append(f'canary cleanup warning: {exc}')
         try:
-            result = run([sys.executable, str(SCRIPTS / "serve_report.py"), "--server", server_base, "register",
-                          "--data", str(table_path), "--spec", str(spec_path),
-                          "--report-id", report_id,
-                          "--profile", str(profile_json),
-                          "--mode", "server"] + inherit_argv, cwd=workdir, timeout=1200)
+            result = _register_single_server(server_base, table_path, spec_path,
+                                             report_id, profile_json, inherit_argv, workdir)
         except subprocess.TimeoutExpired:
             # 超时同样要走 status 落盘：裸 traceback 会让 build-status.json 停在
             # 上一次构建的旧值（可能还是 ready）。
@@ -2091,9 +2283,15 @@ def main() -> int:
                   f"可随时在 {server_base}/manager 修改口令或关闭在线编辑")
 
     status = "ready"
+    report = None
     if args.skip_audit:
         status = "needs_audit"
         messages.append("browser audit skipped by request")
+    elif stage_audit is not None:
+        # The audited canary was compiled from the same spec/table and used a
+        # distinct namespace; only reportId differs from the promoted entry.
+        report = stage_audit
+        messages.append("pre-publish canary passed full browser audit")
     else:
         node = shutil.which("node")
         if not node:
@@ -2105,7 +2303,7 @@ def main() -> int:
                 status = "failed" if args.audit_required else "needs_audit"
                 messages.append(f"browser audit failed or deferred: {report}")
 
-    _write_status(status_path, status, mode=mode, messages=messages)
+    _write_status(status_path, status, mode=mode, messages=messages, audit=report)
     print(f"=== DONE ({mode}, {status}): {out} ===")
     if mode == "server" and status != "failed":
         _print_server_access(server_base, report_id)

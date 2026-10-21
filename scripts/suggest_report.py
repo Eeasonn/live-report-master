@@ -30,6 +30,7 @@ from typing import Any
 
 from table_input import load_table_file
 from profile_table import build_profile
+import date_parse
 
 # Top-level list fields are REPLACED wholesale by a patch; dict fields are
 # shallow-merged (patch keys win); scalars are simply overridden.
@@ -78,12 +79,101 @@ def _low_card_dims(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def suggest_charts(profile: dict[str, Any]) -> list[dict[str, Any]]:
+# Flint 聚合角色（refs/flint/src/core/type-registry.ts:104-122）：intensive 量
+# 不可加总、只能平均——榜首事实的聚合方式跟随语义，标题不写「跨品类加总」式伪事实。
+_INTENSIVE_HINTS = {"Price", "Percentage", "PercentageChange", "Score",
+                    "Temperature", "Sentiment", "Correlation"}
+
+
+def _measure_hint(profile: dict[str, Any], name: str) -> str:
+    for c in profile.get("columns") or []:
+        if c.get("name") == name:
+            return c.get("semanticHint") or ""
+    return ""
+
+
+def _time_span(table: dict[str, Any] | None, col: str) -> tuple[str, str] | None:
+    """(首期, 末期) 日历序标签——数据形态能支撑的最低限度「半结论」素材。
+
+    只认真日期值（``parts`` 为 None 的单元一律跳过）；不足两期或首末同 label
+    （单期数据）不产出，回退描述式标题。周值（parts 恒 None）天然跳过。"""
+    if not table or not col:
+        return None
+    cols = table.get("columns") or []
+    if col not in cols:
+        return None
+    ci = cols.index(col)
+    values: list[Any] = []
+    for row in table.get("rows") or []:
+        v = row[ci] if ci < len(row) else None
+        if v is None or str(v).strip() == "" or date_parse.parts(v) is None:
+            continue
+        values.append(v)
+    if len(values) < 2:
+        return None
+    bucket = date_parse.infer_grain(values, col) or "day"
+    keyed = sorted(((date_parse.sort_key(v), str(date_parse.label(v, bucket) or ""))
+                    for v in values), key=lambda kv: kv[0])
+    lo, hi = keyed[0][1], keyed[-1][1]
+    return (lo, hi) if lo and hi and lo != hi else None
+
+
+def _rank_top1(table: dict[str, Any] | None, dim: str, measure: str | None,
+               intensive: bool) -> str | None:
+    """榜首事实：``dim`` 各取值按 ``measure`` 聚合（intensive→average，否则 sum）
+    的最大者。单一取值不产出（flint-chart-author「don't chart blind」的
+    one-real-entity 陷阱：只有一组时「居首」无信息量）。"""
+    if not table or not dim:
+        return None
+    cols = table.get("columns") or []
+    if dim not in cols or (measure is not None and measure not in cols):
+        return None
+    di = cols.index(dim)
+    mi = cols.index(measure) if measure else None
+    acc: dict[str, list[float]] = {}  # key → [sum, count]
+    for row in table.get("rows") or []:
+        key = row[di] if di < len(row) else None
+        if key is None or str(key).strip() == "":
+            continue
+        key = str(key).strip()
+        if mi is None:  # 记录型数据：按行计数
+            cell = acc.setdefault(key, [0.0, 0.0])
+            cell[0] += 1.0
+            cell[1] += 1.0
+            continue
+        v = row[mi] if mi < len(row) else None
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        cell = acc.setdefault(key, [0.0, 0.0])
+        cell[0] += v
+        cell[1] += 1.0
+    if len(acc) < 2:
+        return None
+
+    def _val(cell: list[float]) -> float:
+        return cell[0] / cell[1] if intensive else cell[0]
+
+    return max(acc.items(), key=lambda kv: _val(kv[1]))[0]
+
+
+def suggest_charts(profile: dict[str, Any],
+                   table: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Data-shape heuristics → a short, family-diverse chart list.
 
     Record-type datasets (no numeric measure column; each row = one record) use
     the synthetic row-count measure ``*`` with ``count`` aggregation — the same
     count semantics the compiler/runtime/server all understand.
+
+    ``table`` (optional, the canonical loaded table) upgrades two default titles
+    from mechanical to data-backed semi-conclusions — the trend title gains the
+    calendar time span, the rank title names the leader (aggregation follows the
+    Flint additive/intensive role). Without it, titles stay descriptive. The
+    model is expected to overwrite titles with real findings in its patch; these
+    are just better placeholders (SKILL.md「标题写发现句」).
     """
     columns: list[dict[str, Any]] = profile.get("columns") or []
     by_name = {c.get("name"): c for c in columns}
@@ -125,13 +215,21 @@ def suggest_charts(profile: dict[str, Any]) -> list[dict[str, Any]]:
 
     # 1) Trend over time (highest value signal).
     if times:
-        add("line.trend", f"{measures[0] if has_measures else count_label} 随时间趋势",
-            bind(times[0], primary))
+        m0 = measures[0] if has_measures else count_label
+        span = _time_span(table, times[0])
+        title = f"{m0}走势（{span[0]}→{span[1]}）" if span else f"{m0} 随时间趋势"
+        add("line.trend", title, bind(times[0], primary))
 
     # 2) Rank/compare over a readable category.
     if low_dims:
-        add("bar.rank", f"{low_dims[0]} {('对比' if has_measures else count_label)}",
-            bind(low_dims[0], primary))
+        if has_measures:
+            intensive = _measure_hint(profile, measures[0]) in _INTENSIVE_HINTS
+            top1 = _rank_top1(table, low_dims[0], measures[0], intensive)
+            title = f"{top1}的{measures[0]}居首" if top1 else f"{low_dims[0]} 对比"
+        else:
+            top1 = _rank_top1(table, low_dims[0], None, False)
+            title = f"{top1}记录数最多" if top1 else f"{low_dims[0]} {count_label}"
+        add("bar.rank", title, bind(low_dims[0], primary))
 
     # 3) Two-measure relationship (real measures only).
     if len(measures) >= 2:
@@ -182,7 +280,7 @@ def suggest_request(table_path: str | Path) -> dict[str, Any]:
         "schemaVersion": 1,
         "templateId": "standard-bi-v1",
         "title": _clean_title(stem),
-        "charts": suggest_charts(trimmed),
+        "charts": suggest_charts(trimmed, table),
         **({"columnRoles": ignores} if ignores else {}),
     }
 

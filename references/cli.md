@@ -43,11 +43,11 @@ py scripts\\report_build.py --table input.xlsx --spec report_request.json
 └── build/   (profile/table/draft/manifest/status 等)
 ```
 
-可选参数：`--mode auto|singlefile|server`、`--out <file>`（显式指定报告路径）、`--out-dir <dir>`（自动命名文件夹的父目录，默认当前目录）、`--workdir <dir>`、`--threshold 100000`、`--max-bytes 52428800`、`--max-cardinality 2000`、`--server http://127.0.0.1:8765`、`--skip-audit`、`--audit-required`、`--report-id <id>`（覆盖 reportId；拼版草稿原址转正必需）。pipeline 顺序为 profile → request/table 校验 → 编译 → lint → 打包或注册 → packaged 校验 → 审计。
+可选参数：`--mode auto|singlefile|server`、`--out <file>`（显式指定报告路径）、`--out-dir <dir>`（自动命名文件夹的父目录，默认当前目录）、`--workdir <dir>`、`--threshold 100000`、`--max-bytes 52428800`、`--max-cardinality 2000`、`--server http://127.0.0.1:8765`、`--skip-audit`、`--audit-required`、`--report-id <id>`（覆盖 reportId；拼版草稿原址转正必需）。pipeline 顺序为 profile → request/table 校验 → 编译 → lint → 全量 canary 审计（仅 required server/mixed）→ 注册正式 id → 打包/发布。`--audit-required` 与 `--skip-audit` / `--audit-scope` 互斥。server 与 mixed 都在覆盖正式 reportId 前注册独立 canary 并审计；审计失败不动已发布报告。最终注册过程本身仍非事务性，不能宣称严格原子提交。
 
-server 模式会在目标 localhost 尚未运行时自动启动一个 SQLite server（registry/data/pid 文件均位于 `--workdir`）；已有 server 则复用，不会重复启动。
+server 模式会在目标 localhost 尚未运行时自动启动一个 SQLite server（registry/data/pid 文件在机器级 `~/.ai-html-report/` 或 `LRM_STATE_HOME`）；已有兼容 server 则复用，不会重复启动。
 
-退出码：0 表示 `ready` 或 `needs_audit`；2 表示硬失败（`failed` 或 `--audit-required` 下审计失败）；中间状态保存在 `build/build-status.json`。
+退出码：0 表示 `ready` 或 `needs_audit`；2 表示硬失败（`failed` 或 `--audit-required` 下审计失败）；中间状态保存在 `build/build-status.json`（含 `phase`、`audit` 与结构化 `diagnostics`）。浏览器原始证据另存 `build/browser-audit.json`。Agent 只可对 `infrastructure/retry-audit` 重试，`data-truth/manual-review` 禁止自行改指标或筛选来消红。
 
 ## 输入预处理：缺省直通 vs `--sort` 整理模式（2026-09-18 用户裁决）
 

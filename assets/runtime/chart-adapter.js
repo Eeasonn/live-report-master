@@ -2546,6 +2546,16 @@
     if(sink&&sink.trunc)sink.trunc.merged=true;
     return head.concat([other]);
   }
+  // Agent/editor semantic action: TOP-N members of the breakdown dimension.
+  // This is separate from topK, which caps primary categories.
+  function applyBreakdownTopN(entries,data){
+    var n=Number(data&&data.breakdownTopN||0);
+    if(!n||!entries||!entries.length)return entries;
+    var totals={};entries.forEach(function(e){var k=String(e.breakdown==null?'':e.breakdown);totals[k]=(totals[k]||0)+number(e.values&&e.values[0]);});
+    var keep=Object.keys(totals).sort(function(a,b){return totals[b]-totals[a];}).slice(0,n);
+    var set={};keep.forEach(function(k){set[k]=1;});
+    return entries.filter(function(e){return Object.prototype.hasOwnProperty.call(set,String(e.breakdown==null?'':e.breakdown));});
+  }
   function sortEntries(entries,data,type,chart){
     if(!entries||!entries.length)return entries;
     if(['table','scatter'].indexOf(type)>=0)return entries;
@@ -3177,6 +3187,7 @@
     entries=sortEntries(entries,data,chart.viewType||'bar',chart);
     // sink 必须传（与编辑路径的 applyTopK 同一口径）：编译期 truncation 事实缺席
     // 或已失效（topK 被改过）时，作者视图的 TOP-N 截断只能靠它登记——静默截断 = 报告失真。
+    entries=applyBreakdownTopN(entries,data);
     entries=applyTopK(entries,data,chart.viewType||'bar',sink);
     var allMeasures=(chart.editor&&chart.editor.originalMeasures)||numericColumns(data);
     var roles=data.roles||{};
@@ -3365,6 +3376,7 @@
       // Applies after sorting so the kept entries are the true top-K; the
       // server already LIMITs via data.topK for server mode, and this local
       // slice covers singlefile (official sort + filter semantics).
+      entries=applyBreakdownTopN(entries,data);
       entries=applyTopK(entries,data,type,sink);
       if(['bar','stackedBar','line','area'].indexOf(type)>=0)categoryOption(option,type,data,entries,decimals,chart);
       else if(['pie','donut','funnel'].indexOf(type)>=0)shareOption(option,type,data,entries,decimals,chart);
@@ -3579,12 +3591,19 @@
   // baseline, chart-type recommendation) — no split between skill and Flint.
   var FLINT_TYPES={
     DateTime:{t0:'Temporal',t1:'DateTime',v:['temporal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Date:{t0:'Temporal',t1:'DateTime',v:['temporal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Time:{t0:'Temporal',t1:'DateTime',v:['temporal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Timestamp:{t0:'Temporal',t1:'DateTime',v:['temporal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Year:{t0:'Temporal',t1:'DateGranule',v:['temporal','ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'integer',zero:'arbitrary',pad:0.03},
+    Quarter:{t0:'Temporal',t1:'DateGranule',v:['ordinal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Month:{t0:'Temporal',t1:'DateGranule',v:['ordinal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Week:{t0:'Temporal',t1:'DateGranule',v:['ordinal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Day:{t0:'Temporal',t1:'DateGranule',v:['ordinal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Hour:{t0:'Temporal',t1:'DateGranule',v:['ordinal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'integer',zero:'arbitrary',pad:0},
     YearMonth:{t0:'Temporal',t1:'DateGranule',v:['temporal','ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    YearQuarter:{t0:'Temporal',t1:'DateGranule',v:['temporal','ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
     YearWeek:{t0:'Temporal',t1:'DateGranule',v:['temporal','ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Decade:{t0:'Temporal',t1:'DateGranule',v:['temporal','ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'integer',zero:'arbitrary',pad:0.03},
     Duration:{t0:'Temporal',t1:'Duration',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'unit-suffix',zero:'meaningful',pad:0},
     Amount:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
     Revenue:{t0:'Measure',t1:'Amount',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'currency',zero:'meaningful',pad:0},
@@ -3603,10 +3622,22 @@
     Number:{t0:'Measure',t1:'GenericMeasure',v:['quantitative'],aggRole:'additive',domainShape:'open',diverging:'none',fmt:'decimal',zero:'meaningful',pad:0},
     Rank:{t0:'Discrete',t1:'Rank',v:['ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'integer',zero:'arbitrary',pad:0.08},
     Score:{t0:'Discrete',t1:'Score',v:['quantitative','ordinal'],aggRole:'intensive',domainShape:'bounded',diverging:'conditional',fmt:'decimal',zero:'contextual',pad:0.05},
+    ID:{t0:'Identifier',t1:'ID',v:['nominal'],aggRole:'identifier',domainShape:'open',diverging:'none',fmt:'plain',zero:'arbitrary',pad:0},
     Category:{t0:'Categorical',t1:'Entity',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Name:{t0:'Categorical',t1:'Entity',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
     Status:{t0:'Categorical',t1:'Coded',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
-    Region:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0}
+    Boolean:{t0:'Categorical',t1:'Coded',v:['nominal'],aggRole:'dimension',domainShape:'fixed',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Direction:{t0:'Categorical',t1:'Coded',v:['ordinal','nominal'],aggRole:'dimension',domainShape:'cyclic',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Range:{t0:'Categorical',t1:'Binned',v:['ordinal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Unknown:{t0:'Categorical',t1:'Entity',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Region:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Latitude:{t0:'Geographic',t1:'GeoCoordinate',v:['quantitative','geographic'],aggRole:'dimension',domainShape:'fixed',diverging:'none',fmt:'decimal',zero:'arbitrary',pad:0.02},
+    Longitude:{t0:'Geographic',t1:'GeoCoordinate',v:['quantitative','geographic'],aggRole:'dimension',domainShape:'fixed',diverging:'none',fmt:'decimal',zero:'arbitrary',pad:0.02},
+    Country:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    State:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    City:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    Address:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'dimension',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0},
+    ZipCode:{t0:'Geographic',t1:'GeoPlace',v:['nominal'],aggRole:'identifier',domainShape:'open',diverging:'none',fmt:'plain',zero:'none',pad:0}
   };
   var FLINT_ALIAS={currency:'Amount',percent:'Percentage',count:'Count',duration:'Duration',number:'Quantity',unitless:'Number',price:'Price',cost:'Cost',Rating:'Score'};
   function flintGetType(name){return FLINT_TYPES[name];}
@@ -3619,17 +3650,29 @@
     if(isBool)return 'nominal';
     var isNum=nonNull.every(function(v){return v!==true&&v!==false&&!isNaN(Number(v));});
     if(isNum)return 'quantitative';
-    var dateLike=nonNull.every(function(v){return /^\d|^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(String(v).trim())&&!isNaN(Date.parse(String(v).trim()));});
+    // Mirror the skill's date_parse.parts (flint_core.infer_vis_category), not
+    // Date.parse: the latter accepts invalid/binned strings on some browsers.
+    var dateLike=nonNull.every(function(v){return dateParts(v)!==null;});
     if(dateLike)return 'temporal';
     return 'nominal';
   }
   function flintEncoding(name){var t=FLINT_TYPES[flintCanonicalAlias(name)];return (t&&t.v)||['nominal'];}
+  function flintResolvedEncoding(name,values){
+    var t=FLINT_TYPES[flintCanonicalAlias(name)];if(!t)return flintInferVisCategory(values);
+    var choices=t.v||[];var obs=(values||[]).filter(function(v){return v!=null&&v!=='';});
+    var distinct=Object.create(null);obs.forEach(function(v){distinct[String(v)]=1;});
+    var n=Object.keys(distinct).length;
+    if(n&&choices.indexOf('quantitative')>=0&&choices.indexOf('ordinal')>=0)return n<=12?'ordinal':'quantitative';
+    if(n&&choices.indexOf('temporal')>=0&&choices.indexOf('ordinal')>=0)return n<=6?'ordinal':'temporal';
+    if(obs.length&&choices.length===1&&choices[0]==='quantitative'&&obs.some(function(v){return typeof v==='boolean'||String(v).trim()===''||!Number.isFinite(Number(v));}))return flintInferVisCategory(obs);
+    return choices[0]||'nominal';
+  }
   function flintZeroBaseline(name){var t=FLINT_TYPES[flintCanonicalAlias(name)];return (t&&t.zero)||'none';}
   function flintZeroPad(name){var t=FLINT_TYPES[flintCanonicalAlias(name)];return (t&&t.pad)||0;}
   function flintAdditive(name){var t=FLINT_TYPES[flintCanonicalAlias(name)];return !!(t&&(t.aggRole==='additive'||t.aggRole==='signed-additive'));}
   function flintFieldSemantics(name,values){
     var t=FLINT_TYPES[flintCanonicalAlias(name)];
-    if(t){return {type:flintCanonicalAlias(name),encoding:t.v[0],additive:flintAdditive(name),aggregationDefault:t.aggRole==='additive'||t.aggRole==='signed-additive'?'sum':t.aggRole==='intensive'?'average':'none',zeroBaseline:t.zero,domainShape:t.domainShape,sortDirection:t.v[0]==='ordinal'||t.v[0]==='temporal'?'asc':'desc'};}
+    if(t){var enc=flintResolvedEncoding(name,values);return {type:flintCanonicalAlias(name),encoding:enc,additive:flintAdditive(name),aggregationDefault:t.aggRole==='additive'||t.aggRole==='signed-additive'?'sum':t.aggRole==='intensive'?'average':'none',zeroBaseline:t.zero,domainShape:t.domainShape,sortDirection:enc==='ordinal'||enc==='temporal'?'asc':'desc'};}
     var vis=flintInferVisCategory(values);
     return {type:name,encoding:vis,additive:vis==='quantitative',aggregationDefault:vis==='quantitative'?'sum':'none',zeroBaseline:vis==='quantitative'?'meaningful':'none',domainShape:'open',sortDirection:vis==='temporal'?'asc':'desc'};
   }
@@ -3705,7 +3748,7 @@
       values.forEach(function(v){if(v!=null&&v!==''){var k=String(v);if(!seen[k]){seen[k]=1;card++;}}});
       p.cardinality[f.name]=card;
       var t=FLINT_TYPES[flintCanonicalAlias(f.semLabel||'')];
-      if(t&&(t.aggRole==='additive'||t.aggRole==='signed-additive')){p.measures.push(f);}
+      if(t&&(t.aggRole==='additive'||t.aggRole==='signed-additive'||t.aggRole==='intensive')&&t.v.indexOf('quantitative')>=0){p.measures.push(f);}
       else if(t&&t.v[0]==='temporal'){p.temporals.push(f);}
       else if(t&&t.v[0]==='ordinal'){p.ordinals.push(f);}
       else if(t&&(t.t0==='Categorical'||t.t0==='Geographic')){p.categoricals.push(f);}
@@ -3798,5 +3841,5 @@
     out.sort(function(a,b){return b.score-a.score;});
     return out;
   }
-  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,nonAdditiveMeasureOf:nonAdditiveMeasureOf,flintAxisDomain:flintAxisDomain,semanticNameType:semanticNameType,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
+  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,applyBreakdownTopN:applyBreakdownTopN,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,nonAdditiveMeasureOf:nonAdditiveMeasureOf,flintAxisDomain:flintAxisDomain,semanticNameType:semanticNameType,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintResolvedEncoding:flintResolvedEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
 })(window);

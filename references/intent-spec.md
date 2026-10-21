@@ -22,16 +22,20 @@ formatting, aggregation role, zero-baseline and non-additivity.
   "商品销售额": {"type": "Revenue", "unit": "元"},
   "实付金额":   {"type": "Revenue"},
   "客户地区":   {"type": "Category"},
-  "毛利率":     {"type": "Ratio"}
+  "毛利率":     {"type": "Percentage"}
 }
 ```
 
-Accepted type labels (all degrade to a canonical T2 format without failing):
-- T2 formats: `currency`, `percent`, `count`, `duration`, `number`, `unitless`
-- T1 families: `money`/`revenue`/`Revenue`, `ratio`/`Rate`, `count`, `duration`, `number`
-- T0 families: `measure` (→ `number`), `dimension`/`category`/`time`
-- Chinese tokens: `金额`/`销售额`/`收入` → currency, `占比`/`率` → percent, `人数` → count
-  (see `scripts/semantics/type_registry.py`)
+Accepted type labels are the registered Flint T2 labels in
+`scripts/semantics/flint_core.py` (the complete `refs/flint/src/core/type-registry.ts`
+set plus skill aliases `Revenue`/`Cost`), or canonical measure-format aliases
+`currency`/`price`/`percent`/`count`/`duration`/`number`/`unitless`.
+Unknown labels are **errors**, not silent fallbacks. Temporal/categorical/ID
+annotations remain field semantics and are not inserted into `measureTypes`;
+numeric annotations additionally determine the chart's measure format. `timeUnit`
+is accepted only for temporal types. Do not write Flint's `intrinsicDomain`,
+`divergingMidpoint`, or `sortOrder` until the skill's request/compiler/runtime
+paths support them; the validator rejects unsupported annotation keys.
 
 ### `chart.chartSpec`
 One chart's intent. `chartType` + `encodings` (channel bindings). The x channel
@@ -49,8 +53,8 @@ dimension); an optional `breakdown` adds a 2nd dimension (cross-tab); per-measur
     "encodings": {
       "x": {"field": "订单日期", "timeUnit": "month"},
       "y": [
-        {"measure": "商品销售额", "series": "bar",  "axis": "left"},
-        {"measure": "实付金额",   "series": "line", "axis": "right"}
+        {"measure": "商品销售额", "series": "bar",  "axis": "left", "aggregate": "sum"},
+        {"measure": "实付金额",   "series": "line", "axis": "right", "aggregate": "sum"}
       ]
     }
   }
@@ -58,7 +62,11 @@ dimension); an optional `breakdown` adds a 2nd dimension (cross-tab); per-measur
 ```
 
 ### `chartType`
-Maps to a skill viewType (ECharts family): `mixed`→bar, `bar`→bar,
+`auto` may omit `encodings`: the compiler chooses a real time/category field
+and a real measure (or COUNT(*) for a record dataset), then chooses line/bar.
+Authored x/y bindings take precedence over recommendation. If the data has no
+usable dimension it returns an actionable error rather than inventing a field.
+Explicit chart types map to a skill viewType (ECharts family): `mixed`→bar, `bar`→bar,
 `stackedBar`→stackedBar, `line`→line, `area`→area, `pie`→pie, `donut`→donut,
 `funnel`→funnel, `scatter`→scatter, `table`→table.
 
@@ -69,16 +77,23 @@ semantic_types + chartSpec
   → compile_chart_spec()            (scripts/compile_intent.py)
       resolve semantic types → FieldSemantics  (semantics/type_registry)
       channel rules (degrades category→count, rejects non-additive stack)
-      derive dimension / measures / aggregation / seriesType / seriesAxis /
+      derive dimension / measures / per-measure aggregations / seriesType / seriesAxis /
       dimensionBucket / roles(breakdown)
   → spec_to_report.normalize_request   (expand chartSpec → preset chart)
-  → _chart_manifest_entry              (editor.data carries seriesType/seriesAxis
-                                        /dimensionBucket for the runtime)
+  → _chart_manifest_entry              (editor.data carries aggregations,
+                                        seriesType/seriesAxis/dimensionBucket)
   → runtime optionFor()                (categoryOption renders mixed series + ≤2 Y axes)
 ```
 
 Rules that the compiler enforces on intent:
-- A non-additive measure (percent/unitless) defaults to `average`, never `sum`.
+- Every measure gets its own aggregation: additive→`sum`, intensive→`average`.
+  Precedence is `y[].aggregate` → `chartSpec.aggregation` → field-level
+  `semantic_types[name].aggregation` / `measureTypes[name].aggregation` → Flint
+  aggRole default. Explicit `sum` on an intensive measure
+  is rejected. A mixed Revenue+Price chart therefore remains SUM+AVG on both
+  static first paint and runtime re-aggregation (Flint `aggregate.ts:48-55`).
+- The same `chartSpec` is valid on any declared ordinary dataset via
+  `chart.datasetId` (not just the primary dataset).
 - A category dragged into a measure slot degrades to a row-count.
 - Composite (`series` bar/line) only on a cartesian single-dimension chart;
   2-维度 cross-tab caps measures at 1; single cartesian dimension allows up to 10.

@@ -37,10 +37,10 @@ from __future__ import annotations
 from typing import Any
 
 from semantics.type_registry import resolve_t2, is_non_additive
-from semantics.channel_semantics import channel_action
+from semantics.channel_semantics import channel_action, encoding_type
 from semantics.shape_rules import shape_rule, effective_measure_max, supports_composite
 from semantics import flint_core as fc
-from semantics.recommend import recommend
+from semantics.recommend import build_profile as build_recommend_profile
 
 # Flint chartType (semantic) -> skill viewType (ECharts backend family).
 CHARTTYPE_TO_VIEW = {
@@ -54,18 +54,6 @@ CHARTTYPE_TO_VIEW = {
 
 # Default series glyph per viewType.
 BASE_SERIES = {"bar": "bar", "stackedBar": "bar", "line": "line", "area": "line"}
-
-# Flint recommend display name -> skill chartType key (CHARTTYPE_TO_VIEW).
-RECOMMEND_TO_KEY = {
-    "Line Chart": "line",
-    "Bar Chart": "bar",
-    "Scatter Plot": "scatter",
-    "Pie Chart": "pie",
-    "Donut Chart": "donut",
-    "Grouped Bar Chart": "bar",
-    "Stacked Bar Chart": "stackedBar",
-}
-
 
 class IntentError(ValueError):
     pass
@@ -109,16 +97,16 @@ def _dimension_kind(field: str, semantic_types: dict[str, Any], table: dict | No
     Prefers the declared semantic type's visEncodings, then data inference."""
     sem = semantic_types.get(field)
     label = sem.get("type") if isinstance(sem, dict) else sem
+    values = []
+    if table:
+        cols = table.get("columns") or []
+        if field in cols:
+            j = cols.index(field)
+            values = [r[j] for r in table.get("rows") or [] if j < len(r)]
     t = fc.get_type(fc.canonical_alias(label)) if label else None
     if t and t["visEncodings"]:
-        enc = t["visEncodings"][0]
-        if enc == "temporal":
-            return "time"
-        if enc == "ordinal":
-            return "ordinal"
-        if enc == "quantitative":
-            return "measure"
-        return "category"
+        enc = encoding_type(label, values)
+        return {"temporal": "time", "ordinal": "ordinal", "quantitative": "measure"}.get(enc, "category")
     # No label -> data inference.
     if table:
         cols = table.get("columns") or []
@@ -145,18 +133,33 @@ def compile_chart_spec(chart_spec: Any, semantic_types: dict[str, Any] | None,
     if not isinstance(chart_spec, dict):
         raise IntentError("chartSpec must be an object")
     semantic_types = semantic_types or {}
-    enc = _norm_encoding(chart_spec.get("encodings"))
+    enc = dict(_norm_encoding(chart_spec.get("encodings")))
     chart_type = chart_spec.get("chartType") or "auto"
     ct_lower = str(chart_type).lower()
     if ct_lower in ("auto", "recommend", ""):
-        # Flint recommendation (moved-in recommend.py): pick the top-scoring
-        # chart type from declared semantics, so 'auto' intent is a real choice
-        # driven by data — not a hardcoded default. Only chart types the skill
-        # can render are candidates (heatmap etc. are skipped).
-        recs = recommend(_build_profile_fields(table, semantic_types))
-        chart_type = next((r["chartType"] for r in recs
-                           if RECOMMEND_TO_KEY.get(r["chartType"])), "Bar Chart")
-        ct_lower = RECOMMEND_TO_KEY.get(chart_type)
+        # Flint chart-type-recommendation.ts:22-32 pairs type recommendation
+        # with channel bindings. A bare "auto" must be executable, not pick a
+        # type and then fail because x/y are absent. Respect authored bindings
+        # first; otherwise choose only from actual dimension/measure fields.
+        profile = build_recommend_profile(_build_profile_fields(table, semantic_types))
+        x = _norm_encoding(enc.get("x"))
+        if not x.get("field"):
+            candidates = profile["temporals"] + profile["categoricals"] + profile["ordinals"]
+            if not candidates:
+                raise IntentError("chartType:auto needs a time/category dimension; specify encodings.x.field")
+            x = {"field": candidates[0]["name"]}
+            enc["x"] = x
+        if not enc.get("y"):
+            candidates = [f for f in profile["measures"] if f["name"] != x["field"]]
+            enc["y"] = [{"measure": candidates[0]["name"]}] if candidates else [{"measure": "*", "aggregate": "count"}]
+        kind = _dimension_kind(x["field"], semantic_types, table)
+        if kind == "measure":
+            raise IntentError("chartType:auto cannot use a measure as its category axis; choose a dimension or an explicit scatter chart")
+        _x_sem = semantic_types.get(x["field"])
+        _x_label = (_x_sem.get("type") if isinstance(_x_sem, dict) else _x_sem) or ""
+        _x_type = fc.get_type(fc.canonical_alias(_x_label))
+        ct_lower = "line" if kind == "time" or (_x_type and _x_type["t0"] == "Temporal") else "bar"
+        chart_type = ct_lower
     view = CHARTTYPE_TO_VIEW.get(ct_lower)
     if view is None:
         raise IntentError(f"unsupported chartType: {chart_type!r}")
@@ -207,19 +210,56 @@ def compile_chart_spec(chart_spec: Any, semantic_types: dict[str, Any] | None,
         out["seriesAxis"] = series_axis
 
     # ---- aggregation ---------------------------------------------------------
+    # Flint encodings own their aggregate independently (aggregate.ts:48-55).
+    # A chart-wide average for Revenue + Price silently changes Revenue SUM into
+    # AVG. Keep the legacy chart-level slot for callers, but emit the complete
+    # per-measure decision map for both static compilation and live re-aggregation.
+    allowed_aggs = {"sum", "average", "count", "countd", "min", "max"}
     preferred_agg = chart_spec.get("aggregation")
-    # For a measure that is non-additive (percent/unitless) default to average;
-    # a category dragged into measures degrades to count (channel semantics).
-    agg = preferred_agg or "sum"
-    non_additive_measures = [m for m in measures if is_non_additive(
-        (semantic_types.get(m) or {}).get("type") if isinstance(semantic_types.get(m), dict) else None)]
-    if non_additive_measures and agg == "sum":
-        agg = "average"
-    out["aggregation"] = agg
+    if preferred_agg is not None and preferred_agg not in allowed_aggs:
+        raise IntentError(f"unsupported chartSpec.aggregation: {preferred_agg!r}")
+    per_agg: dict[str, str] = {}
+    for item in y:
+        m = _resolve_measure_enc(item)
+        name = m["measure"]
+        entry = semantic_types.get(name)
+        declared_agg = entry.get("aggregation") if isinstance(entry, dict) else None
+        explicit = m.get("aggregate")
+        if explicit is None:
+            explicit = m.get("aggregation")
+        if explicit is None:
+            explicit = preferred_agg if preferred_agg is not None else declared_agg
+        if explicit is not None and explicit not in allowed_aggs:
+            raise IntentError(f"unsupported aggregate for {name!r}: {explicit!r}")
+        label = (entry.get("semantic") or entry.get("type")) if isinstance(entry, dict) else entry
+        resolved = fc.get_type(fc.canonical_alias(label or ""))
+        kind = _dimension_kind(name, semantic_types, table) if name != "*" else "category"
+        if resolved and "quantitative" in resolved["visEncodings"] and resolved["aggRole"] == "intensive":
+            kind = "measure"  # Score may be ordinal on x but numeric on y.
+        action = channel_action(kind, "measure", label, view)
+        if action["action"] == "reject":
+            raise IntentError(f"{name!r} cannot be used as a measure ({action['reason']})")
+        if action["action"] == "count" or name == "*":
+            if explicit not in (None, "count"):
+                raise IntentError(f"{name!r} is categorical; use count, not {explicit}")
+            per_agg[name] = "count"
+            continue
+        intensive = (resolved and resolved["aggRole"] == "intensive") or is_non_additive(label)
+        if explicit == "sum" and intensive:
+            raise IntentError(f"{name!r} is non-additive; use average instead of sum")
+        per_agg[name] = explicit or ("count" if name == "*" else "average" if intensive else "sum")
+    out["aggregation"] = per_agg[measures[0]]
+    out["aggregations"] = per_agg
 
     # ---- breakdown (optional 2nd dimension, cross-tab) -----------------------
     bd = _norm_encoding(enc.get("breakdown")).get("field")
     if bd:
+        bd_sem = semantic_types.get(bd)
+        bd_type = (bd_sem.get("type") if isinstance(bd_sem, dict) else bd_sem) or ""
+        bd_kind = _dimension_kind(bd, semantic_types, table)
+        bd_action = channel_action(bd_kind, "breakdown", bd_type, view)
+        if bd_action["action"] == "reject":
+            raise IntentError(f"{bd!r} cannot be used as breakdown ({bd_action['reason']})")
         out["roles"] = {"breakdown": bd}
 
     # ---- limit / topK --------------------------------------------------------

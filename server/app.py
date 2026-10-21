@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import hmac
 import json
+import csv
+import io
 import os
 import re
 import socket
@@ -22,12 +25,17 @@ import sys
 import threading
 import time
 import copy
+import math
+import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .aggregator import AggregationError, aggregate, aggregate_multi, parse_request
+from .aggregator import (AggregationError, aggregate, aggregate_multi, aggregate_cache_summary,
+                         explain_index_candidate, index_suggestions, parse_request)
+from .index_advisor import (IndexAdvisor, IndexAdvisorError, IndexProposalConflict,
+                            IndexProposalNotFound)
 from .derived_columns import (DERIVED_KIND, apply_dataset_derived, apply_dim_groups, columns_decl,
                               dim_group_table_defs, dim_groups_defs, ensure_dim_groups,
                               ensure_table_defs, replay_all as replay_columns,
@@ -44,6 +52,136 @@ from .servers_index import (
 )
 from .store import Engine, TableInfo, TableSchemaError, get_engine
 from .truth import validate_truth
+
+_COPILOT_JOB_TIMEOUT_SECONDS = 120
+_COPILOT_RATE_WINDOW_SECONDS = 60
+_COPILOT_RATE_LIMIT = 30
+_COPILOT_RATE_LOCK = threading.Lock()
+_COPILOT_RATE: dict[str, list[float]] = {}
+_MONITOR_TOOLS = frozenset({"anomaly_scan", "compare_periods", "data_quality", "profile_dataset"})
+
+
+def _validate_monitor_definition(tool: Any, args: Any) -> tuple[str, dict[str, Any]]:
+    """Validate a durable monitor at creation, not only when it eventually runs.
+
+    A monitor is a persisted Agent tool call. Reuse the same Tool Registry
+    schema so malformed/side-effecting payloads fail before becoming a
+    long-lived scheduled job; the scheduler remains read-only by construction.
+    """
+    name = str(tool or "")
+    if name not in _MONITOR_TOOLS or not isinstance(args, dict):
+        raise ValueError("monitor requires a supported read tool and object args")
+    from .agent_tools import ToolContractError, default_registry
+    try:
+        registry = default_registry()
+        spec = registry.get(name)
+        if spec.side_effect != "none":
+            raise ToolContractError("monitor tool must be read-only")
+        registry.validate_args(name, args)
+    except ToolContractError as exc:
+        raise ValueError(f"monitor args invalid: {exc}") from exc
+    return name, dict(args)
+
+
+def _monitor_evidence_hash(value: Any) -> str:
+    """Hash stable monitor evidence so repeated unchanged runs can be deduped."""
+    def stable(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {str(key): stable(child) for key, child in sorted(item.items(), key=lambda pair: str(pair[0]))
+                    if str(key) not in {"elapsedMs", "evidenceHash", "changed", "previousEvidenceHash"}}
+        if isinstance(item, list):
+            return [stable(child) for child in item]
+        return item
+    payload = json.dumps(stable(value), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _agent_subject_hash(handler: Any) -> str:
+    """Return a stable, non-reversible identity bucket for governance/rate limits."""
+    claims = getattr(handler, "agent_claims", None) or {}
+    subject = str(claims.get("subject") or "")
+    if not subject:
+        address = getattr(handler, "client_address", ("unknown", 0))
+        subject = f"ip:{address[0]}"
+    return hashlib.sha256(subject.encode("utf-8")).hexdigest()[:32]
+
+
+def _report_tenant_id(entry: Mapping[str, Any] | None) -> str:
+    """Read an optional report tenant boundary without exposing its value."""
+    if not isinstance(entry, Mapping):
+        return ""
+    manifest = entry.get("manifest") if isinstance(entry.get("manifest"), Mapping) else {}
+    security = manifest.get("security") if isinstance(manifest.get("security"), Mapping) else {}
+    value = entry.get("tenantId") or manifest.get("tenantId") or security.get("tenantId")
+    return str(value or "").strip()[:120]
+
+
+def _validate_tenant_id(value: Any) -> str:
+    tenant = str(value or "").strip()
+    if tenant and not re.fullmatch(r"[A-Za-z0-9._:-]{1,120}", tenant):
+        raise BadRequest("tenantId must contain only bounded ASCII scope characters")
+    return tenant
+
+
+def _tenant_scope_hash(handler: Any) -> str:
+    claims = getattr(handler, "agent_claims", None) or {}
+    tenant = str(claims.get("tenantId") or "")
+    return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:32] if tenant else "none"
+
+
+def _governance_scope(handler: Any, report_id: str) -> str:
+    """Scope provider budgets by report + hashed actor, never raw identity."""
+    return f"{report_id}\x00{_tenant_scope_hash(handler)}\x00{_agent_subject_hash(handler)}"
+
+
+def _notification_proposal_id(report_id: str, channel: str, destination: str,
+                              message: str) -> str:
+    proposal = {"reportId": report_id, "channel": channel,
+                "destination": destination, "message": message,
+                "requiresApproval": True, "sideEffect": "notify"}
+    return "notify-" + hashlib.sha256(
+        json.dumps(proposal, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:20]
+
+
+def _serialize_evidence_export(value: Any, fmt: str, cancel_check: Callable[[], bool] | None = None) -> tuple[bytes, str, str]:
+    """Serialize bounded Agent evidence without exposing server paths."""
+    def check_cancel() -> None:
+        if cancel_check is not None and cancel_check():
+            raise _jobs.JobCancelled("证据导出已取消")
+
+    if fmt == "json":
+        encoder = json.JSONEncoder(ensure_ascii=False, indent=2, default=str)
+        chunks: list[str] = []
+        for index, chunk in enumerate(encoder.iterencode(value)):
+            if index % 64 == 0:
+                check_cancel()
+            chunks.append(chunk)
+        check_cancel()
+        return "".join(chunks).encode("utf-8"), "application/json; charset=utf-8", "json"
+    if fmt == "markdown":
+        raw_json, _content_type, _extension = _serialize_evidence_export(value, "json", cancel_check)
+        lines = ["# Agent evidence", "", "```json", raw_json.decode("utf-8"), "```", ""]
+        return "\n".join(lines).encode("utf-8"), "text/markdown; charset=utf-8", "md"
+    if fmt == "csv":
+        rows = value.get("rows") if isinstance(value, dict) else None
+        columns = value.get("columns") if isinstance(value, dict) else None
+        if not isinstance(rows, list):
+            rows = []
+        if not isinstance(columns, list):
+            columns = []
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream)
+        if columns:
+            writer.writerow(columns)
+        for index, row in enumerate(rows):
+            if index % 128 == 0:
+                check_cancel()
+            writer.writerow(row if isinstance(row, list) else [row])
+        check_cancel()
+        return stream.getvalue().encode("utf-8-sig"), "text/csv; charset=utf-8", "csv"
+    raise BadRequest("format must be json, csv or markdown")
 
 
 # ---------------------- response helpers ----------------------------------------
@@ -353,6 +491,17 @@ def write_dataset_snapshot(path: Path, columns: list, rows: list) -> None:
     os.replace(tmp, path)
 
 
+def _register_full_entry(registry, report_id: str, entry: dict) -> None:
+    """Persist a complete entry for non-job handlers.
+
+    Replace jobs must use ``_commit_replace_result`` instead: their entry is a
+    stale task-start snapshot and writing it wholesale can roll back a newer
+    editor save.  Keeping ordinary full-entry writes behind this explicitly
+    named seam also makes that distinction visible to the source-level guard.
+    """
+    registry.register(report_id, entry)
+
+
 def _commit_replace_result(registry, reportId: str, entry: dict, datasetId: str) -> None:
     """替换/增量/追加任务的收尾落表（lost-update 防护，2026-09-26）。
 
@@ -372,7 +521,11 @@ def _commit_replace_result(registry, reportId: str, entry: dict, datasetId: str)
     """
     latest = registry.get(reportId)
     if latest is None:
-        registry.register(reportId, entry)
+        # The report may have been deleted while the durable job was running.
+        # Never resurrect a stale task snapshot: that would undo the deletion
+        # and reintroduce the lost-update bug this merge helper is meant to
+        # prevent.  The engine/snapshot work is already complete, but there is
+        # no live registry entry to commit it to.
         return
     task_meta = next((d for d in (entry.get("datasets") or [])
                       if isinstance(d, dict) and d.get("id") == datasetId), None)
@@ -414,6 +567,27 @@ def _commit_replace_result(registry, reportId: str, entry: dict, datasetId: str)
         log.append(task_log[-1])
         latest["changelog"] = log
     registry.register(reportId, latest)
+
+
+def _touch_dataset_revision(entry: dict, dataset_id: str, token: str | None = None) -> str:
+    """Advance the opaque dataset revision in registry and manifest metadata.
+
+    ``rowCount``/``dataAsOf`` are useful but do not change when a same-sized
+    replacement edits values. The revision is intentionally an opaque,
+    bounded token: it is only for stale-card fencing, never a data or path
+    identifier. ReportContext includes it alongside the semantic card key so
+    a delayed Agent result cannot target a same-shaped new snapshot.
+    """
+    value = str(token or f"r{time.time_ns():x}")[:40]
+    for item in (entry.get("datasets") or []):
+        if isinstance(item, dict) and item.get("id") == dataset_id:
+            item["dataRevision"] = value
+    manifest = entry.get("manifest")
+    if isinstance(manifest, dict):
+        for item in (manifest.get("datasets") or []):
+            if isinstance(item, dict) and item.get("id") == dataset_id:
+                item["dataRevision"] = value
+    return value
 
 
 class BadRequest(ValueError): pass
@@ -558,8 +732,462 @@ def _generate_password(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _cleanup_queued_replace_input(registry: Registry, job: dict[str, Any]) -> bool:
+    """Delete a queued replace input after cancellation, without path escape."""
+    payload = job.get("payload") if isinstance(job, dict) else None
+    name = payload.get("inputName") if isinstance(payload, dict) else None
+    if not isinstance(name, str) or not re.fullmatch(
+            r"replace-[A-Fa-f0-9]{24}(?:\.[A-Za-z0-9]{1,9})?", name):
+        return False
+    queue_dir = (Path(registry.path.parent) / "queued-replace").resolve()
+    path = (queue_dir / name).resolve()
+    if path.parent != queue_dir:
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_evidence_export(registry: Registry, job: dict[str, Any]) -> bool:
+    """Remove an export artifact when cancellation wins terminal publication."""
+    job_id = job.get("id") if isinstance(job, dict) else None
+    if not isinstance(job_id, str) or not re.fullmatch(r"job-[A-Fa-f0-9]{12}", job_id):
+        return False
+    export_dir = (Path(registry.path.parent) / "copilot-exports").resolve()
+    removed = False
+    for extension in ("json", "csv", "md"):
+        path = export_dir / f"export-{job_id}.{extension}"
+        try:
+            path.unlink(missing_ok=True)
+            removed = removed or not path.exists()
+        except OSError:
+            pass
+    return removed
+
+
+def _prune_evidence_exports(registry: Registry, *, now: float | None = None) -> int:
+    """Reclaim 600-second export artifacts even when nobody downloads them."""
+    export_dir = (Path(registry.path.parent) / "copilot-exports").resolve()
+    if not export_dir.is_dir():
+        return 0
+    current = time.time() if now is None else float(now)
+    removed = 0
+    try:
+        entries = list(export_dir.iterdir())[:512]
+    except OSError:
+        return 0
+    for path in entries:
+        if not path.is_file() or not re.fullmatch(
+                r"export-job-[A-Fa-f0-9]{12}\.(?:json|csv|md)", path.name):
+            continue
+        try:
+            if current - path.stat().st_mtime > 600:
+                path.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def dispatch_queued_job(engine: Engine, registry: Registry,
+                        job: dict[str, Any], progress: Callable[[str], None]) -> dict[str, Any]:
+    """Dispatch durable queue payloads that are safe to reconstruct elsewhere.
+
+    Monitor/Agent jobs carry only bounded typed payloads; the worker reloads
+    the current report manifest instead of serializing rows or Python
+    closures.  Write/notify kinds fail closed so an external worker cannot
+    accidentally execute a future side-effecting job.
+    """
+    payload = job.get("payload") or {}
+    report_id = str(job.get("reportId") or "")
+    entry = registry.get(report_id)
+    if entry is None:
+        raise ValueError("report for queued Agent job is not registered")
+    job_id = str(job.get("id") or "")
+    cancel_check = lambda: _jobs.is_cancel_requested(job_id)
+
+    if job.get("kind") == "agent_plan":
+        plan = payload.get("plan") if isinstance(payload, dict) else None
+        if not isinstance(plan, dict):
+            raise ValueError("queued Agent plan payload is invalid")
+        from .agent_executor import execute_plan
+        from .agent_tools import default_registry
+        progress("校验分析计划")
+        return execute_plan(plan, default_registry(), engine=engine, entry=entry,
+                            role="viewer", cancel_check=cancel_check, progress=progress,
+                            max_seconds=float((plan.get("budget") or {}).get("maxSeconds", 120)))
+
+    if job.get("kind") == "copilot":
+        if not isinstance(payload, dict) or not isinstance(payload.get("message"), str):
+            raise ValueError("queued Copilot payload is invalid")
+        from .copilot import load_config, model_complete, run_turn
+        progress("模型处理中")
+        return run_turn(
+            entry, engine, load_config(registry), payload["message"],
+            str(payload.get("chartId") or ""), payload.get("history") or [],
+            complete=lambda cfg, msgs: model_complete(
+                cfg, msgs, cancel_check=cancel_check,
+                health_path=registry.path.parent / "provider-health.sqlite3",
+                governance_scope=str(payload.get("governanceScope") or report_id)),
+            cancel_check=cancel_check, timeout_seconds=120,
+            context_key=payload.get("contextKey"),
+            filter_scopes=payload.get("filterScopes"))
+
+    if job.get("kind") == "evidence_export":
+        source_id = str(payload.get("sourceId") or "") if isinstance(payload, dict) else ""
+        fmt = str(payload.get("format") or "json").lower() if isinstance(payload, dict) else "json"
+        source = _jobs.get(source_id)
+        if source is None or source.get("reportId") != report_id or source.get("status") != "done":
+            raise ValueError("source evidence job is not complete")
+        progress("整理证据")
+        evidence = (source.get("result") or {}).get("steps") if isinstance(source.get("result"), dict) else source.get("result")
+        raw, content_type, extension = _serialize_evidence_export(
+            evidence, fmt, cancel_check=cancel_check)
+        if len(raw) > 20 * 1024 * 1024:
+            raise ValueError("证据导出超过 20MB 上限，请缩小查询范围")
+        export_dir = registry.path.parent / "copilot-exports"
+        export_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = export_dir / f"export-{job_id}.{extension}"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with tmp.open("wb") as stream:
+                for offset in range(0, len(raw), 64 * 1024):
+                    if cancel_check():
+                        raise _jobs.JobCancelled("证据导出已取消")
+                    stream.write(raw[offset:offset + 64 * 1024])
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            if cancel_check():
+                # Cancellation may arrive after the last chunk but before the
+                # worker publishes its terminal state. Do not leave a file
+                # whose source Job will be reported as cancelled.
+                path.unlink(missing_ok=True)
+                raise _jobs.JobCancelled("证据导出已取消")
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return {"exportId": job_id, "format": fmt, "bytes": len(raw),
+                "contentType": content_type}
+
+    if job.get("kind") == "replace":
+        if not isinstance(payload, dict):
+            raise ValueError("queued replace payload is invalid")
+        input_name = str(payload.get("inputName") or "")
+        if not re.fullmatch(r"replace-[A-Fa-f0-9]{24}(?:\.[A-Za-z0-9]{1,9})?", input_name):
+            raise ValueError("queued replace input name is invalid")
+        mode = str(payload.get("mode") or "replace")
+        if mode not in {"replace", "upsert", "append"}:
+            raise ValueError("queued replace mode is invalid")
+        key_cols = payload.get("keyCols")
+        if key_cols is not None and (not isinstance(key_cols, list) or
+                                     any(not isinstance(item, str) for item in key_cols)):
+            raise ValueError("queued replace keyCols is invalid")
+        input_dir = Path(registry.path.parent) / "queued-replace"
+        path = (input_dir / input_name).resolve()
+        if path.parent != input_dir.resolve() or not path.exists():
+            raise ValueError("queued replace input is missing")
+        try:
+            suffix = path.suffix.lower()
+            if suffix == ".json":
+                with path.open("r", encoding="utf-8") as stream:
+                    table = json.load(stream)
+            else:
+                progress(f"解析文件（{suffix.lstrip('.') or 'upload'}）中…")
+                from table_input import load_table_file as _load_table_file
+                loaded = _load_table_file(str(path))
+                table = {"columns": [str(c) for c in loaded.get("columns") or []],
+                         "rows": [list(r) for r in loaded.get("rows") or []]}
+            if not isinstance(table, dict):
+                raise ValueError("queued replace table is invalid")
+            progress("执行数据替换")
+            return _process_replace_table_impl(engine, registry, report_id, str(job.get("datasetId") or ""),
+                                               table, mode, key_cols, progress)
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    if job.get("kind") != "monitor":
+        raise ValueError(f"worker dispatcher does not support job kind {job.get('kind')!r}")
+    monitor_id = str(payload.get("monitorId") or job.get("datasetId", "").removeprefix("monitor:"))
+    monitor = next((item for item in _jobs.list_monitors(report_id)
+                    if item.get("id") == monitor_id), None)
+    if monitor is None:
+        raise ValueError("monitor definition no longer exists")
+    from .agent_executor import envelope
+    from .agent_tool_runner import execute_read_tool
+    progress("执行监控查询")
+    value = execute_read_tool(monitor["tool"], monitor["args"], engine=engine, entry=entry,
+                              cancel_check=cancel_check,
+                              timeout_seconds=60)
+    evidence_hash = _monitor_evidence_hash(value)
+    previous_hash = None
+    previous_job_id = str(payload.get("previousJobId") or "")
+    if previous_job_id:
+        previous_job = _jobs.get(previous_job_id)
+        previous_result = previous_job.get("result") if isinstance(previous_job, Mapping) else None
+        if isinstance(previous_result, Mapping) and isinstance(previous_result.get("evidenceHash"), str):
+            previous_hash = previous_result["evidenceHash"]
+    return {"monitorId": monitor["id"], "name": monitor["name"],
+            "tool": monitor["tool"], "evidence": value,
+            "evidenceHash": evidence_hash,
+            "previousEvidenceHash": previous_hash,
+            "changed": previous_hash is None or previous_hash != evidence_hash,
+            "provenance": envelope(monitor["tool"], monitor["args"], value)}
+
+
+def _process_replace_table_impl(engine, registry, reportId, datasetId, table, mode, key_cols, progress=None):
+    """h_dataset_replace 的重管道（唯一实现：同步请求线程 / 异步 job 线程共用）。
+
+    形状/列集闸 → 合并（upsert）/替换/追加（append）→ 计算列与维度值分组
+    重算 → 装载 → 快照落盘 → manifest/注册表记账。fail-closed：任何闸失败
+    抛 BadRequest/NotFound，数据零改动。返回响应 payload（不写 HTTP 响应）。
+    """
+    def _tick(label):
+        if progress:
+            try:
+                progress(label)
+            except Exception:  # noqa: BLE001 — 阶段上报绝不拖垮主流程
+                pass
+
+    entry = registry.get(reportId)
+    if entry is None:
+        raise NotFound(f"report {reportId!r} not registered")
+    cols = table.get("columns") or []
+    rows = table.get("rows") or []
+    if not isinstance(cols, list) or not cols or len(cols) > 200:
+        raise BadRequest("table columns must contain 1-200 fields")
+    # 重复表头闸（与 CSV 直传同口径）：缺列/多列闸是集合比较，[A,A,B] 对
+    # [A,B] 放行后 index(c) 按首现投影 → 第二个 A 整列静默丢弃。
+    _reject_duplicate_columns(cols, "表格")
+    if not isinstance(rows, list) or not rows:
+        raise BadRequest("table rows must contain at least one record")
+    if len(rows) > 5_000_000:
+        raise BadRequest("table rows must contain at most 5,000,000 records")
+    if any(not isinstance(r, list) or len(r) != len(cols) for r in rows):
+        raise BadRequest("table rows must be rectangular")
+    datasets_meta = list(entry.get("datasets") or [])
+    meta = next((d for d in datasets_meta if d.get("id") == datasetId), None)
+    if meta is None:
+        raise NotFound(f"dataset {datasetId!r} not in report {reportId!r}")
+    current: list[str] = []
+    info_existing = engine.table_info(datasetId)
+    if info_existing is not None:
+        current = [str(c) for c in (info_existing.columns or [])]
+    if not current:
+        manifest_ds = next((d for d in ((entry.get("manifest") or {}).get("datasets") or [])
+                            if d.get("id") == datasetId), None)
+        current = [c.get("name") if isinstance(c, dict) else str(c)
+                   for c in ((manifest_ds or {}).get("columns") or [])]
+    # 计算列（derived.columns）与维度值分组列都是**物化产物**，不是源字段：
+    # 装载后的表里有它们，但用户上传的是原始文件（没有这些列），也可能上传
+    # 导出过的物化表（有）。两种都必须接受 —— 比对只针对原始字段，物化列
+    # 一律按声明重算（旧版只排除计算列，带分组列的表永远「缺列」被拒）。
+    # 声明取**注册表并集**（与下方 dimGroups / h_register 同口径）：共享表的
+    # 另一份副本可能已声明本条目 meta 里还没有的列，只读本条目会把引擎里
+    # 真实存在的物化列误判成「上传缺列」而拒绝整次替换。
+    decl_defs = table_defs(registry.raw_entries(), datasetId,
+                           extra=columns_decl(meta.get("derived")))
+    decl = {"kind": "columns", "defs": decl_defs} if decl_defs else None
+    derived_names = {str(d.get("name")) for d in decl_defs}
+    group_union = dim_group_table_defs(registry.raw_entries(), datasetId,
+                                       extra=dim_groups_defs(meta.get("dimGroups")))
+    derived_names.update(str(g.get("name")) for g in group_union)
+    # 退役物化列（曾声明过、声明已被删）：从**全部**注册表条目取并集——共享表
+    # 的孤儿列对每一份副本都是孤儿。它们不参与「原始列」比对。
+    retired_names = {str(c) for e2 in registry.raw_entries() if isinstance(e2, dict)
+                     for d2 in (e2.get("datasets") or []) if isinstance(d2, dict)
+                     and d2.get("id") == datasetId
+                     for c in (d2.get("retiredColumns") or [])}
+    current_raw = [c for c in current if c not in derived_names and c not in retired_names]
+    new_names = [str(c) for c in cols]
+    upload_raw = [c for c in new_names if c not in derived_names]
+    missing = [c for c in current_raw if c not in upload_raw]
+    extra = [c for c in upload_raw if c not in current_raw]
+    if missing or extra:
+        raise BadRequest(
+            "表格结构不一致，无法原位替换（缺列：" + ",".join(missing[:5]) +
+            "；多列：" + ",".join(extra[:5]) + "）。请使用列映射向导或新建数据源。")
+    upsert_stats = None
+    if mode == "upsert":
+        _tick("合并增量行中…")
+        import sys as _sys
+        _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from upsert_merge import UpsertError, upsert_merge  # noqa: PLC0415  (scripts/ on sys.path above)
+        if info_existing is None:
+            # 空基表闸（2026-09-26）：引擎表缺失（重启时快照损坏被 _reload_all
+            # WARN 跳过）而注册表/manifest 声称有行——base_rows=[] 会把「增量
+            # 合并」变成破坏性全量替换，历史行被上传行集静默顶掉。fail-closed
+            # 400：先修复数据源（重新上传全量文件）或显式改用全量替换。声明
+            # 行数为 0/缺失（真空表）才允许空基表合并。
+            _mds = next((d for d in ((entry.get("manifest") or {}).get("datasets") or [])
+                         if isinstance(d, dict) and d.get("id") == datasetId), None)
+            claimed = 0
+            for cand in (meta.get("rowCount"), (_mds or {}).get("rowCount")):
+                try:
+                    claimed = max(claimed, int(cand or 0))
+                except (TypeError, ValueError):
+                    continue
+            if claimed > 0:
+                raise BadRequest(
+                    f"增量合并被拒绝：引擎内没有数据源 {datasetId!r} 的表（重启时快照可能"
+                    f"损坏被跳过），而注册表声称有 {claimed:,} 行。此时合并会把这些行永久"
+                    "替换成本次上传的增量——请先在数据源配置里重新上传全量文件修复，"
+                    "或改用「全量替换」。")
+            base_rows: list[list] = []
+        else:
+            from .aggregator import _quote
+            select = ", ".join(_quote(c) for c in current_raw)
+            base_rows = [[rec.get(c) for c in current_raw]
+                         for rec in engine.execute(
+                             f'SELECT {select} FROM {_quote(datasetId)}')]
+        try:
+            # 上传行先投影到 current_raw（与 replace 的 keep_idx 同一处理）：
+            # 导出过的物化表带着计算列回灌时，多余列直接丢弃而不是 400——
+            # 同一份文件「全量替换能成功、增量合并被拒」自相矛盾（真机复验）。
+            up_idx = [new_names.index(c) for c in current_raw]
+            proj_rows = [[r[i] if i < len(r) else None for i in up_idx] for r in rows]
+            merged = upsert_merge(current_raw, base_rows, proj_rows, key_cols,
+                                  delta_columns=list(current_raw))
+        except UpsertError as exc:
+            raise BadRequest(str(exc)) from exc
+        upsert_stats = merged["stats"]
+        raw_payload = {"columns": current_raw, "rows": merged["rows"]}
+    elif mode == "append":
+        # 追加新行（2026-09-22，W35/W36 真机复盘）：同构文件补新一期数据时，
+        # 按周期键判断增量往往 100% 是新行——upsert 的主键选择是纯仪式，
+        # 弹窗却把它设成硬闸。append = 不查重不覆盖，基表行 + 上传行直接
+        # 并表；重复导入同一文件会产生重复行（弹窗文案已声明此代价）。
+        _tick("并入追加行中…")
+        keep_idx = [new_names.index(c) for c in current_raw]
+        append_rows = [[r[i] for i in keep_idx] for r in rows]
+        if info_existing is not None:
+            from .aggregator import _quote
+            select = ", ".join(_quote(c) for c in current_raw)
+            base_rows = [[rec.get(c) for c in current_raw]
+                         for rec in engine.execute(
+                             f'SELECT {select} FROM {_quote(datasetId)}')]
+        else:
+            base_rows = []
+        if len(base_rows) + len(append_rows) > 5_000_000:
+            raise BadRequest(
+                f"追加后总行数 {len(base_rows) + len(append_rows):,} 超过 5,000,000 行上限，"
+                "请改用全量替换或拆分增量。")
+        _tick(f"装载 {len(base_rows) + len(append_rows):,} 行中…")
+        raw_payload = {"columns": current_raw, "rows": base_rows + append_rows}
+    else:
+        _tick("装载替换行中…")
+        keep_idx = [new_names.index(c) for c in current_raw]
+        raw_payload = {"columns": current_raw,
+                       "rows": [[r[i] for i in keep_idx] for r in rows]}
+    _tick("重算计算列/维度值分组…")
+    table_payload = apply_dataset_derived(raw_payload,
+                                          decl or {"kind": "columns", "defs": []})
+    # 维度值分组列同为物化产物：按并集声明重算（来源与上方比对同一份）。
+    table_payload = apply_dim_groups(table_payload, group_union)
+    info = engine.load_table(datasetId, table_payload["columns"], table_payload["rows"],
+                             index_columns=list(meta.get("indexColumns") or []))
+    for d in datasets_meta:
+        if d.get("id") == datasetId:
+            d["rowCount"] = info.row_count
+            if key_cols is not None:
+                # 主键声明随本次合并持久化（下次刷新向导免重选；也是 D1
+                # 模板化的种子）。replace/append 不改动已存声明。
+                d["primaryKey"] = key_cols
+            # 重建成功 = 退役物化列已随 DROP+CREATE 消失，记录清掉。
+            d.pop("retiredColumns", None)
+    # 重启存活：`_reload_all` 是从注册表里的 **source 快照** 重载表的，所以替换
+    # 必须把新数据落到快照文件并改指 source —— 否则重启后数据悄悄退回旧版本
+    # （同一类 bug：改了内存/引擎，却没改重载的真源）。
+    data_dir = getattr(registry, "data_dir", None)
+    if data_dir:
+        from pathlib import Path as _Path
+        snap_path = _Path(data_dir) / (_snapshot_stem(datasetId) + ".replaced.json")
+        # 流式写盘（write_dataset_snapshot 内含临时文件 + os.replace 原子落盘）：
+        # 裸 write_text 半途失败会留半份快照，重启 _reload_all 灌进半个表。
+        # 写盘失败显式 400——引擎内已是新数据，必须告诉作者「重启会回退」，
+        # 不能静默吞掉（状态撕裂不可归因）。
+        try:
+            write_dataset_snapshot(snap_path, table_payload["columns"],
+                                   table_payload["rows"])
+        except OSError as exc:
+            raise BadRequest(
+                f"替换数据的快照写盘失败：{exc}。引擎内已是新数据，但重启会回退到旧快照；"
+                "请处理磁盘/权限问题后重做一次「替换数据」。") from exc
+        try:
+            rel = os.path.relpath(snap_path, registry.path.parent)
+        except ValueError:
+            rel = str(snap_path)
+        for d in datasets_meta:
+            if d.get("id") == datasetId:
+                d["source"] = rel
+    entry["datasets"] = datasets_meta
+    manifest = entry.get("manifest") or {}
+    for d in (manifest.get("datasets") or []):
+        if d.get("id") == datasetId:
+            d["rowCount"] = info.row_count
+            # 列对象形状契约（server 模式 = [{name, type}]）：替换/增量不得把
+            # 编译期写好的 type 洗成裸名字——否则运行时分类全失效（插入图表
+            # alert「至少需要一个维度和一个指标」、字段面板丢指标区）。同名列
+            # 保留既有 type；替换真带来了新列时按值推断（validate_table 单一
+            # 真源）。_manifest_typed_columns 的 docstring 有完整失败链。
+            d["columns"] = _manifest_typed_columns(
+                [str(c) for c in table_payload["columns"]],
+                table_payload.get("rows") or [],
+                prev_cols=d.get("columns"))
+            if key_cols is not None:
+                d["primaryKey"] = key_cols
+            # 列统计（字段副行）是**编译期从旧数据算出来的**：数据一换就过期。
+            # 宁可让 UI 显示“—”，也不能继续展示旧数字（客户端同一路径也删）。
+            d.pop("columnStats", None)
+            # filterOptions（筛选/值域勾选的选项源）同性质：编译期从旧 rows
+            # 取样的截断值域。不删的话新数据里的新类目值永远不出现在筛选
+            # 下拉里（客户端会退回 /values 有界通道现拉）。
+            d.pop("filterOptions", None)
+    manifest["datasets"] = manifest.get("datasets") or []
+    entry["manifest"] = manifest
+    _touch_dataset_revision(entry, datasetId)
+    log = list(entry.get("changelog") or [])
+    log.append({"at": time.time(),
+                "mode": "upsert-data" if mode == "upsert"
+                else ("append-data" if mode == "append" else "replace-data"),
+                "datasetId": datasetId, "rows": info.row_count,
+                **({"inserted": upsert_stats["inserted"],
+                    "updated": upsert_stats["updated"]} if upsert_stats else {}),
+                **({"appended": len(rows)} if mode == "append" else {}),
+                "title": entry.get("title") or reportId})
+    entry["changelog"] = log
+    # 收尾合并落表（不整条覆盖）：异步任务跑的几分钟里作者可能已在线保存
+    # 过 manifest，整条 register 会把保存静默回滚（lost update）。
+    _commit_replace_result(registry, reportId, entry, datasetId)
+    payload = {"datasetId": datasetId, "rowCount": info.row_count,
+               "columns": table_payload["columns"]}
+    if upsert_stats:
+        payload["upsert"] = upsert_stats
+    if mode == "append":
+        payload["appended"] = len(rows)
+    return payload
+
+
+
 def make_handlers(engine: Engine, registry: Registry) -> Router:
     """Build the route table. Handlers close over engine/registry."""
+    # Job metadata lives beside the shared registry so another server process
+    # or ``run_server --worker`` process can poll/cancel/claim it.  The
+    # embedded worker keeps the default server self-contained; configure()
+    # marks only confirmed-dead owners as lost.
+    _jobs.configure(registry.path.parent)
+    # F05 is intentionally server-local and approval-gated.  The advisor's
+    # proposal files are metadata only; no index is created until its apply
+    # route receives an explicit admin/editor approval object.
+    index_advisor = IndexAdvisor(engine, registry.path.parent / "index-proposals")
     r = Router()
 
     def h_health(_handler):
@@ -571,11 +1199,1218 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             "status": "ok",
             "version": SKILL_VERSION,
             "engine": engine.engine_name,
+            "enginePolicy": getattr(engine, "engine_policy", None),
             "datasetCount": summary["datasetCount"],
             "reportCount": summary["reportCount"],
+            "jobs": _jobs.summary(),
+            "aggregateCache": aggregate_cache_summary(),
             "registryPath": str(registry.path),
             "startedAt": _server_started_at(),
         })
+
+    def h_index_suggestions(_handler):
+        """Read-only physical-index advice from observed semantic queries."""
+        if not _same_origin_guard(_handler):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "跨站请求已拒绝"}})
+            return
+        query = parse_qs(urlparse(_handler.path).query)
+        dataset_id = (query.get("datasetId") or [None])[0]
+        respond_json(_handler, 200, index_suggestions(engine, dataset_id))
+
+    def h_index_explain(_handler):
+        """Read-only EXPLAIN probe; never creates or changes an index."""
+        if not _same_origin_guard(_handler):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "跨站请求已拒绝"}})
+            return
+        query = parse_qs(urlparse(_handler.path).query)
+        dataset_id = (query.get("datasetId") or [""])[0]
+        column = (query.get("column") or [""])[0]
+        if not dataset_id or not column:
+            raise BadRequest("datasetId and column are required")
+        try:
+            result = explain_index_candidate(engine, dataset_id, column)
+        except ValueError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, result)
+
+    def _index_admin_origin(handler):
+        """Gate index proposal writes to the local management surface."""
+        if not is_loopback(handler) or not _same_origin_guard(handler):
+            respond_json(handler, 403, {"error": {"code": "Forbidden",
+                                                   "message": "索引审批仅限本机管理端"}})
+            return False
+        return True
+
+    def _index_advisor_call(call):
+        try:
+            return call()
+        except IndexProposalNotFound as exc:
+            raise NotFound(str(exc)) from exc
+        except IndexProposalConflict as exc:
+            raise Conflict(str(exc)) from exc
+        except IndexAdvisorError as exc:
+            if getattr(exc, "status", 0) == 404:
+                raise NotFound(str(exc)) from exc
+            if getattr(exc, "status", 0) == 409:
+                raise Conflict(str(exc)) from exc
+            if getattr(exc, "status", 0) == 422:
+                raise ValidationFailed(str(exc)) from exc
+            raise BadRequest(str(exc)) from exc
+
+    def _persist_index_column(dataset_id: str, column: str) -> None:
+        """Persist an approved index declaration for every shared report.
+
+        ``IndexAdvisor`` has already created and verified the SQLite index.  We
+        only mirror the declaration here so the existing DROP+CREATE reload
+        pipeline carries the approved index across a restart; this callback is
+        never reached by suggestions, preview, or dry-run.
+        """
+        original: dict[str, dict[str, Any]] = {}
+        try:
+            for report_id, raw_entry in registry.items_raw():
+                if not isinstance(raw_entry, dict):
+                    continue
+                if not any(isinstance(ds, dict) and ds.get("id") == dataset_id
+                           for ds in (raw_entry.get("datasets") or [])):
+                    continue
+                entry = registry.get(report_id)
+                if not isinstance(entry, dict):
+                    continue
+                changed = False
+                original[report_id] = copy.deepcopy(entry)
+                for ds in (entry.get("datasets") or []):
+                    if isinstance(ds, dict) and ds.get("id") == dataset_id:
+                        columns = list(ds.get("indexColumns") or [])
+                        if column not in columns:
+                            columns.append(column)
+                            ds["indexColumns"] = columns
+                            changed = True
+                manifest = entry.get("manifest")
+                if isinstance(manifest, dict):
+                    for ds in (manifest.get("datasets") or []):
+                        if isinstance(ds, dict) and ds.get("id") == dataset_id:
+                            columns = list(ds.get("indexColumns") or [])
+                            if column not in columns:
+                                columns.append(column)
+                                ds["indexColumns"] = columns
+                                changed = True
+                if changed:
+                    registry.register(report_id, entry)
+        except Exception:
+            # DDL apply treats this callback as part of the same logical
+            # transaction.  Restore any manifests already written so a
+            # registry I/O failure cannot leave a declaration for a rolled-back
+            # physical index.
+            for report_id, entry in original.items():
+                try:
+                    registry.register(report_id, entry)
+                except Exception:
+                    pass
+            raise
+
+    def h_index_proposal_preview(_handler):
+        """Build a proposal without writing the proposal store or database."""
+        if not _index_admin_origin(_handler):
+            return
+        body = read_json(_handler)
+        if not isinstance(body, dict):
+            raise BadRequest("request body must be an object")
+        result = _index_advisor_call(lambda: index_advisor.preview(
+            str(body.get("datasetId") or ""), str(body.get("column") or ""),
+            role=body.get("role"),
+            min_observations=body.get("minObservations", 2)))
+        respond_json(_handler, 200, {**result, "preview": True, "dryRun": True})
+
+    def h_index_proposal_create(_handler):
+        """Persist proposal metadata only; this route never executes DDL."""
+        if not _index_admin_origin(_handler):
+            return
+        body = read_json(_handler)
+        if not isinstance(body, dict):
+            raise BadRequest("request body must be an object")
+        result = _index_advisor_call(lambda: index_advisor.propose(
+            str(body.get("datasetId") or ""), str(body.get("column") or ""),
+            role=body.get("role"),
+            min_observations=body.get("minObservations", 2)))
+        respond_json(_handler, 200, result)
+
+    def h_index_proposal_get(_handler, proposalId):
+        if not _index_admin_origin(_handler):
+            return
+        result = _index_advisor_call(lambda: index_advisor.get(proposalId))
+        respond_json(_handler, 200, result)
+
+    def h_index_proposal_approve(_handler, proposalId):
+        if not _index_admin_origin(_handler):
+            return
+        body = read_json(_handler)
+        if not isinstance(body, dict):
+            raise BadRequest("request body must be an object")
+        approval = body.get("approval") if isinstance(body.get("approval"), dict) else body
+        result = _index_advisor_call(lambda: index_advisor.approve(proposalId, approval))
+        respond_json(_handler, 200, result)
+
+    def h_index_proposal_apply(_handler, proposalId):
+        """Apply only after a current-fence check and explicit approval."""
+        if not _index_admin_origin(_handler):
+            return
+        body = read_json(_handler)
+        if not isinstance(body, dict):
+            raise BadRequest("request body must be an object")
+        dry_run = body.get("dryRun") is True
+        approval = body.get("approval") if isinstance(body.get("approval"), dict) else body
+        result = _index_advisor_call(lambda: index_advisor.apply(
+            proposalId, approval=approval, dry_run=dry_run,
+            persist_index=_persist_index_column))
+        respond_json(_handler, 200, result)
+
+    # The model configuration is owner-local until report author identity is
+    # separated from the legacy manifest edit password. Conversation turns are
+    # same-origin and can be read-only for LAN viewers; applying/saving remains
+    # behind the existing editor permission.
+    def _copilot_origin(handler):
+        if not _same_origin_guard(handler):
+            respond_json(handler, 403, {"error": {"code": "Forbidden", "message": "跨站 Copilot 请求已拒绝"}})
+            return False
+        return True
+
+    def _copilot_owner(handler):
+        if not _copilot_origin(handler):
+            return False
+        if not is_loopback(handler):
+            respond_json(handler, 403, {"error": {"code": "Forbidden", "message": "模型配置仅限报告服务器本机"}})
+            return False
+        return True
+
+    def _audit(handler, report_id: str, action: str, target: str = "",
+               detail: dict[str, Any] | None = None) -> None:
+        """Persist an action with the request's bounded cross-job trace id."""
+        actor = "subject:" + _agent_subject_hash(handler)
+        _jobs.record_audit(report_id, actor, action, target, detail,
+                           trace_id=getattr(handler, "trace_id", None))
+
+    def _agent_auth(handler, report_id: str, minimum_role: str = "viewer") -> bool:
+        """Validate an optional scoped Agent bearer token.
+
+        The legacy same-origin surface remains compatible for existing local
+        reports.  Once a caller presents ``Authorization: Bearer ar1...``,
+        however, the token is authoritative: a viewer token cannot perform an
+        editor action and an expired/foreign token is rejected.  This gives
+        the server a real role seam without silently trusting spoofable role
+        headers or breaking already-issued edit-password links.
+        """
+        authorization = str(handler.headers.get("Authorization") or "").strip()
+        if not authorization:
+            return True
+        if not authorization.lower().startswith("bearer "):
+            respond_json(handler, 401, {"error": {"code": "Unauthorized", "message": "Agent 身份令牌格式无效"}},
+                         {"WWW-Authenticate": "Bearer"})
+            return False
+        token = authorization[7:].strip()
+        from .copilot import CopilotError, verify_agent_token
+        try:
+            report_entry = registry.get(report_id)
+            claims = verify_agent_token(registry.path.parent, token, report_id, minimum_role,
+                                        tenant_id=_report_tenant_id(report_entry) or None)
+            handler.agent_claims = claims
+        except CopilotError as exc:
+            respond_json(handler, 403, {"error": {"code": "Forbidden", "message": str(exc)}})
+            return False
+        return True
+
+    def _agent_editor_auth(handler, report_id: str) -> bool:
+        return _agent_auth(handler, report_id, "editor")
+
+    def _agent_context_guard(entry: dict, report_id: str, body: dict,
+                             plan: dict | None = None) -> str:
+        """Reject stale card bindings before a plan/job can be persisted."""
+        plan = plan if isinstance(plan, dict) else {}
+        context = plan.get("context") if isinstance(plan.get("context"), dict) else {}
+        chart_id = body.get("chartId") or context.get("chartId") or ""
+        raw_key = body.get("contextKey") or context.get("contextKey")
+        raw_revision = context.get("datasetRevision")
+        from .copilot import CopilotError, normalize_filter_scopes, validate_context_key, validate_dataset_revision
+        request_has_scopes = isinstance(body, dict) and "filterScopes" in body
+        raw_request_scopes = body.get("filterScopes") if request_has_scopes else None
+        raw_plan_scopes = context.get("filterScopes")
+        canonical_scopes = None
+        if raw_request_scopes is not None:
+            try:
+                canonical_scopes = normalize_filter_scopes(entry, str(chart_id), raw_request_scopes)
+                if raw_plan_scopes is not None:
+                    plan_scopes = normalize_filter_scopes(entry, str(chart_id), raw_plan_scopes)
+                    if plan_scopes != canonical_scopes:
+                        raise Conflict("当前筛选范围已变化，请重新生成分析计划")
+            except Conflict:
+                raise
+            except CopilotError as exc:
+                raise BadRequest(str(exc)) from exc
+        elif raw_plan_scopes is not None:
+            try:
+                canonical_scopes = normalize_filter_scopes(entry, str(chart_id), raw_plan_scopes)
+            except CopilotError as exc:
+                raise BadRequest(str(exc)) from exc
+        if canonical_scopes is not None:
+            body["filterScopes"] = canonical_scopes
+            if isinstance(context, dict):
+                context["filterScopes"] = canonical_scopes
+        if raw_revision is not None and chart_id:
+            try:
+                validate_dataset_revision(entry, str(chart_id), raw_revision)
+            except CopilotError as exc:
+                raise Conflict(str(exc)) from exc
+        if not raw_key:
+            return ""
+        try:
+            return validate_context_key(entry, str(chart_id), raw_key, canonical_scopes)
+        except CopilotError as exc:
+            raise Conflict(str(exc)) from exc
+
+    def h_copilot_auth_token(_handler, reportId):
+        """Issue a short-lived, report-scoped role token from the local host.
+
+        Issuance requires the existing edit password and loopback origin.  The
+        token itself is signed with a server-local secret and is never logged.
+        This is the transitional identity seam until a deployment supplies its
+        external SSO/identity provider.
+        """
+        if not _copilot_owner(_handler):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        role = str(body.get("role") or "viewer")
+        try:
+            ttl = int(body.get("ttlSeconds") or 3600)
+        except (TypeError, ValueError):
+            raise BadRequest("ttlSeconds must be an integer") from None
+        subject = str(body.get("subject") or "local-user")[:120]
+        from .copilot import CopilotError, issue_agent_token
+        try:
+            result = issue_agent_token(registry.path.parent, reportId, role,
+                                       ttl_seconds=ttl, subject=subject,
+                                       tenant_id=_report_tenant_id(entry) or None)
+        except CopilotError as exc:
+            raise BadRequest(str(exc)) from exc
+        _audit(_handler, reportId, "agent.auth.issue", subject,
+               {"role": role, "ttlSeconds": ttl})
+        respond_json(_handler, 200, result)
+
+    def h_copilot_config_get(_handler):
+        if not _copilot_origin(_handler):
+            return
+        from .copilot import public_config
+        respond_json(_handler, 200, public_config(registry))
+
+    def h_copilot_config_set(_handler):
+        if not _copilot_owner(_handler):
+            return
+        from .copilot import CopilotError, save_config
+        try:
+            result = save_config(registry, read_json(_handler))
+        except CopilotError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, result)
+
+    def h_copilot_provider_models(_handler):
+        """Discover a provider-owned model list without exposing the API key."""
+        if not _copilot_owner(_handler):
+            return
+        from .copilot import CopilotError, load_config, provider_model_catalog
+        try:
+            result = provider_model_catalog(load_config(registry))
+        except CopilotError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, result)
+
+    def h_copilot_test(_handler):
+        if not _copilot_owner(_handler):
+            return
+        from .copilot import CopilotError, load_config, model_complete
+        try:
+            # DeepSeek JSON mode requires the prompt to mention JSON.  The
+            # connection test must exercise the same response contract as a
+            # real Agent turn rather than failing on a provider-side mode
+            # guard before authentication/model connectivity is checked.
+            model_complete(load_config(registry), [{"role": "user", "content": 'Return JSON only: {"ok":true}'}],
+                           health_path=registry.path.parent / "provider-health.sqlite3")
+        except CopilotError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, {"ok": True})
+
+    def h_copilot_usage(_handler):
+        if not _copilot_owner(_handler):
+            return
+        from .copilot import ProviderGovernance
+        path = registry.path.parent / "provider-health.sqlite3"
+        respond_json(_handler, 200, {"usage": ProviderGovernance(path).usage_summary()})
+
+    def h_copilot_tools(_handler):
+        """Expose the non-sensitive Agent tool catalog for UI/diagnostics."""
+        if not _copilot_origin(_handler):
+            return
+        from .agent_tools import default_registry
+        tools = []
+        for spec in default_registry().list():
+            tools.append({"name": spec.name, "inputSchema": spec.input_schema,
+                          "outputSchema": spec.output_schema,
+                          "permissions": sorted(spec.permissions),
+                          "estimatedCost": spec.estimated_cost,
+                          "timeoutSeconds": spec.timeout_seconds,
+                          "cancellable": spec.cancellable,
+                          "sideEffect": spec.side_effect,
+                          "requiresApproval": spec.requires_approval,
+                          "semanticReferences": list(spec.semantic_references),
+                          "acceptanceTests": list(spec.acceptance_tests)})
+        respond_json(_handler, 200, {"version": 1, "tools": tools})
+
+    def h_copilot_plan_validate(_handler, reportId):
+        """Validate a typed plan without executing a tool or side effect."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        from .agent_planner import normalize_plan, plan_hash, preview_plan
+        from .agent_tools import default_registry, ToolContractError
+        body = read_json(_handler)
+        raw_plan = body.get("plan") if isinstance(body, dict) else None
+        raw_plan = raw_plan if isinstance(raw_plan, dict) else body
+        _agent_context_guard(entry, reportId, body, raw_plan)
+        try:
+            normalized = normalize_plan(raw_plan, default_registry(), role="viewer",
+                                        context={"reportId": reportId})
+        except ToolContractError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, {"valid": True, "plan": normalized,
+                                     "planHash": plan_hash(normalized),
+                                     "requiresApproval": any(step["requiresApproval"]
+                                                              for step in normalized["steps"]),
+                                     "preview": preview_plan(normalized, entry)})
+
+    def h_copilot_plan_execute(_handler, reportId):
+        """Schedule a server-owned, read-first plan execution.
+
+        This endpoint deliberately has no provider call and no write path. A
+        plan containing a proposal stops at ``needsApproval``; the executor
+        only invokes typed read tools backed by the existing aggregator.
+        """
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        from .agent_planner import normalize_plan, plan_hash
+        from .agent_tools import ToolContractError, default_registry
+        body = read_json(_handler)
+        raw_plan = body.get("plan") if isinstance(body, dict) else None
+        if not isinstance(raw_plan, dict):
+            raw_plan = body if isinstance(body, dict) else {}
+        _agent_context_guard(entry, reportId, body, raw_plan)
+        try:
+            normalized = normalize_plan(raw_plan, default_registry(), role="viewer",
+                                        context={"reportId": reportId})
+        except ToolContractError as exc:
+            raise BadRequest(str(exc)) from exc
+        expected_hash = body.get("planHash") if isinstance(body, dict) else None
+        if expected_hash == "":
+            expected_hash = None
+        actual_hash = plan_hash(normalized)
+        if expected_hash is not None and expected_hash != actual_hash:
+            raise BadRequest("plan 已变化，请重新确认后执行")
+        request_id = body.get("requestId") if isinstance(body, dict) else None
+        if request_id is not None and (not isinstance(request_id, str)
+                                       or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id)):
+            raise BadRequest("requestId 格式无效")
+        allowed, retry_after = _copilot_rate_limit(_handler, reportId)
+        if not allowed:
+            respond_json(_handler, 429, {"error": {"code": "TooManyRequests",
+                "message": "Copilot 请求较频繁，请稍后重试。"}},
+                         {"Retry-After": str(retry_after)})
+            return
+        chart_key = str((normalized.get("context") or {}).get("chartId") or "__report__")[:120]
+        request_hash = actual_hash
+        if request_id:
+            try:
+                existing = _jobs.find_by_request(reportId, request_id, request_hash=request_hash)
+            except _jobs.JobRequestConflict as exc:
+                respond_json(_handler, 409, {"error": {"code": "RequestConflict",
+                    "message": "requestId 已对应另一份分析计划，请生成新的 requestId。",
+                    "jobId": str(exc)}})
+                return
+            if existing is not None:
+                respond_json(_handler, 202, {"jobId": existing["id"],
+                    "status": existing["status"], "reused": True})
+                return
+        try:
+            job_id = _jobs.create("agent_plan", reportId, "plan:" + chart_key,
+                                  max_running=2, request_key=request_id,
+                                  request_hash=request_hash,
+                                  priority=60, payload={"plan": normalized,
+                                                       "recoveryPolicy": "safe-read"}, queued=True,
+                                  trace_id=getattr(_handler, "trace_id", None))
+        except _jobs.JobReplay as exc:
+            existing = _jobs.get(str(exc))
+            respond_json(_handler, 202, {"jobId": str(exc),
+                "status": (existing or {}).get("status", "running"), "reused": True})
+            return
+        except _jobs.JobRequestConflict as exc:
+            respond_json(_handler, 409, {"error": {"code": "RequestConflict",
+                "message": "requestId 已对应另一份分析计划，请生成新的 requestId。",
+                "jobId": str(exc)}})
+            return
+        except _jobs.JobConflict as exc:
+            respond_json(_handler, 409, {"error": {"code": "Conflict",
+                "message": "当前报告已有一项 Agent 分析任务，请等待完成或停止等待后再试。",
+                "jobId": str(exc)}})
+            return
+        except _jobs.JobCapacity:
+            respond_json(_handler, 429, {"error": {"code": "TooManyRequests",
+                "message": "Agent 后台任务较多，请稍后重试。"}},
+                         {"Retry-After": "3"})
+            return
+
+        # Queue payload is typed plan metadata only; worker reloads the report
+        # manifest and engine, so no rows or Python closure cross the process.
+        respond_json(_handler, 202, {"jobId": job_id, "status": "queued",
+                                     "planHash": actual_hash, "retryToken": _jobs.retry_token(job_id)})
+
+    def h_copilot_proposal_validate(_handler, reportId):
+        """Return a complete before/after diff without mutating the report."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        from .agent_proposals import (validate_alias_transaction_scope, validate_proposal,
+                                       validate_transaction_scope)
+        from .agent_tools import ToolContractError
+        body = read_json(_handler)
+        try:
+            proposal = body.get("proposal") or body
+            result = validate_proposal(entry, proposal)
+            if proposal.get("kind") == "alias_confirmation":
+                result["transaction"] = validate_alias_transaction_scope(
+                    entry, [proposal], engine=engine)
+            else:
+                result["transaction"] = validate_transaction_scope(entry, [proposal], engine=engine)
+        except ToolContractError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, result)
+
+    def h_copilot_proposal_history(_handler, reportId):
+        """Return bounded proposal metadata only; manifests stay server-side."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        if registry.get(reportId) is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        from .agent_proposals import list_snapshot_metadata, manifest_hash
+        current = registry.get(reportId) or {}
+        current_hash = manifest_hash(current.get("manifest") or {})
+        respond_json(_handler, 200, {
+            "reportId": reportId,
+            "currentHash": current_hash,
+            "snapshots": list_snapshot_metadata(registry.path.parent, reportId,
+                                                 current_hash=current_hash),
+        })
+
+    def h_copilot_proposal_apply(_handler, reportId):
+        """Atomically apply one or more validated chart proposals with a snapshot."""
+        if not _same_origin_guard(_handler):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "跨站请求已拒绝"}})
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "proposal.apply",
+               str((body.get("proposal") or {}).get("chartId") or ""),
+               {"count": len(body.get("proposals") or [body.get("proposal")])})
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        raw = body.get("proposals") if isinstance(body.get("proposals"), list) else [body.get("proposal") or body]
+        if not raw or len(raw) > 8 or any(not isinstance(item, dict) for item in raw):
+            raise BadRequest("proposals must contain 1-8 objects")
+        from .agent_proposals import (apply_proposals, manifest_hash, validate_alias_transaction_scope,
+                                       validate_proposal, validate_transaction_scope)
+        checks = []
+        normalized_raw = []
+        for proposal in raw:
+            try:
+                check = validate_proposal(entry, proposal)
+            except Exception as exc:
+                raise BadRequest(f"proposal 未通过服务端校验：{exc}") from exc
+            expected = proposal.get("proposalId")
+            if expected and expected != check["proposalId"]:
+                raise Conflict("proposal 已过期，请重新预览")
+            checks.append(check)
+            normalized = dict(proposal)
+            if proposal.get("kind") == "alias_confirmation":
+                # The field-resolution tool intentionally returns only the
+                # chart/alias/canonical proposal.  Fill the dataset identity
+                # from the server-owned validation result before the atomic
+                # apply path persists it.
+                normalized["datasetId"] = check.get("after", {}).get("datasetId")
+                normalized["alias"] = proposal.get("alias", proposal.get("name"))
+            after_aggregations = check.get("after", {}).get("aggregations", {})
+            if isinstance(after_aggregations, dict):
+                measure_name = str(proposal.get("measure") or "")
+                if measure_name in after_aggregations:
+                    normalized["aggregation"] = after_aggregations[measure_name]
+            normalized_raw.append(normalized)
+        raw = normalized_raw
+        alias_only = all(item.get("kind") == "alias_confirmation" for item in raw)
+        chart_only = all(item.get("kind") != "alias_confirmation" for item in raw)
+        if not alias_only and not chart_only:
+            raise BadRequest("alias proposal 不能与图表 proposal 混合提交")
+        try:
+            if alias_only:
+                transaction_scope = validate_alias_transaction_scope(entry, raw, engine=engine)
+            else:
+                transaction_scope = validate_transaction_scope(entry, raw, engine=engine)
+        except Exception as exc:
+            raise BadRequest(f"proposal transaction scope invalid: {exc}") from exc
+        before_entry = copy.deepcopy(entry)
+        before_manifest = before_entry.get("manifest") or {}
+        after_manifest = apply_proposals(before_manifest, raw)
+        after_manifest["reportId"] = reportId
+        _apply_policy_to_manifest(after_manifest, edit_policy_of(entry))
+        after_hash = manifest_hash(after_manifest)
+        before_hash = manifest_hash(before_manifest)
+        import secrets
+        snapshot_id = "proposal-" + secrets.token_hex(8)
+        snapshot_dir = registry.path.parent / "copilot-snapshots"
+        snapshot_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"{snapshot_id}.json"
+        snapshot = {"snapshotId": snapshot_id, "reportId": reportId, "createdAt": time.time(),
+                    "beforeHash": before_hash, "afterHash": after_hash, "beforeEntry": before_entry}
+        tmp = snapshot_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, default=str), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, snapshot_path)
+        new_entry = copy.deepcopy(entry)
+        new_entry["manifest"] = after_manifest
+        new_entry["title"] = after_manifest.get("title") or entry.get("title")
+        log = list(entry.get("changelog") or [])
+        log.append({**_change_entry("agent-proposal", reportId, new_entry["title"], after_manifest),
+                    "snapshotId": snapshot_id, "proposalIds": [item["proposalId"] for item in checks]})
+        new_entry["changelog"] = log
+        new_entry["edit"] = edit_policy_of({"manifest": after_manifest})
+        # Keep the after-state beside the before-state so a later explicit
+        # redo can be fenced by the same manifest hashes. Older snapshots that
+        # lack this field remain rollback-only and fail closed for redo.
+        snapshot["afterEntry"] = copy.deepcopy(new_entry)
+        tmp = snapshot_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, default=str), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, snapshot_path)
+        registry.register(reportId, new_entry)
+        replay_columns(engine, registry)
+        respond_json(_handler, 200, {"ok": True, "reportId": reportId, "snapshotId": snapshot_id,
+                                     "proposalIds": [item["proposalId"] for item in checks],
+                                     "transaction": transaction_scope,
+                                     "manifest": _server_strip(after_manifest)})
+
+    def h_copilot_proposal_rollback(_handler, reportId):
+        """Rollback a proposal snapshot only if no later manifest edit won the race."""
+        if not _same_origin_guard(_handler):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "跨站请求已拒绝"}})
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "proposal.rollback", str(body.get("snapshotId") or ""))
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        snapshot_id = str(body.get("snapshotId") or "")
+        if not re.fullmatch(r"proposal-[A-Fa-f0-9]{16}", snapshot_id):
+            raise BadRequest("snapshotId 格式无效")
+        path = registry.path.parent / "copilot-snapshots" / f"{snapshot_id}.json"
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise NotFound("proposal snapshot 不存在或已过期") from exc
+        if snapshot.get("reportId") != reportId or not isinstance(snapshot.get("beforeEntry"), dict):
+            raise NotFound("proposal snapshot 不属于当前报告")
+        from .agent_proposals import manifest_hash
+        if manifest_hash(entry.get("manifest") or {}) != snapshot.get("afterHash"):
+            raise Conflict("报告已发生后续编辑，拒绝覆盖新版本；请先读取当前报告再决定是否回滚")
+        restored = snapshot["beforeEntry"]
+        registry.register(reportId, restored)
+        replay_columns(engine, registry)
+        respond_json(_handler, 200, {"ok": True, "reportId": reportId, "snapshotId": snapshot_id,
+                                     "redoSnapshot": snapshot_id if isinstance(snapshot.get("afterEntry"), dict) else None,
+                                     "manifest": _server_strip(restored.get("manifest") or {})})
+
+    def h_copilot_proposal_redo(_handler, reportId):
+        """Redo a rolled-back proposal only when the report is still at beforeHash."""
+        if not _same_origin_guard(_handler):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "跨站请求已拒绝"}})
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "proposal.redo", str(body.get("snapshotId") or ""))
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        snapshot_id = str(body.get("snapshotId") or "")
+        if not re.fullmatch(r"proposal-[A-Fa-f0-9]{16}", snapshot_id):
+            raise BadRequest("snapshotId 格式无效")
+        path = registry.path.parent / "copilot-snapshots" / f"{snapshot_id}.json"
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise NotFound("proposal snapshot 不存在或已过期") from exc
+        after_entry = snapshot.get("afterEntry")
+        if snapshot.get("reportId") != reportId or not isinstance(after_entry, dict):
+            raise NotFound("该旧 snapshot 不支持 redo")
+        from .agent_proposals import manifest_hash
+        if manifest_hash(entry.get("manifest") or {}) != snapshot.get("beforeHash"):
+            raise Conflict("报告已发生后续编辑，拒绝覆盖新版本；请先读取当前报告再决定是否重做")
+        before_entry = copy.deepcopy(entry)
+        after_hash = manifest_hash(after_entry.get("manifest") or {})
+        redo_id = "proposal-" + __import__("secrets").token_hex(8)
+        redo_path = registry.path.parent / "copilot-snapshots" / f"{redo_id}.json"
+        redo_snapshot = {"snapshotId": redo_id, "reportId": reportId, "createdAt": time.time(),
+                         "beforeHash": snapshot.get("beforeHash"), "afterHash": after_hash,
+                         "beforeEntry": before_entry, "afterEntry": copy.deepcopy(after_entry)}
+        tmp = redo_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(redo_snapshot, ensure_ascii=False, default=str), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, redo_path)
+        registry.register(reportId, after_entry)
+        replay_columns(engine, registry)
+        respond_json(_handler, 200, {"ok": True, "reportId": reportId,
+                                     "snapshotId": redo_id,
+                                     "manifest": _server_strip(after_entry.get("manifest") or {})})
+
+    def h_copilot_turn(_handler, reportId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "copilot.turn", str(body.get("chartId") or ""),
+               {"async": bool(body.get("async"))})
+        from .copilot import CopilotError, load_config, model_complete, run_turn
+        _agent_context_guard(entry, reportId, body)
+        allowed, retry_after = _copilot_rate_limit(_handler, reportId)
+        if not allowed:
+            respond_json(_handler, 429, {"error": {"code": "TooManyRequests",
+                "message": "Copilot 请求较频繁，请稍后重试。"}},
+                         {"Retry-After": str(retry_after)})
+            return
+
+        # Deep/remote model calls can outlive a reverse proxy's request
+        # timeout.  Reuse the existing in-memory job contract used by large
+        # dataset replacement: the HTTP request only schedules work, while
+        # the browser polls a bounded status/result record.  The query itself
+        # remains the same typed Copilot plan and the server still owns all
+        # aggregation; this is transport back-pressure, not a second Agent
+        # execution path.
+        want_async = body.get("async") is True or body.get("async") == "1"
+        if want_async:
+            message = body.get("message")
+            if not isinstance(message, str) or not message.strip() or len(message) > 2000:
+                raise BadRequest("问题必须为 1–2000 字")
+            history = body.get("history")
+            if history is not None and (not isinstance(history, list) or len(history) > 200):
+                raise BadRequest("对话历史过长，请新建对话后重试")
+            # Canonicalize untrusted history before it enters the durable queue
+            # or request hash.  The model path applies the same chart/context
+            # isolation, but storing arbitrary LAN payload strings would let a
+            # client inflate jobs.sqlite without adding useful context.
+            safe_history = []
+            for item in (history or [])[-200:]:
+                if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                    continue
+                content = item.get("content")
+                if not isinstance(content, str):
+                    continue
+                safe_history.append({
+                    "role": item["role"], "content": content[:500],
+                    **({"chartId": str(item["chartId"])[:240]} if item.get("chartId") is not None else {}),
+                    **({"contextKey": str(item["contextKey"])[:32000]} if item.get("contextKey") is not None else {}),
+                })
+            history = safe_history
+            request_hash = hashlib.sha256(json.dumps(
+                {"message": message, "chartId": body.get("chartId") or "",
+                 "contextKey": body.get("contextKey") or "",
+                 "filterScopes": body.get("filterScopes"),
+                 "history": history or []},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+            chart_key = str(body.get("chartId") or "__report__")[:120]
+            request_id = body.get("requestId")
+            if request_id is not None:
+                if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+                    raise BadRequest("requestId 格式无效")
+            if request_id:
+                # A proxy retry after a lost 202 must not charge the model twice.
+                # The persistent store is the final atomic gate for two processes
+                # racing with the same requestId.
+                try:
+                    existing = _jobs.find_by_request(reportId, request_id, request_hash=request_hash)
+                except _jobs.JobRequestConflict as exc:
+                    respond_json(_handler, 409, {"error": {"code": "RequestConflict",
+                        "message": "requestId 已对应另一份请求，请生成新的 requestId。",
+                        "jobId": str(exc)}})
+                    return
+                if existing is not None:
+                    respond_json(_handler, 202, {"jobId": existing["id"],
+                        "status": existing["status"], "reused": True})
+                    return
+            try:
+                # Bound model sockets/threads across cards. Same-card
+                # duplication is still rejected by the atomic conflict check.
+                job_id = _jobs.create("copilot", reportId, "chart:" + chart_key,
+                                      max_running=4, request_key=request_id,
+                                      request_hash=request_hash,
+                                      priority=70,
+                                      payload={"message": message, "chartId": body.get("chartId") or "",
+                                               "history": history or [], "contextKey": body.get("contextKey"),
+                                               "filterScopes": body.get("filterScopes"),
+                                               "governanceScope": _governance_scope(_handler, reportId),
+                                               "recoveryPolicy": "safe-read"},
+                                      queued=True,
+                                      trace_id=getattr(_handler, "trace_id", None))
+            except _jobs.JobReplay as exc:
+                existing = _jobs.get(str(exc))
+                respond_json(_handler, 202, {"jobId": str(exc),
+                    "status": (existing or {}).get("status", "running"), "reused": True})
+                return
+            except _jobs.JobRequestConflict as exc:
+                respond_json(_handler, 409, {"error": {"code": "RequestConflict",
+                    "message": "requestId 已对应另一份请求，请生成新的 requestId。",
+                    "jobId": str(exc)}})
+                return
+            except _jobs.JobConflict as exc:
+                respond_json(_handler, 409, {"error": {"code": "Conflict",
+                    "message": "当前交互卡片已有一项 Copilot 任务，请等待完成或停止等待后再试。",
+                    "jobId": str(exc)}})
+                return
+            except _jobs.JobCapacity:
+                respond_json(_handler, 429, {"error": {"code": "TooManyRequests",
+                    "message": "Copilot 后台任务较多，请稍后重试。"}},
+                             {"Retry-After": "3"})
+                return
+
+            # The same durable queue is consumed by the embedded worker or an
+            # external ``run_server --worker --worker-kinds copilot`` process.
+            respond_json(_handler, 202, {"jobId": job_id, "status": "queued",
+                                         "retryToken": _jobs.retry_token(job_id)})
+            return
+        try:
+            result = run_turn(entry, engine, load_config(registry), body.get("message"),
+                              body.get("chartId") or "", body.get("history") or [],
+                              complete=lambda cfg, msgs: model_complete(
+                                  cfg, msgs, health_path=registry.path.parent / "provider-health.sqlite3",
+                                  governance_scope=_governance_scope(_handler, reportId)),
+                              context_key=body.get("contextKey"),
+                              filter_scopes=body.get("filterScopes"))
+        except CopilotError as exc:
+            raise BadRequest(str(exc)) from exc
+        respond_json(_handler, 200, result)
+
+    def h_copilot_job(_handler, reportId, jobId):
+        """Poll an async Copilot turn; metadata is shared, worker execution is local."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        job = _jobs.get(jobId)
+        if job is None or job.get("kind") not in {"copilot", "agent_plan", "evidence_export", "monitor"} or job.get("reportId") != reportId:
+            respond_json(_handler, 404, {"error": {"code": "NotFound",
+                "message": "Copilot 任务不存在或已过期，结果不会被伪造。"}})
+            return
+        payload = {"id": job["id"], "status": job["status"], "phase": job["phase"],
+                   "startedAt": job["startedAt"], "finishedAt": job["finishedAt"],
+                   "traceId": job.get("traceId"),
+                   "canRecover": bool(job.get("canRecover")),
+                   "pollAfterMs": 900 if job["status"] == "running" else 0,
+                   "events": _jobs.events(jobId), "retryToken": _jobs.retry_token(jobId)}
+        if job.get("result") is not None:
+            payload["result"] = job["result"]
+        if job.get("error"):
+            payload["error"] = job["error"]
+        respond_json(_handler, 200, payload)
+
+    def h_copilot_jobs(_handler, reportId):
+        """Bounded multi-card task tray metadata; evidence stays behind job poll."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        if registry.get(reportId) is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        tasks = []
+        for job in _jobs.list_jobs(reportId):
+            if job.get("kind") not in {"copilot", "agent_plan", "evidence_export", "monitor"}:
+                continue
+            tasks.append({key: job.get(key) for key in (
+                "id", "kind", "datasetId", "status", "phase", "startedAt", "finishedAt",
+                "cancelRequested", "cancelReason", "error", "traceId", "retryToken", "canRecover")})
+        respond_json(_handler, 200, {"tasks": tasks})
+
+    def h_copilot_job_cancel(_handler, reportId, jobId):
+        """Request cooperative cancellation; never claim a running model was killed."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        job = _jobs.get(jobId)
+        if job is None or job.get("kind") not in {"copilot", "agent_plan", "evidence_export", "monitor"} or job.get("reportId") != reportId:
+            respond_json(_handler, 404, {"error": {"code": "NotFound",
+                "message": "Copilot 任务不存在或已过期。"}})
+            return
+        body = read_json(_handler)
+        retry_token = body.get("retryToken") if isinstance(body, dict) else None
+        if retry_token and not _jobs.verify_retry_token(jobId, str(retry_token)):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "任务 retry token 无效"}})
+            return
+        accepted = _jobs.cancel(jobId)
+        current = _jobs.get(jobId) or job
+        if current.get("status") == "cancelled" and current.get("kind") == "evidence_export":
+            _cleanup_evidence_export(registry, current)
+        respond_json(_handler, 200, {"ok": accepted, "status": current.get("status"),
+                                     "phase": current.get("phase")})
+
+    def h_copilot_job_recover(_handler, reportId, jobId):
+        """Requeue only an explicitly replayable lost read/export task."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        job = _jobs.get(jobId)
+        if job is None or job.get("reportId") != reportId \
+                or job.get("kind") not in {"copilot", "agent_plan", "evidence_export", "monitor"}:
+            raise NotFound("Copilot 任务不存在或已过期。")
+        body = read_json(_handler)
+        token = body.get("retryToken") if isinstance(body, dict) else None
+        if not token:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden",
+                "message": "重试 lost 任务必须提供 retry token"}})
+            return
+        try:
+            recovered = _jobs.recover_lost(jobId, str(token))
+        except _jobs.JobRecoveryDenied as exc:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": str(exc)}})
+            return
+        except _jobs.JobConflict as exc:
+            respond_json(_handler, 409, {"error": {"code": "Conflict",
+                "message": "同一数据源已有任务进行中，请先等待或取消它。", "jobId": str(exc)}})
+            return
+        respond_json(_handler, 202, {"jobId": jobId, "status": recovered.get("status"),
+                                     "phase": recovered.get("phase"),
+                                     "retryToken": _jobs.retry_token(jobId), "recovered": True})
+
+    def h_copilot_evidence_export(_handler, reportId):
+        """Export a completed evidence Job asynchronously; never inline large rows."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        body = read_json(_handler)
+        _audit(_handler, reportId, "evidence.export", str(body.get("jobId") or ""),
+               {"format": body.get("format")})
+        source_id = body.get("jobId")
+        source = _jobs.get(str(source_id or ""))
+        if source is None or source.get("reportId") != reportId or source.get("status") != "done" \
+                or source.get("kind") not in {"copilot", "agent_plan"}:
+            raise NotFound("可导出的 Agent 证据任务不存在或尚未完成")
+        fmt = str(body.get("format") or "json").lower()
+        if fmt not in {"json", "csv", "markdown"}:
+            raise BadRequest("format must be json, csv or markdown")
+        request_id = body.get("requestId")
+        if request_id is not None and (not isinstance(request_id, str)
+                                       or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id)):
+            raise BadRequest("requestId 格式无效")
+        request_hash = hashlib.sha256((str(source_id) + "\x00" + fmt).encode()).hexdigest()
+        if request_id:
+            existing = _jobs.find_by_request(reportId, request_id, request_hash=request_hash)
+            if existing is not None:
+                respond_json(_handler, 202, {"jobId": existing["id"], "status": existing["status"], "reused": True})
+                return
+        try:
+            export_job = _jobs.create("evidence_export", reportId, "export:" + str(source_id)[:80],
+                                      max_running=2, request_key=request_id, request_hash=request_hash,
+                                      priority=40, payload={"sourceId": str(source_id), "format": fmt,
+                                                           "recoveryPolicy": "safe-export"},
+                                      queued=True,
+                                      trace_id=getattr(_handler, "trace_id", None))
+        except _jobs.JobReplay as exc:
+            existing = _jobs.get(str(exc))
+            respond_json(_handler, 202, {"jobId": str(exc), "status": (existing or {}).get("status", "running"), "reused": True})
+            return
+        except _jobs.JobConflict as exc:
+            respond_json(_handler, 409, {"error": {"code": "Conflict", "message": "相同证据正在导出。", "jobId": str(exc)}})
+            return
+        except _jobs.JobCapacity:
+            respond_json(_handler, 429, {"error": {"code": "TooManyRequests", "message": "导出任务较多，请稍后重试。"}},
+                         {"Retry-After": "3"})
+            return
+        # Evidence export is also a durable queued job; the worker reads only
+        # the completed source Job result and writes a bounded 0600 artifact.
+        respond_json(_handler, 202, {"jobId": export_job, "status": "queued",
+                                     "retryToken": _jobs.retry_token(export_job)})
+
+    def h_copilot_evidence_download(_handler, reportId, exportId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        job = _jobs.get(exportId)
+        if job is None or job.get("kind") != "evidence_export" or job.get("reportId") != reportId \
+                or job.get("status") != "done" or not isinstance(job.get("result"), dict):
+            raise NotFound("证据导出不存在或尚未完成")
+        result = job["result"]
+        extension = {"json": "json", "csv": "csv", "markdown": "md"}.get(result.get("format"))
+        if not extension:
+            raise NotFound("证据导出格式无效")
+        path = registry.path.parent / "copilot-exports" / f"export-{exportId}.{extension}"
+        try:
+            if time.time() - path.stat().st_mtime > 600:
+                path.unlink(missing_ok=True)
+                raise FileNotFoundError
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise NotFound("证据导出已过期") from exc
+        content_type = result.get("contentType") or "application/octet-stream"
+        _send_body(_handler, 200, raw, content_type,
+                   {"Cache-Control": "no-store", "Content-Disposition": f'attachment; filename="evidence-{exportId}.{extension}"'},
+                   compress=False)
+
+    def h_copilot_monitors(_handler, reportId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        if registry.get(reportId) is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        respond_json(_handler, 200, {"monitors": _jobs.list_monitors(reportId)})
+
+    def h_copilot_audit(_handler, reportId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_auth(_handler, reportId):
+            return
+        if registry.get(reportId) is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        respond_json(_handler, 200, {"events": _jobs.audit_events(reportId)})
+
+    def h_copilot_monitor_create(_handler, reportId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "monitor.create", str(body.get("name") or ""),
+               {"tool": body.get("tool")})
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        name = str(body.get("name") or "").strip()
+        tool = str(body.get("tool") or "")
+        args = body.get("args") or {}
+        try:
+            interval = int(body.get("intervalSeconds") or 3600)
+        except (TypeError, ValueError):
+            raise BadRequest("intervalSeconds must be an integer") from None
+        if not name or len(name) > 120:
+            raise BadRequest("monitor requires a bounded name")
+        try:
+            tool, args = _validate_monitor_definition(tool, args)
+        except ValueError as exc:
+            raise BadRequest(str(exc)) from exc
+        if interval < 30 or interval > 86400:
+            raise BadRequest("intervalSeconds must be between 30 and 86400")
+        monitor_id = _jobs.create_monitor(reportId, name, tool, args, interval)
+        respond_json(_handler, 201, {"id": monitor_id, "reportId": reportId, "enabled": True,
+                                     "tool": tool, "intervalSeconds": interval})
+
+    def h_copilot_monitor_toggle(_handler, reportId, monitorId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "monitor.toggle", monitorId,
+               {"enabled": bool(body.get("enabled"))})
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        changed = _jobs.set_monitor_enabled(monitorId, reportId, bool(body.get("enabled")))
+        if not changed:
+            raise NotFound("monitor 不存在")
+        respond_json(_handler, 200, {"ok": True, "id": monitorId, "enabled": bool(body.get("enabled"))})
+
+    def h_copilot_monitor_delete(_handler, reportId, monitorId):
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        _audit(_handler, reportId, "monitor.delete", monitorId)
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        if not _jobs.delete_monitor(monitorId, reportId):
+            raise NotFound("monitor 不存在")
+        respond_json(_handler, 200, {"ok": True, "id": monitorId})
+
+    def h_copilot_notification_propose(_handler, reportId):
+        """Validate a notification proposal; never contact an external service."""
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        channel = str(body.get("channel") or "").lower()
+        destination = str(body.get("destination") or "").strip()
+        message = str(body.get("message") or "").strip()
+        if channel not in {"email", "slack", "webhook"}:
+            raise BadRequest("channel must be email, slack or webhook")
+        if not destination or len(destination) > 500 or not message or len(message) > 2000:
+            raise BadRequest("notification destination/message is invalid")
+        proposal = {"reportId": reportId, "channel": channel,
+                    "destination": destination, "message": message,
+                    "requiresApproval": True, "sideEffect": "notify"}
+        proposal_id = _notification_proposal_id(reportId, channel, destination, message)
+        _audit(_handler, reportId, "notification.propose", proposal_id,
+               {"channel": channel, "requiresApproval": True})
+        respond_json(_handler, 200, {"status": "needsApproval", "proposalId": proposal_id,
+                                     "proposal": {**proposal, "message": "[已隐藏，需审批后发送]"},
+                                     "message": "通知尚未发送；需要明确审批并配置外部通知适配器。"})
+
+    def h_copilot_notification_send(_handler, reportId):
+        """Send an explicitly approved webhook through a server allowlist.
+
+        Email/Slack adapters remain disabled; webhook delivery is opt-in via
+        ``LRM_NOTIFICATION_WEBHOOK_URL`` and accepts only the exact configured
+        destination.  The request body never controls the network destination.
+        """
+        if not _copilot_origin(_handler):
+            return
+        if not _agent_editor_auth(_handler, reportId):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        gate = check_edit_gate(body, edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        if body.get("approved") is not True:
+            respond_json(_handler, 409, {"error": {"code": "ApprovalRequired",
+                                                       "message": "通知必须由用户明确批准后发送。"}})
+            return
+        channel = str(body.get("channel") or "").lower()
+        destination = str(body.get("destination") or "").strip()
+        message = str(body.get("message") or "").strip()
+        proposal_id = str(body.get("proposalId") or "")
+        if channel != "webhook" or not destination or not message or len(message) > 2000:
+            raise BadRequest("仅支持 webhook，且 message 必须为 1–2000 字")
+        expected_id = _notification_proposal_id(reportId, channel, destination, message)
+        if not hmac.compare_digest(proposal_id, expected_id):
+            raise Conflict("通知 proposal 已变化，请重新预览并批准")
+        configured_url = str(os.environ.get("LRM_NOTIFICATION_WEBHOOK_URL") or "").strip()
+        if not configured_url or destination != configured_url:
+            respond_json(_handler, 501, {"error": {"code": "NotificationAdapterNotConfigured",
+                                                   "message": "webhook 未配置或 destination 不在服务端 allowlist；未发送。"}})
+            return
+        parsed = urlparse(configured_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise BadRequest("通知 webhook 必须是无凭证 HTTPS URL")
+        delivery = _jobs.claim_notification(proposal_id, reportId, channel, destination)
+        if not delivery.get("send"):
+            state = delivery.get("status")
+            if state == "sent":
+                respond_json(_handler, 200, {"sent": True, "deduplicated": True,
+                                             "channel": channel, "proposalId": proposal_id,
+                                             "attempts": delivery.get("attempts", 0)})
+                return
+            if state == "in_flight":
+                respond_json(_handler, 202, {"sent": False, "status": "in_flight",
+                                             "channel": channel, "proposalId": proposal_id})
+                return
+            if state == "retry_exhausted":
+                respond_json(_handler, 429, {"error": {"code": "NotificationRetryExhausted",
+                    "message": "通知发送失败次数已达上限，请重新生成并批准新的通知提案。"}})
+                return
+            raise Conflict("通知 proposal 与既有 delivery 不一致，请重新生成提案")
+        from urllib.request import Request as _NotificationRequest, urlopen as _notification_urlopen
+        payload = json.dumps({"text": message, "reportId": reportId,
+                              "proposalId": proposal_id}, ensure_ascii=False).encode("utf-8")
+        try:
+            req = _NotificationRequest(configured_url, data=payload,
+                                       headers={"Content-Type": "application/json",
+                                                "User-Agent": "live-report-master-notifier/1",
+                                                "X-Idempotency-Key": proposal_id}, method="POST")
+            with _notification_urlopen(req, timeout=10) as response:
+                status = int(getattr(response, "status", 200) or 200)
+        except Exception as exc:
+            _jobs.finish_notification(proposal_id, sent=False, error=type(exc).__name__,
+                                      attempts=delivery.get("attempts"))
+            _audit(_handler, reportId, "notification.send.error", proposal_id,
+                   {"channel": channel, "error": type(exc).__name__,
+                    "attempts": delivery.get("attempts", 0)})
+            raise BadRequest(f"webhook 发送失败：{type(exc).__name__}") from exc
+        _jobs.finish_notification(proposal_id, sent=True, attempts=delivery.get("attempts"))
+        _audit(_handler, reportId, "notification.send", proposal_id,
+               {"channel": channel, "status": status,
+                "attempts": delivery.get("attempts", 0)})
+        respond_json(_handler, 200, {"sent": True, "channel": channel,
+                                     "proposalId": proposal_id, "status": status,
+                                     "attempts": delivery.get("attempts", 0)})
 
     def h_list_datasets(_handler):
         out = []
@@ -862,7 +2697,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                     **({"purgedSnapshots": purged} if purged else {}),
                     "title": entry.get("title") or reportId})
         entry["changelog"] = log
-        registry.register(reportId, entry)
+        _register_full_entry(registry, reportId, entry)
         respond_json(_handler, 200, {"datasetId": datasetId, "dropped": dropped,
                                      "detached": not dropped,
                                      **({"sharedWith": others} if others else {}),
@@ -977,6 +2812,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             for d in (entry.get("datasets") or []):
                 if isinstance(d, dict) and d.get("id") == datasetId:
                     d["rowCount"] = total_after
+            _touch_dataset_revision(entry, datasetId)
             manifest = entry.get("manifest") or {}
             for d in (manifest.get("datasets") or []):
                 if isinstance(d, dict) and d.get("id") == datasetId:
@@ -1169,7 +3005,8 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             except ValueError:
                 source_value = str(snap_path)
         datasets_meta.append({"id": ds_id, "label": label, "rowCount": info.row_count,
-                              "source": source_value})
+                              "source": source_value,
+                              "dataRevision": f"r{time.time_ns():x}"})
         manifest = entry.get("manifest") or {}
         mds = manifest.get("datasets")
         if not isinstance(mds, list):
@@ -1181,294 +3018,85 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                     "rowCount": info.row_count})
         entry["datasets"] = datasets_meta
         entry["manifest"] = manifest
-        registry.register(reportId, entry)
+        _touch_dataset_revision(entry, ds_id, datasets_meta[-1].get("dataRevision"))
+        _register_full_entry(registry, reportId, entry)
         respond_json(_handler, 200, {"datasetId": ds_id, "rowCount": info.row_count,
                                      "columns": [str(c) for c in cols],
                                      "sample": [list(r) for r in rows[:5]]})
 
     def _process_replace_table(reportId, datasetId, table, mode, key_cols, progress=None):
-        """h_dataset_replace 的重管道（唯一实现：同步请求线程 / 异步 job 线程共用）。
+        return _process_replace_table_impl(engine, registry, reportId, datasetId, table, mode, key_cols, progress)
 
-        形状/列集闸 → 合并（upsert）/替换/追加（append）→ 计算列与维度值分组
-        重算 → 装载 → 快照落盘 → manifest/注册表记账。fail-closed：任何闸失败
-        抛 BadRequest/NotFound，数据零改动。返回响应 payload（不写 HTTP 响应）。
+    def _start_replace_job(reportId, datasetId, table, mode, key_cols, tmp_path=None,
+                           trace_id=None):
+        """Persist the upload as a durable queue input and return 202.
+
+        The worker payload contains only a state-home-relative filename and
+        typed mode/key metadata; raw rows never enter jobs.sqlite JSON.
         """
-        def _tick(label):
-            if progress:
-                try:
-                    progress(label)
-                except Exception:  # noqa: BLE001 — 阶段上报绝不拖垮主流程
-                    pass
-
-        entry = registry.get(reportId)
-        if entry is None:
-            raise NotFound(f"report {reportId!r} not registered")
-        cols = table.get("columns") or []
-        rows = table.get("rows") or []
-        if not isinstance(cols, list) or not cols or len(cols) > 200:
-            raise BadRequest("table columns must contain 1-200 fields")
-        # 重复表头闸（与 CSV 直传同口径）：缺列/多列闸是集合比较，[A,A,B] 对
-        # [A,B] 放行后 index(c) 按首现投影 → 第二个 A 整列静默丢弃。
-        _reject_duplicate_columns(cols, "表格")
-        if not isinstance(rows, list) or not rows:
-            raise BadRequest("table rows must contain at least one record")
-        if len(rows) > 5_000_000:
-            raise BadRequest("table rows must contain at most 5,000,000 records")
-        if any(not isinstance(r, list) or len(r) != len(cols) for r in rows):
-            raise BadRequest("table rows must be rectangular")
-        datasets_meta = list(entry.get("datasets") or [])
-        meta = next((d for d in datasets_meta if d.get("id") == datasetId), None)
-        if meta is None:
-            raise NotFound(f"dataset {datasetId!r} not in report {reportId!r}")
-        current: list[str] = []
-        info_existing = engine.table_info(datasetId)
-        if info_existing is not None:
-            current = [str(c) for c in (info_existing.columns or [])]
-        if not current:
-            manifest_ds = next((d for d in ((entry.get("manifest") or {}).get("datasets") or [])
-                                if d.get("id") == datasetId), None)
-            current = [c.get("name") if isinstance(c, dict) else str(c)
-                       for c in ((manifest_ds or {}).get("columns") or [])]
-        # 计算列（derived.columns）与维度值分组列都是**物化产物**，不是源字段：
-        # 装载后的表里有它们，但用户上传的是原始文件（没有这些列），也可能上传
-        # 导出过的物化表（有）。两种都必须接受 —— 比对只针对原始字段，物化列
-        # 一律按声明重算（旧版只排除计算列，带分组列的表永远「缺列」被拒）。
-        # 声明取**注册表并集**（与下方 dimGroups / h_register 同口径）：共享表的
-        # 另一份副本可能已声明本条目 meta 里还没有的列，只读本条目会把引擎里
-        # 真实存在的物化列误判成「上传缺列」而拒绝整次替换。
-        decl_defs = table_defs(registry.raw_entries(), datasetId,
-                               extra=columns_decl(meta.get("derived")))
-        decl = {"kind": "columns", "defs": decl_defs} if decl_defs else None
-        derived_names = {str(d.get("name")) for d in decl_defs}
-        group_union = dim_group_table_defs(registry.raw_entries(), datasetId,
-                                           extra=dim_groups_defs(meta.get("dimGroups")))
-        derived_names.update(str(g.get("name")) for g in group_union)
-        # 退役物化列（曾声明过、声明已被删）：从**全部**注册表条目取并集——共享表
-        # 的孤儿列对每一份副本都是孤儿。它们不参与「原始列」比对。
-        retired_names = {str(c) for e2 in registry.raw_entries() if isinstance(e2, dict)
-                         for d2 in (e2.get("datasets") or []) if isinstance(d2, dict)
-                         and d2.get("id") == datasetId
-                         for c in (d2.get("retiredColumns") or [])}
-        current_raw = [c for c in current if c not in derived_names and c not in retired_names]
-        new_names = [str(c) for c in cols]
-        upload_raw = [c for c in new_names if c not in derived_names]
-        missing = [c for c in current_raw if c not in upload_raw]
-        extra = [c for c in upload_raw if c not in current_raw]
-        if missing or extra:
-            raise BadRequest(
-                "表格结构不一致，无法原位替换（缺列：" + ",".join(missing[:5]) +
-                "；多列：" + ",".join(extra[:5]) + "）。请使用列映射向导或新建数据源。")
-        upsert_stats = None
-        if mode == "upsert":
-            _tick("合并增量行中…")
-            import sys as _sys
-            _scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
-            if _scripts_dir not in _sys.path:
-                _sys.path.insert(0, _scripts_dir)
-            from upsert_merge import UpsertError, upsert_merge  # noqa: PLC0415  (scripts/ on sys.path above)
-            if info_existing is None:
-                # 空基表闸（2026-09-26）：引擎表缺失（重启时快照损坏被 _reload_all
-                # WARN 跳过）而注册表/manifest 声称有行——base_rows=[] 会把「增量
-                # 合并」变成破坏性全量替换，历史行被上传行集静默顶掉。fail-closed
-                # 400：先修复数据源（重新上传全量文件）或显式改用全量替换。声明
-                # 行数为 0/缺失（真空表）才允许空基表合并。
-                _mds = next((d for d in ((entry.get("manifest") or {}).get("datasets") or [])
-                             if isinstance(d, dict) and d.get("id") == datasetId), None)
-                claimed = 0
-                for cand in (meta.get("rowCount"), (_mds or {}).get("rowCount")):
-                    try:
-                        claimed = max(claimed, int(cand or 0))
-                    except (TypeError, ValueError):
-                        continue
-                if claimed > 0:
-                    raise BadRequest(
-                        f"增量合并被拒绝：引擎内没有数据源 {datasetId!r} 的表（重启时快照可能"
-                        f"损坏被跳过），而注册表声称有 {claimed:,} 行。此时合并会把这些行永久"
-                        "替换成本次上传的增量——请先在数据源配置里重新上传全量文件修复，"
-                        "或改用「全量替换」。")
-                base_rows: list[list] = []
-            else:
-                from .aggregator import _quote
-                select = ", ".join(_quote(c) for c in current_raw)
-                base_rows = [[rec.get(c) for c in current_raw]
-                             for rec in engine.execute(
-                                 f'SELECT {select} FROM {_quote(datasetId)}')]
+        import secrets as _secrets
+        queue_dir = Path(registry.path.parent) / "queued-replace"
+        queue_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        token = _secrets.token_hex(12)
+        if tmp_path is not None:
+            suffix = Path(tmp_path).suffix or ".upload"
+            input_path = queue_dir / f"replace-{token}{suffix}"
             try:
-                # 上传行先投影到 current_raw（与 replace 的 keep_idx 同一处理）：
-                # 导出过的物化表带着计算列回灌时，多余列直接丢弃而不是 400——
-                # 同一份文件「全量替换能成功、增量合并被拒」自相矛盾（真机复验）。
-                up_idx = [new_names.index(c) for c in current_raw]
-                proj_rows = [[r[i] if i < len(r) else None for i in up_idx] for r in rows]
-                merged = upsert_merge(current_raw, base_rows, proj_rows, key_cols,
-                                      delta_columns=list(current_raw))
-            except UpsertError as exc:
-                raise BadRequest(str(exc)) from exc
-            upsert_stats = merged["stats"]
-            raw_payload = {"columns": current_raw, "rows": merged["rows"]}
-        elif mode == "append":
-            # 追加新行（2026-09-22，W35/W36 真机复盘）：同构文件补新一期数据时，
-            # 按周期键判断增量往往 100% 是新行——upsert 的主键选择是纯仪式，
-            # 弹窗却把它设成硬闸。append = 不查重不覆盖，基表行 + 上传行直接
-            # 并表；重复导入同一文件会产生重复行（弹窗文案已声明此代价）。
-            _tick("并入追加行中…")
-            keep_idx = [new_names.index(c) for c in current_raw]
-            append_rows = [[r[i] for i in keep_idx] for r in rows]
-            if info_existing is not None:
-                from .aggregator import _quote
-                select = ", ".join(_quote(c) for c in current_raw)
-                base_rows = [[rec.get(c) for c in current_raw]
-                             for rec in engine.execute(
-                                 f'SELECT {select} FROM {_quote(datasetId)}')]
-            else:
-                base_rows = []
-            if len(base_rows) + len(append_rows) > 5_000_000:
-                raise BadRequest(
-                    f"追加后总行数 {len(base_rows) + len(append_rows):,} 超过 5,000,000 行上限，"
-                    "请改用全量替换或拆分增量。")
-            _tick(f"装载 {len(base_rows) + len(append_rows):,} 行中…")
-            raw_payload = {"columns": current_raw, "rows": base_rows + append_rows}
-        else:
-            _tick("装载替换行中…")
-            keep_idx = [new_names.index(c) for c in current_raw]
-            raw_payload = {"columns": current_raw,
-                           "rows": [[r[i] for i in keep_idx] for r in rows]}
-        _tick("重算计算列/维度值分组…")
-        table_payload = apply_dataset_derived(raw_payload,
-                                              decl or {"kind": "columns", "defs": []})
-        # 维度值分组列同为物化产物：按并集声明重算（来源与上方比对同一份）。
-        table_payload = apply_dim_groups(table_payload, group_union)
-        info = engine.load_table(datasetId, table_payload["columns"], table_payload["rows"],
-                                 index_columns=list(meta.get("indexColumns") or []))
-        for d in datasets_meta:
-            if d.get("id") == datasetId:
-                d["rowCount"] = info.row_count
-                if key_cols is not None:
-                    # 主键声明随本次合并持久化（下次刷新向导免重选；也是 D1
-                    # 模板化的种子）。replace/append 不改动已存声明。
-                    d["primaryKey"] = key_cols
-                # 重建成功 = 退役物化列已随 DROP+CREATE 消失，记录清掉。
-                d.pop("retiredColumns", None)
-        # 重启存活：`_reload_all` 是从注册表里的 **source 快照** 重载表的，所以替换
-        # 必须把新数据落到快照文件并改指 source —— 否则重启后数据悄悄退回旧版本
-        # （同一类 bug：改了内存/引擎，却没改重载的真源）。
-        data_dir = getattr(registry, "data_dir", None)
-        if data_dir:
-            from pathlib import Path as _Path
-            snap_path = _Path(data_dir) / (_snapshot_stem(datasetId) + ".replaced.json")
-            # 流式写盘（write_dataset_snapshot 内含临时文件 + os.replace 原子落盘）：
-            # 裸 write_text 半途失败会留半份快照，重启 _reload_all 灌进半个表。
-            # 写盘失败显式 400——引擎内已是新数据，必须告诉作者「重启会回退」，
-            # 不能静默吞掉（状态撕裂不可归因）。
-            try:
-                write_dataset_snapshot(snap_path, table_payload["columns"],
-                                       table_payload["rows"])
+                os.replace(tmp_path, input_path)
             except OSError as exc:
-                raise BadRequest(
-                    f"替换数据的快照写盘失败：{exc}。引擎内已是新数据，但重启会回退到旧快照；"
-                    "请处理磁盘/权限问题后重做一次「替换数据」。") from exc
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise BadRequest(f"无法持久化异步上传文件：{exc}") from exc
+        else:
+            input_path = queue_dir / f"replace-{token}.json"
             try:
-                rel = os.path.relpath(snap_path, registry.path.parent)
-            except ValueError:
-                rel = str(snap_path)
-            for d in datasets_meta:
-                if d.get("id") == datasetId:
-                    d["source"] = rel
-        entry["datasets"] = datasets_meta
-        manifest = entry.get("manifest") or {}
-        for d in (manifest.get("datasets") or []):
-            if d.get("id") == datasetId:
-                d["rowCount"] = info.row_count
-                # 列对象形状契约（server 模式 = [{name, type}]）：替换/增量不得把
-                # 编译期写好的 type 洗成裸名字——否则运行时分类全失效（插入图表
-                # alert「至少需要一个维度和一个指标」、字段面板丢指标区）。同名列
-                # 保留既有 type；替换真带来了新列时按值推断（validate_table 单一
-                # 真源）。_manifest_typed_columns 的 docstring 有完整失败链。
-                d["columns"] = _manifest_typed_columns(
-                    [str(c) for c in table_payload["columns"]],
-                    table_payload.get("rows") or [],
-                    prev_cols=d.get("columns"))
-                if key_cols is not None:
-                    d["primaryKey"] = key_cols
-                # 列统计（字段副行）是**编译期从旧数据算出来的**：数据一换就过期。
-                # 宁可让 UI 显示“—”，也不能继续展示旧数字（客户端同一路径也删）。
-                d.pop("columnStats", None)
-                # filterOptions（筛选/值域勾选的选项源）同性质：编译期从旧 rows
-                # 取样的截断值域。不删的话新数据里的新类目值永远不出现在筛选
-                # 下拉里（客户端会退回 /values 有界通道现拉）。
-                d.pop("filterOptions", None)
-        manifest["datasets"] = manifest.get("datasets") or []
-        entry["manifest"] = manifest
-        log = list(entry.get("changelog") or [])
-        log.append({"at": time.time(),
-                    "mode": "upsert-data" if mode == "upsert"
-                    else ("append-data" if mode == "append" else "replace-data"),
-                    "datasetId": datasetId, "rows": info.row_count,
-                    **({"inserted": upsert_stats["inserted"],
-                        "updated": upsert_stats["updated"]} if upsert_stats else {}),
-                    **({"appended": len(rows)} if mode == "append" else {}),
-                    "title": entry.get("title") or reportId})
-        entry["changelog"] = log
-        # 收尾合并落表（不整条覆盖）：异步任务跑的几分钟里作者可能已在线保存
-        # 过 manifest，整条 register 会把保存静默回滚（lost update）。
-        _commit_replace_result(registry, reportId, entry, datasetId)
-        payload = {"datasetId": datasetId, "rowCount": info.row_count,
-                   "columns": table_payload["columns"]}
-        if upsert_stats:
-            payload["upsert"] = upsert_stats
-        if mode == "append":
-            payload["appended"] = len(rows)
-        return payload
-
-    def _start_replace_job(reportId, datasetId, table, mode, key_cols, tmp_path=None):
-        """把 replace 重管道丢进后台 job；返回 (202, {jobId,...}) 交调用方写响应。
-
-        ``tmp_path`` 非 None = xlsx 直传：请求线程只落了临时文件，重解析在 job
-        线程做（43MB/29 万行 = 分钟级，留在请求里会被公司内网代理掐线），job
-        finally 里负责删除临时文件。
-        """
-        # create 在锁内做「查重 + 登记」原子步：h_dataset_replace 的 active_for
-        # 预检（先于读 body 的快速 409）与 create 之间有 TOCTOU 窗口，两个并发
-        # async=1 请求可以同时通过预检——第二个在这里被拦下，而不是起第二个
-        # 线程并发写同一张 SQLite 表。
+                write_dataset_snapshot(input_path,
+                                       (table or {}).get("columns") or [],
+                                       (table or {}).get("rows") or [])
+            except OSError as exc:
+                raise BadRequest(f"无法持久化异步数据：{exc}") from exc
+        payload = {"inputName": input_path.name, "mode": mode,
+                   "keyCols": key_cols,
+                   # Full replacement is idempotent against the same durable
+                   # input; upsert/append are deliberately manual after a
+                   # worker loss because their base table may have changed.
+                   "recoveryPolicy": "idempotent-replace" if mode == "replace" else "manual"}
         try:
-            job_id = _jobs.create("replace", reportId, datasetId)
+            job_id = _jobs.create("replace", reportId, datasetId, max_running=1,
+                                  priority=30, payload=payload, queued=True,
+                                  trace_id=trace_id)
         except _jobs.JobConflict as exc:
-            # 撞 409 时本进程从未启动 job：xlsx 直传落在请求线程的临时文件
-            # 只在 _work 的 finally 里删——job 没起来它永远不会执行，每次冲突
-            # 泄一份几十 MB 的文件。这里必须就地清理（存在性判断防竞态双删）。
+            # ``tmp_path`` is the request-thread xlsx temp file.  It may have
+            # already been moved into the queue, but unlinking the original is
+            # still required for the failed-move edge case and is harmless
+            # after a successful move.
             if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+            try:
+                input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             return 409, {"error": {"code": "Conflict",
                 "message": "该数据源已有一项进行中的数据更新任务，请等它完成（或失败）后再发起。",
                 "jobId": str(exc)}}
-
-        def _work(progress):
-            nonlocal table
+        except Exception:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             try:
-                if tmp_path is not None:
-                    suffix = Path(tmp_path).suffix.lstrip(".")
-                    progress(f"解析文件（{suffix}）中…")
-                    from table_input import load_table_file as _load_table_file
-                    try:
-                        loaded = _load_table_file(tmp_path)
-                    except Exception as exc:
-                        raise BadRequest(f"failed to parse uploaded file: {exc}") from exc
-                    table = {"columns": [str(c) for c in loaded.get("columns") or []],
-                             "rows": [list(r) for r in loaded.get("rows") or []]}
-                return _process_replace_table(reportId, datasetId, table, mode, key_cols,
-                                              progress)
-            finally:
-                if tmp_path is not None:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-
-        _jobs.run(job_id, _work)
-        return 202, {"jobId": job_id, "mode": mode, "datasetId": datasetId}
+                input_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return 202, {"jobId": job_id, "mode": mode, "datasetId": datasetId,
+                     "status": "queued", "retryToken": _jobs.retry_token(job_id)}
 
     def h_dataset_replace(_handler, reportId, datasetId):
         """Replace/merge/append an existing dataset's rows in place (真持久化).
@@ -1542,7 +3170,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             if ctype.startswith(("text/csv", "text/tab-separated-values")):
                 table = _parse_delimited_table(_handler)
                 if want_async:
-                    status, payload = _start_replace_job(reportId, datasetId, table, mode, key_cols)
+                    status, payload = _start_replace_job(
+                        reportId, datasetId, table, mode, key_cols,
+                        trace_id=getattr(_handler, "trace_id", None))
                     respond_json(_handler, status, payload)
                     return
             else:
@@ -1562,8 +3192,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                     tf.write(raw)
                 if want_async:
                     # 重解析交给 job；临时文件由 job 的 finally 删除。
-                    status, payload = _start_replace_job(reportId, datasetId, None, mode,
-                                                         key_cols, tmp_path=tmp)
+                    status, payload = _start_replace_job(
+                        reportId, datasetId, None, mode, key_cols, tmp_path=tmp,
+                        trace_id=getattr(_handler, "trace_id", None))
                     respond_json(_handler, status, payload)
                     return
                 try:
@@ -1614,8 +3245,10 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
     def h_dataset_replace_job(_handler, reportId, datasetId, jobId):
         """轮询数据更新后台任务（2026-09-22 异步化配套，与 replace 同一 edit 闸）。
 
-        404 = 任务不存在或服务已重启（job 只在内存）：客户端必须如实呈现
-        「状态未知，请用行数确认」，绝不能把 404 轮询成假成功。
+        任务元数据写在 state home 的 jobs.sqlite3；服务重启后仍可查到已完成任务，
+        但确认 owner 已退出的 running 任务会变为 lost，绝不自动重放数据写入。
+        真正不存在或已过期才返回 404，客户端必须如实呈现状态，绝不能把 404
+        轮询成假成功。
         """
         entry = registry.get(reportId)
         if entry is None:
@@ -1628,16 +3261,84 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         job = _jobs.get(jobId)
         if job is None or job["reportId"] != reportId or job["datasetId"] != datasetId:
             respond_json(_handler, 404, {"error": {"code": "NotFound",
-                "message": "任务不存在或服务已重启（进行中任务不跨重启保留）。"
-                           "请用数据源配置里的行数确认数据是否已更新。"}})
+                "message": "任务不存在或已过期，请用数据源配置里的行数确认数据是否已更新。"}})
             return
         payload = {"id": job["id"], "status": job["status"], "phase": job["phase"],
-                   "startedAt": job["startedAt"], "finishedAt": job["finishedAt"]}
+                   "startedAt": job["startedAt"], "finishedAt": job["finishedAt"],
+                   "pollAfterMs": 1200 if job["status"] == "running" else 0,
+                   "canRecover": bool(job.get("canRecover")),
+                   "retryToken": _jobs.retry_token(jobId)}
         if job["result"] is not None:
             payload["result"] = job["result"]
         if job["error"]:
             payload["error"] = job["error"]
         respond_json(_handler, 200, payload)
+
+    def h_dataset_replace_job_cancel(_handler, reportId, datasetId, jobId):
+        """Cooperatively cancel a queued/running replace without claiming rollback."""
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        gate = check_edit_gate({"password": body.get("password") or
+                                _handler.headers.get("X-Edit-Password") or ""},
+                               edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        job = _jobs.get(jobId)
+        if job is None or job.get("kind") != "replace" or job.get("reportId") != reportId \
+                or job.get("datasetId") != datasetId:
+            raise NotFound("数据更新任务不存在或已过期")
+        retry = body.get("retryToken") if isinstance(body, dict) else None
+        if retry and not _jobs.verify_retry_token(jobId, str(retry)):
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": "任务 retry token 无效"}})
+            return
+        accepted = _jobs.cancel(jobId, "数据更新任务已取消")
+        current = _jobs.get(jobId) or job
+        if current.get("status") == "cancelled":
+            # A queued replace has not reached the worker's ``finally`` block,
+            # so reclaim its 0600 input here. This is resource cleanup only:
+            # Flint's caller-owned aggregation/data contract is untouched
+            # (refs/flint/src/core/aggregate.ts:7-20), and cancellation never
+            # claims to roll back a running table mutation.
+            _cleanup_queued_replace_input(registry, current)
+        respond_json(_handler, 200, {"ok": accepted, "status": current.get("status"),
+                                     "phase": current.get("phase")})
+
+    def h_dataset_replace_job_recover(_handler, reportId, datasetId, jobId):
+        """安全重排仅限全量 replace；upsert/append 丢失后必须人工重发。"""
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        body = read_json(_handler)
+        gate = check_edit_gate({"password": body.get("password") or
+                                _handler.headers.get("X-Edit-Password") or ""},
+                               edit_policy_of(entry))
+        if gate:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
+            return
+        job = _jobs.get(jobId)
+        if job is None or job.get("kind") != "replace" or job.get("reportId") != reportId \
+                or job.get("datasetId") != datasetId:
+            raise NotFound("数据更新任务不存在或已过期")
+        token = body.get("retryToken") if isinstance(body, dict) else None
+        if not token:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden",
+                "message": "重试 lost 任务必须提供 retry token"}})
+            return
+        try:
+            recovered = _jobs.recover_lost(jobId, str(token))
+        except _jobs.JobRecoveryDenied as exc:
+            respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": str(exc)}})
+            return
+        except _jobs.JobConflict as exc:
+            respond_json(_handler, 409, {"error": {"code": "Conflict",
+                "message": "同一数据源已有任务进行中，请先等待或取消它。", "jobId": str(exc)}})
+            return
+        respond_json(_handler, 202, {"jobId": jobId, "status": recovered.get("status"),
+                                     "phase": recovered.get("phase"),
+                                     "retryToken": _jobs.retry_token(jobId), "recovered": True})
 
     def h_dataset_materialize(_handler, reportId, datasetId):
         """数据源配置保存后在线物化新计算列/维度值分组（2026-09-18 自动刷新闭环）。
@@ -1854,6 +3555,32 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             })
         respond_json(_handler, 200, {"reports": out})
 
+    def h_report_impact_graph(handler, reportId):
+        """Return a bounded, read-only cross-report/card dependency graph."""
+        if not _copilot_origin(handler):
+            return
+        if not _agent_auth(handler, reportId, "viewer"):
+            return
+        entry = registry.get(reportId)
+        if entry is None:
+            raise NotFound(f"report {reportId!r} not registered")
+        query = parse_qs(urlparse(str(getattr(handler, "path", ""))).query)
+        chart_id = (query.get("chartId") or [None])[0]
+        tenant = _report_tenant_id(entry)
+        # Tenant filtering is server-owned.  A missing tenant is the legacy
+        # local-report scope and must not be mixed with explicitly scoped data.
+        reports = []
+        for candidate in registry.raw_entries():
+            if _report_tenant_id(candidate) != tenant:
+                continue
+            reports.append(candidate)
+        from .agent_extensions import build_report_impact_graph
+        result = build_report_impact_graph(
+            reports,
+            target={"reportId": reportId, "chartId": chart_id} if chart_id else None,
+        )
+        respond_json(handler, 200, result)
+
     def h_get_report(_handler, reportId):
         entry = registry.get(reportId)
         if entry is None:
@@ -1988,6 +3715,15 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             # 证：草稿的整条工作流就是在零块画布上攒占位块并逐次 syncManifest。
             # 非 draft manifest 仍要求 charts 非空（零声明必须走请求层闸门）。
             raise BadRequest("manifest must be an object with charts")
+        security = incoming.get("security") if isinstance(incoming.get("security"), dict) else {}
+        tenant_values = [_validate_tenant_id(value) for value in
+                         (incoming.get("tenantId"), security.get("tenantId"))
+                         if value not in (None, "")]
+        if tenant_values and any(value != tenant_values[0] for value in tenant_values[1:]):
+            raise BadRequest("tenantId declarations must agree")
+        current_tenant = _report_tenant_id(entry)
+        if current_tenant and tenant_values and tenant_values[0] != current_tenant:
+            raise Conflict("报告 tenantId 不可在在线保存中切换")
         # themeShells.vars 键形状校验（安全 P2）：非 CSS 自定义属性键在落盘前丢弃。
         _sanitize_theme_vars(incoming)
         # pageWidth 在 template.render 里走 resolve_page_width（非法值抛错）——
@@ -2275,6 +4011,14 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                 resolve_page_width(manifest.get("pageWidth"))
             except Exception as exc:
                 raise BadRequest(f"manifest.pageWidth invalid: {exc}")
+        if isinstance(manifest, dict):
+            security = manifest.get("security") if isinstance(manifest.get("security"), dict) else {}
+            tenant_values = [body.get("tenantId"), manifest.get("tenantId"), security.get("tenantId")]
+            tenant_values = [_validate_tenant_id(value) for value in tenant_values if value not in (None, "")]
+            if tenant_values and any(value != tenant_values[0] for value in tenant_values[1:]):
+                raise BadRequest("tenantId declarations must agree")
+            if tenant_values and body.get("tenantId") and not manifest.get("tenantId"):
+                manifest["tenantId"] = tenant_values[0]
         multi = bool(body.get("multi"))
         ds_items = body.get("datasets")
         if isinstance(ds_items, list):
@@ -2650,7 +4394,43 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
 
     # ---- API routes ----
     r.add("GET",  "/api/health", h_health)
+    r.add("GET",  "/api/admin/index-suggestions", h_index_suggestions)
+    r.add("GET",  "/api/admin/index-suggestions/explain", h_index_explain)
+    r.add("POST", "/api/admin/index-suggestions/proposals/preview", h_index_proposal_preview)
+    r.add("POST", "/api/admin/index-suggestions/proposals", h_index_proposal_create)
+    r.add("GET",  "/api/admin/index-suggestions/proposals/:proposalId", h_index_proposal_get)
+    r.add("POST", "/api/admin/index-suggestions/proposals/:proposalId/approve", h_index_proposal_approve)
+    r.add("POST", "/api/admin/index-suggestions/proposals/:proposalId/apply", h_index_proposal_apply)
+    r.add("GET",  "/api/copilot/config", h_copilot_config_get)
+    r.add("POST", "/api/copilot/config", h_copilot_config_set)
+    r.add("GET",  "/api/copilot/provider-models", h_copilot_provider_models)
+    r.add("POST", "/api/copilot/test", h_copilot_test)
+    r.add("GET",  "/api/copilot/usage", h_copilot_usage)
+    r.add("GET",  "/api/copilot/tools", h_copilot_tools)
+    r.add("POST", "/api/reports/:reportId/copilot/auth/token", h_copilot_auth_token)
+    r.add("POST", "/api/reports/:reportId/copilot/plan/validate", h_copilot_plan_validate)
+    r.add("POST", "/api/reports/:reportId/copilot/plan/execute", h_copilot_plan_execute)
+    r.add("POST", "/api/reports/:reportId/copilot/proposals/validate", h_copilot_proposal_validate)
+    r.add("GET",  "/api/reports/:reportId/copilot/proposals/history", h_copilot_proposal_history)
+    r.add("POST", "/api/reports/:reportId/copilot/proposals/apply", h_copilot_proposal_apply)
+    r.add("POST", "/api/reports/:reportId/copilot/proposals/rollback", h_copilot_proposal_rollback)
+    r.add("POST", "/api/reports/:reportId/copilot/proposals/redo", h_copilot_proposal_redo)
+    r.add("POST", "/api/reports/:reportId/copilot/evidence/export", h_copilot_evidence_export)
+    r.add("GET",  "/api/reports/:reportId/copilot/evidence/:exportId", h_copilot_evidence_download)
+    r.add("GET",  "/api/reports/:reportId/copilot/monitors", h_copilot_monitors)
+    r.add("GET",  "/api/reports/:reportId/copilot/audit", h_copilot_audit)
+    r.add("POST", "/api/reports/:reportId/copilot/monitors", h_copilot_monitor_create)
+    r.add("POST", "/api/reports/:reportId/copilot/monitors/:monitorId", h_copilot_monitor_toggle)
+    r.add("DELETE", "/api/reports/:reportId/copilot/monitors/:monitorId", h_copilot_monitor_delete)
+    r.add("POST", "/api/reports/:reportId/copilot/notifications/propose", h_copilot_notification_propose)
+    r.add("POST", "/api/reports/:reportId/copilot/notifications/send", h_copilot_notification_send)
+    r.add("GET",  "/api/reports/:reportId/copilot/jobs/:jobId", h_copilot_job)
+    r.add("GET",  "/api/reports/:reportId/copilot/jobs", h_copilot_jobs)
+    r.add("POST", "/api/reports/:reportId/copilot/jobs/:jobId/cancel", h_copilot_job_cancel)
+    r.add("POST", "/api/reports/:reportId/copilot/jobs/:jobId/recover", h_copilot_job_recover)
+    r.add("POST", "/api/reports/:reportId/copilot", h_copilot_turn)
     r.add("GET",  "/api/reports/all", h_reports_all)
+    r.add("GET",  "/api/reports/:reportId/copilot/impact-graph", h_report_impact_graph)
     r.add("POST", "/api/admin/shutdown", h_shutdown)
     r.add("GET",  "/api/admin/edit-policy/:reportId", h_edit_policy_get)
     r.add("POST", "/api/admin/edit-policy/:reportId", h_edit_policy_set)
@@ -2667,6 +4447,8 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
     r.add("POST", "/api/reports/:reportId/datasets", h_dataset_add)
     r.add("POST", "/api/reports/:reportId/datasets/:datasetId/replace", h_dataset_replace)
     r.add("GET",  "/api/reports/:reportId/datasets/:datasetId/replace/jobs/:jobId", h_dataset_replace_job)
+    r.add("POST", "/api/reports/:reportId/datasets/:datasetId/replace/jobs/:jobId/cancel", h_dataset_replace_job_cancel)
+    r.add("POST", "/api/reports/:reportId/datasets/:datasetId/replace/jobs/:jobId/recover", h_dataset_replace_job_recover)
     r.add("POST", "/api/reports/:reportId/datasets/:datasetId/materialize", h_dataset_materialize)
     r.add("GET",  "/api/reports/:reportId/tables", h_report_tables)
     r.add("POST", "/api/reports/:reportId/datasets/:datasetId/drop", h_dataset_drop)
@@ -2687,6 +4469,46 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
     r.add("GET",  "/manager", h_manager)
     r.add("GET",  "/", h_index)
     r.add("GET",  "/index.html", h_reports_index)
+
+    def _monitor_loop():
+        """Enqueue read-only monitors; local or external workers may claim them."""
+        last_export_prune = 0.0
+        while True:
+            try:
+                now = time.time()
+                if now - last_export_prune >= 30:
+                    _prune_evidence_exports(registry, now=now)
+                    last_export_prune = now
+                for monitor in _jobs.due_monitors():
+                    report_id = monitor["reportId"]
+                    entry = registry.get(report_id)
+                    if entry is None:
+                        _jobs.set_monitor_enabled(monitor["id"], report_id, False)
+                        continue
+                    try:
+                        job_id = _jobs.enqueue("monitor", report_id, "monitor:" + monitor["id"],
+                                               priority=10, payload={"monitorId": monitor["id"],
+                                                                      "previousJobId": monitor.get("lastJobId"),
+                                                                      "recoveryPolicy": "safe-read"},
+                                               trace_id="monitor:" + monitor["id"])
+                    except (_jobs.JobConflict, _jobs.JobCapacity):
+                        continue
+                    if not _jobs.claim_monitor(monitor["id"], job_id, monitor["intervalSeconds"]):
+                        _jobs.cancel(job_id, "monitor 已被其他进程领取")
+                        continue
+                # The embedded worker keeps the default one-process server
+                # self-sufficient; ``run_server --worker`` can consume the
+                # same queue from another process/machine.
+                for _ in range(8):
+                    if not _jobs.worker_once(
+                            lambda job, progress: dispatch_queued_job(engine, registry, job, progress),
+                            kinds=["monitor", "agent_plan", "copilot", "evidence_export", "replace"], lease_seconds=60):
+                        break
+            except Exception as exc:  # monitor failure must not kill the server loop
+                print(f"[ai-report-server] WARN monitor scheduler: {type(exc).__name__}", file=sys.stderr)
+            time.sleep(2)
+
+    threading.Thread(target=_monitor_loop, daemon=True, name="lrm-monitor-scheduler").start()
     return r
 
 
@@ -3160,6 +4982,29 @@ def _server_started_at() -> float:
     return _server_started_at_value
 
 
+def _copilot_rate_limit(handler: BaseHTTPRequestHandler, report_id: str) -> tuple[bool, int]:
+    """Shared report/client guard; fall back to process-local tests when unconfigured."""
+    key = f"{report_id}:subject:{_agent_subject_hash(handler)}"
+    if getattr(_jobs, "_PERSIST_PATH", None) is not None:
+        return _jobs.consume_rate_limit(key, _COPILOT_RATE_LIMIT, int(_COPILOT_RATE_WINDOW_SECONDS))
+    now = time.monotonic()
+    with _COPILOT_RATE_LOCK:
+        bucket = [stamp for stamp in _COPILOT_RATE.get(key, [])
+                  if now - stamp < _COPILOT_RATE_WINDOW_SECONDS]
+        if len(bucket) >= _COPILOT_RATE_LIMIT:
+            retry = max(1, math.ceil(_COPILOT_RATE_WINDOW_SECONDS - (now - bucket[0])))
+            _COPILOT_RATE[key] = bucket
+            return False, retry
+        bucket.append(now)
+        _COPILOT_RATE[key] = bucket
+        if len(_COPILOT_RATE) > 1024:
+            stale = [k for k, values in _COPILOT_RATE.items()
+                     if not values or now - values[-1] >= _COPILOT_RATE_WINDOW_SECONDS]
+            for stale_key in stale[:512]:
+                _COPILOT_RATE.pop(stale_key, None)
+        return True, 0
+
+
 def run_server(
     host: str,
     port: int,
@@ -3176,7 +5021,19 @@ def run_server(
         def log_message(self, fmt, *args):
             return  # silence default stderr logging
 
+        def end_headers(self):
+            # One bounded correlation id per HTTP request.  Clients may supply
+            # an id for distributed tracing, but never arbitrary newlines or
+            # unbounded log/header data.  Returning it on errors too makes a
+            # failed Agent turn diagnosable without exposing prompts/rows.
+            trace = getattr(self, "trace_id", "")
+            if trace:
+                self.send_header("X-Trace-Id", trace)
+            super().end_headers()
+
         def _route(self, method):
+            supplied_trace = str(self.headers.get("X-Trace-Id") or "").strip()
+            self.trace_id = supplied_trace if re.fullmatch(r"[A-Za-z0-9._:-]{1,96}", supplied_trace) else uuid.uuid4().hex
             url = urlparse(self.path)
             path = url.path
             if path == "/api/v1":

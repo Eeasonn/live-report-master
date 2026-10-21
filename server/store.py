@@ -13,6 +13,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
@@ -30,6 +31,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_SCRIPTS_DIR))
 import date_parse as _date_parse  # noqa: E402
+from . import agent_extensions as _business_calendar  # noqa: E402
 
 
 # 名实一致（第 2 轮收口批 P3）：本正则只拒绝「非字符串 / 空串 / NUL」——它**不是**
@@ -281,11 +283,22 @@ class _ColAcc:
 class Engine:
     """Common interface. Both engines below implement it."""
 
+    @property
+    def revision(self) -> int:
+        """Monotonic data revision used by bounded read caches.
+
+        Every table load/drop/mutation advances the revision.  Consumers can
+        include it in a cache key without guessing whether a same-sized
+        replacement changed values.
+        """
+        return int(getattr(self, "_revision", 0))
+
     def load_table(self, name: str, columns: list[str], rows: list[list[Any]],
                    index_columns: Optional[list[str]] = None) -> TableInfo:
         raise NotImplementedError
 
-    def execute(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    def execute(self, sql: str, params: tuple = (), *, cancel_check=None,
+                timeout_seconds: float | None = None) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     def execute_mutation(self, sql: str, params: tuple = ()) -> int:
@@ -330,6 +343,10 @@ class Engine:
     # and the browser on nearly every week of the year (2026-01-01 → W00 vs
     # 2026-W01; year-end dates folded into the wrong ISO year).
     supports_week_norm: bool = False
+    # True when the explicit month-aligned fiscal-calendar UDF is available.
+    # It is opt-in through an Agent bucket.calendar declaration; omitted
+    # calendars remain Gregorian and byte-compatible.
+    supports_calendar_norm: bool = False
 
 
 # ---------------------- shared temporal normalization ---------------------------
@@ -443,6 +460,8 @@ def _register_date_norm(conn: Any, dialect: str, module: Any = None) -> bool:
         return False
     except Exception:
         return False
+    except Exception:
+        return False
 
 
 def _ai_week_label(value: Any) -> Any:
@@ -498,6 +517,51 @@ def _register_week_norm(conn: Any, dialect: str, module: Any = None) -> bool:
                 except Exception as exc:  # pragma: no cover - duckdb API differs by version
                     last = exc
             except Exception as exc:  # pragma: no cover - duckdb API differs by version
+                last = exc
+        if last:
+            raise last
+        return False
+
+    except Exception:
+        return False
+
+
+def _fiscal_date_normalize(value: Any, start_month: Any) -> Any:
+    """Shift a raw date so a configured fiscal start month becomes January."""
+    try:
+        month = int(start_month)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= month <= 12:
+        return None
+    try:
+        return _business_calendar.shifted_iso(
+            value, {"kind": "fiscal", "fiscalStartMonth": month})
+    except Exception:  # pragma: no cover - UDF must not break a query
+        return None
+
+
+def _register_calendar_norm(conn: Any, dialect: str, module: Any = None) -> bool:
+    """Best-effort registration of the two-argument fiscal-date UDF."""
+    try:
+        if dialect == "sqlite":
+            conn.create_function("ai_fiscal_date", 2, _fiscal_date_normalize, deterministic=True)
+            return True
+        last: Exception | None = None
+        for params, ret in ((["VARCHAR", "INTEGER"], "VARCHAR"),
+                            (["STRING", "INTEGER"], "STRING")):
+            try:
+                conn.create_function("ai_fiscal_date", _fiscal_date_normalize,
+                                     params, ret, null_handling="SPECIAL")
+                return True
+            except TypeError:
+                try:
+                    conn.create_function("ai_fiscal_date", _fiscal_date_normalize,
+                                         params, ret)
+                    return True
+                except Exception as exc:  # pragma: no cover
+                    last = exc
+            except Exception as exc:  # pragma: no cover
                 last = exc
         if last:
             raise last
@@ -577,9 +641,11 @@ class SQLiteEngine(Engine):
             self._conn.execute("PRAGMA synchronous=NORMAL")
         self._lock = threading.Lock()
         self._tables: dict[str, TableInfo] = {}
+        self._revision = 0
         self.supports_date_norm = _register_date_norm(self._conn, dialect="sqlite")
         self.supports_num_norm = _register_num_norm(self._conn, dialect="sqlite")
         self.supports_week_norm = _register_week_norm(self._conn, dialect="sqlite")
+        self.supports_calendar_norm = _register_calendar_norm(self._conn, dialect="sqlite")
         self.supports_date_check = _register_date_check(self._conn, dialect="sqlite")
 
     def load_table(self, name: str, columns: list[str], rows: list[list[Any]],
@@ -648,20 +714,44 @@ class SQLiteEngine(Engine):
             schema = [acc.schema(col) for col, acc in zip(columns, accs)]
             info = TableInfo(name=name, columns=columns, schema=schema, row_count=matched)
             self._tables[name] = info
+            self._revision += 1
             return info
 
-    def execute(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    def execute(self, sql: str, params: tuple = (), *, cancel_check=None,
+                timeout_seconds: float | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            cur = self._conn.execute(sql, params)
-            if cur.description is None:
-                return []
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+            deadline = time.monotonic() + timeout_seconds if timeout_seconds else None
+            cancelled = False
+            def _progress():
+                nonlocal cancelled
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    return 1
+                if deadline is not None and time.monotonic() >= deadline:
+                    cancelled = True
+                    return 1
+                return 0
+            if cancel_check is not None or deadline is not None:
+                self._conn.set_progress_handler(_progress, 1000)
+            try:
+                cur = self._conn.execute(sql, params)
+                if cur.description is None:
+                    return []
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            except sqlite3.OperationalError as exc:
+                if cancelled:
+                    raise TimeoutError("查询已取消或超过时间预算") from exc
+                raise
+            finally:
+                if cancel_check is not None or deadline is not None:
+                    self._conn.set_progress_handler(None, 0)
 
     def execute_mutation(self, sql: str, params: tuple = ()) -> int:
         with self._lock:
             cur = self._conn.execute(sql, params)
             self._conn.commit()
+            self._revision += 1
             return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
 
     def list_tables(self) -> list[str]:
@@ -674,6 +764,7 @@ class SQLiteEngine(Engine):
         with self._lock:
             self._conn.execute(f'DROP TABLE IF EXISTS {_qcol(name)}')
             self._tables.pop(name, None)
+            self._revision += 1
 
     def close(self) -> None:
         with self._lock:
@@ -698,9 +789,11 @@ class DuckDBEngine(Engine):
         # fetchAggregate 就是竞态。与 SQLiteEngine 同一条「每方法持锁」纪律。
         self._lock = threading.RLock()
         self._tables: dict[str, TableInfo] = {}
+        self._revision = 0
         self.supports_date_norm = _register_date_norm(self._conn, dialect="duckdb", module=duckdb)
         self.supports_num_norm = _register_num_norm(self._conn, dialect="duckdb", module=duckdb)
         self.supports_week_norm = _register_week_norm(self._conn, dialect="duckdb", module=duckdb)
+        self.supports_calendar_norm = _register_calendar_norm(self._conn, dialect="duckdb", module=duckdb)
         self.supports_date_check = _register_date_check(self._conn, dialect="duckdb", module=duckdb)
 
     def load_table(self, name: str, columns: list[str], rows: list[list[Any]],
@@ -755,9 +848,13 @@ class DuckDBEngine(Engine):
             info = TableInfo(name=name, columns=columns, schema=schema,
                              row_count=len([row for row in rows if len(row) == len(columns)]))
             self._tables[name] = info
+            self._revision += 1
         return info
 
-    def execute(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    def execute(self, sql: str, params: tuple = (), *, cancel_check=None,
+                timeout_seconds: float | None = None) -> list[dict[str, Any]]:
+        if cancel_check is not None and cancel_check():
+            raise TimeoutError("查询已取消")
         with self._lock:
             cur = self._conn.execute(sql, params)
             cols = [d[0] for d in cur.description]
@@ -767,6 +864,7 @@ class DuckDBEngine(Engine):
         with self._lock:
             cur = self._conn.execute(sql, params)
             self._conn.commit()
+            self._revision += 1
             # duckdb 的 DELETE 返回的是「Changed N rows」计数对象；rowcount 由
             # DB-API 承载，不可判定时按 0 兜底（调用方随后用 COUNT(*) 复核）。
             return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
@@ -781,6 +879,7 @@ class DuckDBEngine(Engine):
         with self._lock:
             self._conn.execute(f'DROP TABLE IF EXISTS {_qcol(name)}')
             self._tables.pop(name, None)
+            self._revision += 1
 
     def close(self) -> None:
         self._conn.close()
