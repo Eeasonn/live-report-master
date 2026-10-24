@@ -37,10 +37,25 @@ if str(SKILL_DIR / "scripts") not in sys.path:
     sys.path.insert(0, str(SKILL_DIR / "scripts"))
 
 from server.app import dispatch_queued_job, run_server          # noqa: E402
-from server.loopback import urlopen_loopback                   # noqa: E402
+from server._platform import urlopen_loopback                   # noqa: E402
 from server.registry import Registry, DEFAULT_DATA_DIR, DEFAULT_REGISTRY   # noqa: E402
-from server.store import get_engine                            # noqa: E402
+from server.store import (                                     # noqa: E402
+    ENGINE_CACHE_VERSION,
+    engine_load_from_snapshot,
+    engine_supports_table_cache,
+    get_engine,
+    read_snapshot,
+    snapshot_fingerprint,
+    table_cache_stem,
+)
 from server.template import TemplateProvider                   # noqa: E402
+
+# Persistent engine cache (NP-01): the cache key is
+# (dataset id, snapshot sha256, declaration hash, TABLE_CACHE_TAG).
+# Bump LOADER_VERSION whenever scripts/table_input.py parsing changes shape or
+# values (a cached table was produced by the OLD loader and must invalidate).
+TABLE_CACHE_LOADER_VERSION = "1"
+TABLE_CACHE_TAG = f"engine{ENGINE_CACHE_VERSION}+loader{TABLE_CACHE_LOADER_VERSION}"
 
 
 def _select_engine_policy(registry, requested: str) -> tuple[bool, dict[str, object]]:
@@ -90,10 +105,157 @@ def _select_engine_policy(registry, requested: str) -> tuple[bool, dict[str, obj
                    "workloadClass": "interactive_local", "reason": "bounded local workload", **profile}
 
 
+def _table_decl_hash(registry: Registry, ds_id: str) -> str:
+    """Content hash of every registry declaration that shapes a table's content.
+
+    The engine content of a table is NOT just its snapshot: the derived-column
+    union, the 维度值分组 union and the declared index columns are replayed on
+    top of the raw snapshot (aggregate-level ``derived.measures`` 不在此列——
+    它们从不落表).  All unions are computed with the SAME helpers
+    ``derived_columns.replay_all`` uses, so any declaration change flips this
+    hash and the cached table is rebuilt instead of adopted.
+    """
+    import hashlib as _hashlib
+    import json as _json
+
+    from server.store import dim_group_table_defs, table_defs
+    entries = registry.raw_entries()
+    idx_cols: list[str] = []
+    for e2 in entries:
+        if not isinstance(e2, dict):
+            continue
+        for d2 in (e2.get("datasets") or []):
+            if isinstance(d2, dict) and d2.get("id") == ds_id:
+                for c in (d2.get("indexColumns") or []):
+                    if c not in idx_cols:
+                        idx_cols.append(c)
+    payload = _json.dumps(
+        {"derived": table_defs(entries, ds_id),
+         "dimGroups": dim_group_table_defs(entries, ds_id),
+         "indexes": idx_cols},
+        ensure_ascii=False, default=str)
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class _TableCache:
+    """Per-boot coordinator for the persistent engine cache (NP-01).
+
+    Cache files live in ``<state-home>/db/<datasetId>.sqlite`` and are written
+    ONLY by ``store.SQLiteEngine.export_table_cache`` (temp file + os.replace).
+    ``LRM_NO_DB_CACHE=1`` (or true/yes) disables reads AND writes so the boot
+    behaves exactly like the pre-NP-01 reload path.  DuckDB engines never
+    enable it (``engine_supports_table_cache`` is False there).
+    """
+
+    def __init__(self, registry: Registry, engine, verbose: bool = True):
+        self.registry = registry
+        self.engine = engine
+        self.verbose = verbose
+        self.enabled = (
+            os.environ.get("LRM_NO_DB_CACHE", "").strip().lower()
+            not in ("1", "true", "yes")
+            and engine_supports_table_cache(engine))
+        self.db_dir = registry.path.parent / "db"
+        self.adopted: dict[str, str] = {}   # ds_id -> snapshot fingerprint (fresh)
+        self.loaded: dict[str, str] = {}    # ds_id -> snapshot fingerprint (needs export)
+        self._fps: dict[str, str] = {}      # resolved source path -> fingerprint
+        self._expected: set[str] = set()    # stems allowed to survive this boot
+        if self.enabled:
+            try:
+                self.db_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.enabled = False
+
+    def _say(self, msg: str, to_stderr: bool = False) -> None:
+        if self.verbose:
+            print(msg, file=sys.stderr if to_stderr else None)
+
+    def fingerprint_for(self, p: Path) -> str:
+        """sha256 of the snapshot file (memoized per resolved path)."""
+        key = str(p)
+        fp = self._fps.get(key)
+        if fp is None:
+            fp = snapshot_fingerprint(p)
+            self._fps[key] = fp
+        return fp
+
+    def try_adopt(self, ds_id: str, fingerprint: str) -> bool:
+        """Restore the table from cache when snapshot+declarations are unchanged.
+
+        Returns True when the engine already holds the current table content
+        (adopted now, or earlier in this same boot for a shared dataset id) so
+        the caller skips ``load(p)`` + ``engine.load_table`` entirely.  Any
+        cache problem returns False and the caller reloads (fail-closed).
+        """
+        if not self.enabled:
+            return False
+        stem = table_cache_stem(ds_id)
+        self._expected.add(stem)
+        if self.adopted.get(ds_id) == fingerprint:
+            return True  # shared dataset id already adopted with this content
+        info = self.engine.adopt_table_cache(
+            ds_id, self.db_dir / f"{stem}.sqlite", fingerprint,
+            _table_decl_hash(self.registry, ds_id), TABLE_CACHE_TAG)
+        if info is None:
+            return False
+        self.adopted[ds_id] = fingerprint
+        self._say(f"[ai-report-server] cache-hit {ds_id!r} ({info.row_count} rows, "
+                  f"{len(info.columns)} cols) from db/{stem}.sqlite")
+        return True
+
+    def mark_loaded(self, ds_id: str, fingerprint: str) -> None:
+        """A table was reloaded from its snapshot: its cache needs re-export."""
+        self.loaded[ds_id] = fingerprint
+        self.adopted.pop(ds_id, None)
+
+    def flush(self) -> None:
+        """Export reloaded tables to cache files; prune orphans; drop tmp junk.
+
+        Runs AFTER the derived-column and relation replays so a cache file
+        always holds the post-replay table content (a later adoption can then
+        skip the replays for that table — they are no-ops on an up-to-date
+        table because the declaration hash is part of the cache key).
+        """
+        if not self.enabled:
+            return
+        for ds_id, fingerprint in sorted(self.loaded.items()):
+            stem = table_cache_stem(ds_id)
+            ok = self.engine.export_table_cache(
+                ds_id, self.db_dir / f"{stem}.sqlite", fingerprint,
+                _table_decl_hash(self.registry, ds_id), TABLE_CACHE_TAG)
+            if ok:
+                self._say(f"[ai-report-server] cache-write {ds_id!r} -> db/{stem}.sqlite")
+            else:
+                self._say(f"[ai-report-server] WARN cache-write {ds_id!r} failed "
+                          f"（引擎表不受影响，下次启动将重新装载）", to_stderr=True)
+        # Orphan hygiene: a cache file whose dataset has no existing source this
+        # boot can never be validated again — remove it.  Leftover tmp files
+        # from a crashed export go the same way.
+        try:
+            entries = list(self.db_dir.glob("*.sqlite"))
+        except OSError:
+            entries = []
+        for f in entries:
+            if f.name[: -len(".sqlite")] not in self._expected:
+                try:
+                    f.unlink()
+                    self._say(f"[ai-report-server] cache-prune {f.name}（数据集已无快照）")
+                except OSError:
+                    pass
+        for f in list(self.db_dir.glob("*.sqlite.tmp-*")):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def _reload_all(registry: Registry, engine, verbose: bool = True) -> None:
-    from server.derived_columns import replay_all as replay_columns
-    from server.loader import load
-    from server.relations import is_derived, replay_entry
+    from server.store import replay_all as replay_columns
+    from server.registry import is_derived, replay_entry
+    # Persistent engine cache (NP-01): snapshot-content-hash keyed table cache.
+    # Disabled (or DuckDB engines / LRM_NO_DB_CACHE=1) every step below is the
+    # untouched pre-NP-01 path.
+    cache = _TableCache(registry, engine, verbose=verbose)
     # Two passes: file-backed datasets first, then derived output (wide tables
     # merge the sources; 计算列 replay needs the whole file pass done, see
     # server/derived_columns.replay_all).
@@ -111,14 +273,28 @@ def _reload_all(registry: Registry, engine, verbose: bool = True) -> None:
                 if verbose:
                     print(f"[ai-report-server] WARN dataset {d['id']!r} source not found: {src}", file=sys.stderr)
                 continue
+            # 哈希先于装载：命中即免掉 JSON 解析 + DROP+CREATE（冷启动主收益）。
+            # 快照在 exists() 与读盘之间被删属边界竞态：fail-closed 降级为普通重载。
             try:
-                table = load(p)
-                engine.drop_table(d["id"])
-                # 索引列声明随注册表 meta 走（h_register 持久化）：重载是
-                # DROP+CREATE，不透传 = 索引悄悄消失（与 app._reload_dataset
-                # 同一条契约，别只修一处）。
-                info = engine.load_table(d["id"], table["columns"], table["rows"],
-                                         index_columns=list(d.get("indexColumns") or []))
+                fp = cache.fingerprint_for(p) if cache.enabled else None
+            except OSError:
+                fp = None
+            if fp is not None and cache.try_adopt(d["id"], fp):
+                continue
+            try:
+                # XP-01（2026-10-24）：装载统一走 engine_load_from_snapshot——
+                # .json 快照走 canonical 装载器（历史行为逐位一致），.sqlite 快照
+                # 走 ATTACH+INSERT SELECT（跳过整表 JSON 解析），csv/xlsx 构建期
+                # 源拷贝照旧；DuckDB 引擎自动落回旧路径。
+                # 顺序契约（勿改）：先解析后落表——快照解析失败（如 0 行 JSON）
+                # 时引擎里的旧表原样保留（与历史行为逐位一致）；DROP+CREATE 由
+                # load_table/_load_sqlite_snapshot 内部完成。
+                # 索引列声明随注册表 meta 走（h_register 持久化）：不透传 = 索引
+                # 悄悄消失（与 app._reload_dataset 同一条契约，别只修一处）。
+                info = engine_load_from_snapshot(engine, d["id"], p,
+                                                 index_columns=list(d.get("indexColumns") or []))
+                if fp is not None:
+                    cache.mark_loaded(d["id"], fp)
                 if verbose:
                     print(f"[ai-report-server] loaded {d['id']!r} ({info.row_count} rows, {len(info.columns)} cols) from {src}")
             except Exception as e:
@@ -139,22 +315,28 @@ def _reload_all(registry: Registry, engine, verbose: bool = True) -> None:
             if verbose:
                 print(f"[ai-report-server] rebuilt derived {item['id']!r} ({item['rowCount']} rows)")
         registry.register(entry["reportId"], entry)
+    # Cache export LAST: the persisted table must be the post-replay content.
+    cache.flush()
 
 
 def _find_shipped_snapshot(data_dir: Path, report_id: str, ds_id: str) -> Path | None:
-    """在随包的 ``build/data/`` 里找数据集快照。
+    """在随包的 ``build/data/`` 里找数据集快照（XP-01：.json/.sqlite 双后缀）。
 
     优先级 = 数据的新鲜度：**运行时替换 > 运行时追加 > 构建期 canonical**。
-    运行时「替换数据」把权威真值写进 ``.replaced.json`` 并把注册表 source 改
-    指它（server/app.py ``_process_replace_table``），构建期 ``table-primary``
-    旧快照并不删除、两代会同时随包（``_ship_portable_data`` 按 ``{report_id}__*``
-    全量拷）——组序倒置会让便携重注册恒选中旧快照：注册表 rowCount 声称新、
-    聚合全是旧数（静默错数，2026-09-26 甄别）。
+    运行时「替换数据」把权威真值写进 ``.replaced.{json,sqlite}`` 并把注册表
+    source 改指它（server/app.py ``_process_replace_table``），构建期
+    ``table-primary`` 旧快照并不删除、两代会同时随包（``_ship_portable_data``
+    按 ``{report_id}__*`` 全量拷）——组序倒置会让便携重注册恒选中旧快照：注册表
+    rowCount 声称新、聚合全是旧数（静默错数，2026-09-26 甄别）。
 
     随包命名有两代：mixed 注册快照 = ``{report_id}__{ds_id}__*``（ds_id 已是
     final 名）；运行时替换/追加与单表注册 = ``{report_id}__{raw}*``——两种都
     试。兜底 glob 必须带边界（``[._-]``／``__``）：裸 ``{raw}*`` 会让 ``sales``
     命中 ``sales2__table-primary.json``，兄弟数据集数据串台且无告警。
+
+    同一候选位两种格式并存（.replaced.json + .replaced.sqlite）= 格式换轨期的
+    过渡态：**以较新 mtime 为权威**并打印一次 WARN（两份内容理论上同源，但
+    mtime 新的那份才是最后一次写盘的）。
     """
     if not data_dir.exists():
         return None
@@ -162,27 +344,53 @@ def _find_shipped_snapshot(data_dir: Path, report_id: str, ds_id: str) -> Path |
     prefix = f"{report_id}__"
     if ds_id.startswith(prefix):
         raw = ds_id[len(prefix):]
+
+    def _pick(stem: str) -> Path | None:
+        hits = [p for suf in (".json", ".sqlite")
+                if (p := data_dir / f"{stem}{suf}").exists()]
+        if not hits:
+            return None
+        if len(hits) > 1:
+            _warn_dual_format(hits)
+        return max(hits, key=lambda p: p.stat().st_mtime)
+
     prefs = [
         # 运行时权威（app.py 写进中央 state home，随包两代并存时它更新）
-        [data_dir / f"{report_id}__{ds_id}.replaced.json",
-         data_dir / f"{report_id}__{raw}.replaced.json"],
-        [data_dir / f"{report_id}__{ds_id}.added.json",
-         data_dir / f"{report_id}__{raw}.added.json"],
+        [f"{report_id}__{ds_id}.replaced", f"{report_id}__{raw}.replaced"],
+        [f"{report_id}__{ds_id}.added", f"{report_id}__{raw}.added"],
         # 构建期 canonical（mixed 注册 / 单表注册）
-        [data_dir / f"{report_id}__{ds_id}__table-primary.json",
-         data_dir / f"{report_id}__{raw}__table-primary.json"],
+        [f"{report_id}__{ds_id}__table-primary", f"{report_id}__{raw}__table-primary"],
     ]
     for group in prefs:
-        for p in group:
-            if p.exists():
+        for stem in group:
+            p = _pick(stem)
+            if p is not None:
                 return p
     # 兜底（表名非 table-primary 的历史包等）：按 ``__``/``.`` 边界自匹配，
     # 绝不让 ``sales`` 命中 ``sales2__…``（首字符必须是边界符）。
     for stem in (ds_id, raw):
         hits = sorted(data_dir.glob(f"{report_id}__{stem}[._-]*"))
         if hits:
-            return hits[0]
+            if len({p.suffix for p in hits if p.suffix in (".json", ".sqlite")}) > 1:
+                _warn_dual_format(hits)
+            return max(hits, key=lambda p: p.stat().st_mtime)
     return None
+
+
+_DUAL_FORMAT_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_dual_format(hits: list[Path]) -> None:
+    """Same-stem dual-format coexistence → newer mtime wins, WARN once per set."""
+    names = tuple(sorted(p.name for p in hits))
+    if names in _DUAL_FORMAT_WARNED:
+        return
+    _DUAL_FORMAT_WARNED.add(names)
+    newest = max(hits, key=lambda p: p.stat().st_mtime)
+    print(f"[ai-report-server] WARN 同一数据集两种快照格式并存 "
+          f"（{' / '.join(names)}）；以较新 mtime 为权威 → {newest.name}。"
+          "可运行 run_server --prune 回收被取代的旧格式代次。",
+          file=sys.stderr)
 
 
 def _shipped_report_bundle(registry, folder: Path, verbose: bool = True):
@@ -201,7 +409,7 @@ def _shipped_report_bundle(registry, folder: Path, verbose: bool = True):
     import json as _json
     import re as _re
 
-    from server.relations import wide_dataset_id
+    from server.registry import wide_dataset_id
 
     build = folder / "build"
     manifest_path = build / "manifest.json"
@@ -272,7 +480,7 @@ def _register_report_folder(registry, folder: Path, port: int, verbose: bool = T
             # 声明登记（source=None + derived.kind=relation），boot/reload 的
             # replay_entry 从已装载的源表重建引擎表。只打 WARN 跳过的旧行为
             # 会让收件机引用宽表的图表永久 400（无声明 = replay 不接管）。
-            from server.relations import derived_entry
+            from server.registry import derived_entry
             try:
                 ds_entries.append(derived_entry(ds_id, item["relation"],
                                                 int(ds.get("rowCount") or 0)))
@@ -417,7 +625,13 @@ def _register_report_warm(base: str, registry, folder: Path, verbose: bool = Tru
             })
             continue
         try:
-            table = _json.loads(item["snapshot"].read_text(encoding="utf-8"))
+            # XP-01：随包快照按后缀分派读回（.json 走 json 解析、.sqlite 走
+            # store.read_snapshot 流式读），旧 JSON 包照读零漂移。
+            if item["snapshot"].suffix.lower() == ".sqlite":
+                _cols, _rows_iter = read_snapshot(item["snapshot"])
+                table = {"columns": list(_cols), "rows": list(_rows_iter)}
+            else:
+                table = _json.loads(item["snapshot"].read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             print(f"[ai-report-server] WARN --register-report: 快照 {item['snapshot'].name} "
                   f"读取失败：{exc}", file=sys.stderr)
@@ -463,6 +677,287 @@ def _register_report_warm(base: str, registry, folder: Path, verbose: bool = Tru
     return report_id
 
 
+# ---------------------- XP-01 · --prune 快照保留策略（2026-10-24） -----------------
+#
+# state home 的 data/（数据快照）与 db/（NP-01 表缓存）没有任何治理会无限膨胀
+# （真机 data/ 964MB + db/ 360MB，含大量历史测试报告与被取代代次）。prune 只碰
+# 这两个目录；registry.json / servers.json / jobs.sqlite3 / *.secret /
+# copilot-* / server.pid 等一律不进回收范围，且 apply 阶段逐文件再验一次
+# 「父目录必须是本次扫描的 data/ 或 db/」——即使计划列表被塞进白名单外的路径
+# 也删不掉（白名单闸，tests/test_prune.py 源级+行为级锁定）。
+#
+# 三类可回收：
+#   ① orphan-snapshot      data/ 里带 ``{reportId}__`` 前缀、但不属于任何注册
+#                          表条目（数据集记账/manifest/source 全都接不上）的文件；
+#   ② superseded-generation 同一数据集的各代快照（.replaced/.added/构建期
+#                          canonical/pre-delete）中，注册表 source 当前引用的那份
+#                          与最新 mtime 的那两份保留，其余可回收；
+#   ③ orphan-cache         db/*.sqlite 的 stem 不对应任何注册数据集；
+#      stale-cache         或 stem 合法但 ``_ai_cache_meta.fingerprint`` ≠ 当前
+#                          快照指纹（下次 boot 也会重建，离线删掉即回收）。
+#
+# 安全闸：state home 的 server.pid 对应进程活着 → --prune-apply 拒绝执行
+#（提示先停服务）；--prune-force 显式放行。dry-run（--prune）恒可运行。
+PRUNE_SCOPE_DIRS = ("data", "db")
+
+
+def _snapshot_files_for_dir(data_dir: Path, report_id: str, ds_id: str) -> list[Path]:
+    """app._snapshot_files_for 的本地别名（单一实现，不起第二套匹配规则）。"""
+    from server.app import _snapshot_files_for
+    return _snapshot_files_for(data_dir, report_id, ds_id)
+
+
+def _read_cache_fingerprint(cache_file: Path) -> str | None:
+    """Read ``_ai_cache_meta.fingerprint`` from an NP-01 cache file (None=unreadable)."""
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(cache_file.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM _ai_cache_meta").fetchall()
+        finally:
+            conn.close()
+    except (OSError, _sqlite3.Error, ValueError):
+        return None
+    for key, value in rows:
+        if str(key) == "fingerprint":
+            return str(value)
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _server_pid_from(state_home: Path) -> int | None:
+    """state home 根的 server.pid 里记录的 pid；文件缺失/内容非法 → None。
+
+    注意这只认「启动器/构建器写下的那个常驻服务」的 pid 文件（report_build
+    `_ensure_server` 与便携启动器都以 ``<state>/server.pid`` 为约定）。
+    """
+    pid_file = state_home / "server.pid"
+    if not pid_file.exists():
+        return None
+    try:
+        return int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _build_prune_plan(state_home: Path, registry, data_dir: Path,
+                      db_dir: Path) -> dict:
+    """Classify reclaimable files. Pure scan — touches NOTHING on disk."""
+    from server.store import table_cache_stem
+    entries = [e for e in registry.raw_entries() if isinstance(e, dict)]
+
+    referenced_names: set[str] = set()
+    group_sources: dict[tuple[str, str], set[str]] = {}
+    groups: dict[tuple[str, str], list[Path]] = {}
+    ds_ids: list[str] = []
+    for e in entries:
+        rid = str(e.get("reportId") or "")
+        for d in (e.get("datasets") or []):
+            if not isinstance(d, dict) or not d.get("id"):
+                continue
+            ds_id = str(d["id"])
+            if ds_id not in ds_ids:
+                ds_ids.append(ds_id)
+            key = (rid, ds_id)
+            groups.setdefault(key, [])
+            src = str(d.get("source") or "")
+            if src:
+                name = Path(src).name
+                referenced_names.add(name)
+                group_sources.setdefault(key, set()).add(name)
+            for p in _snapshot_files_for_dir(data_dir, rid, ds_id):
+                if p not in groups[key]:
+                    groups[key].append(p)
+
+    plan: list[dict] = []
+
+    def _add(path: Path, category: str) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        plan.append({"path": str(path), "category": category, "bytes": size})
+
+    # ② 被取代代次（先分类组内文件，剩下的才轮到 ① 孤儿判定）
+    kept_names: set[str] = set()
+    for key, files in sorted(groups.items()):
+        if not files:
+            continue
+        keep = set(group_sources.get(key) or set())
+        newest = max(files, key=lambda p: (p.stat().st_mtime if p.exists() else 0))
+        keep.add(newest.name)
+        kept_names.update(p.name for p in files)
+        for p in sorted(files):
+            if p.name not in keep:
+                _add(p, "superseded-generation")
+
+    # ① 孤儿快照：带报告前缀但任何注册条目都接不上
+    try:
+        data_files = sorted(p for p in data_dir.iterdir() if p.is_file())
+    except OSError:
+        data_files = []
+    for f in data_files:
+        if f.name in kept_names or f.name in referenced_names:
+            continue
+        if "__" in f.name:
+            _add(f, "orphan-snapshot")
+
+    # ③ 孤儿/过期表缓存
+    expected: dict[str, str] = {}   # cache stem -> ds_id
+    for ds_id in ds_ids:
+        expected[table_cache_stem(ds_id)] = ds_id
+    ds_snapshot: dict[str, Path | None] = {}
+    for (rid, ds_id), _files in groups.items():
+        if ds_id in ds_snapshot:
+            continue
+        src = None
+        for e in entries:
+            hit = next((d for d in (e.get("datasets") or [])
+                        if isinstance(d, dict) and str(d.get("id") or "") == ds_id
+                        and d.get("source")), None)
+            if hit is not None:
+                p = Path(str(hit["source"]))
+                src = p if p.is_absolute() else state_home / p
+                break
+        ds_snapshot[ds_id] = src
+    try:
+        cache_files = sorted(db_dir.glob("*.sqlite"))
+    except OSError:
+        cache_files = []
+    fps: dict[str, str] = {}
+
+    def _fp(p: Path) -> str:
+        key = str(p)
+        if key not in fps:
+            fps[key] = snapshot_fingerprint(p)
+        return fps[key]
+
+    for f in cache_files:
+        stem = f.name[:-len(".sqlite")]
+        ds_id = expected.get(stem)
+        if ds_id is None:
+            _add(f, "orphan-cache")
+            continue
+        snap = ds_snapshot.get(ds_id)
+        if snap is None or not snap.exists():
+            _add(f, "orphan-cache")
+            continue
+        cached_fp = _read_cache_fingerprint(f)
+        if cached_fp is None or cached_fp != _fp(snap):
+            _add(f, "stale-cache")
+
+    subtotals: dict[str, int] = {}
+    for item in plan:
+        subtotals[item["category"]] = subtotals.get(item["category"], 0) + item["bytes"]
+    return {
+        "stateHome": str(state_home),
+        "mode": "dry-run",
+        "entries": plan,
+        "subtotals": subtotals,
+        "totalBytes": sum(item["bytes"] for item in plan),
+    }
+
+
+def _inside_scope(path: Path, scope: list[Path]) -> bool:
+    """白名单闸：路径必须直接位于本次扫描的 data/ 或 db/ 目录内。"""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return any(resolved.parent == scope_dir for scope_dir in scope)
+
+
+def _apply_prune(state_home: Path, plan: dict, data_dir: Path,
+                 db_dir: Path) -> dict:
+    """Delete EXACTLY the planned files, re-verifying the scope whitelist per path.
+
+    逐文件 try/except 不中断；白名单外（含被塞进列表的 registry.json 等）一律
+    skip 并记录原因，绝不扩大删除面。
+    """
+    scope = [data_dir.resolve(), db_dir.resolve()]
+    deleted: list[dict] = []
+    skipped: list[dict] = []
+    for item in plan["entries"]:
+        p = Path(item["path"])
+        if not _inside_scope(p, scope):
+            skipped.append({"path": item["path"],
+                            "reason": "outside data//db scope（白名单外，拒绝删除）"})
+            continue
+        try:
+            p.unlink()
+            deleted.append(item)
+        except OSError as exc:
+            skipped.append({"path": item["path"], "reason": str(exc)})
+    applied = dict(plan)
+    applied["mode"] = "applied"
+    applied["deleted"] = deleted
+    applied["deletedBytes"] = sum(i["bytes"] for i in deleted)
+    applied["skipped"] = skipped
+    return applied
+
+
+def _print_prune_plan(plan: dict, tail: dict | None = None) -> None:
+    print(f"[ai-report-prune] state home: {plan['stateHome']}  mode: {plan['mode']}")
+    if not plan["entries"]:
+        print("[ai-report-prune] 没有可回收文件（data/ 与 db/ 已收敛）。")
+    for item in plan["entries"]:
+        print(f"{item['path']} | {item['category']} | {item['bytes']}")
+    print("[ai-report-prune] 分类小计：")
+    for cat, n in sorted(plan["subtotals"].items()):
+        print(f"  {cat} | {n} bytes")
+    print(f"[ai-report-prune] 总可回收：{plan['totalBytes']} bytes "
+          f"({plan['totalBytes'] / 1048576:.2f} MB)")
+    if tail:
+        for item in tail.get("deleted") or []:
+            print(f"[ai-report-prune] 已删除 {item['path']}（{item['bytes']} bytes）")
+        for item in tail.get("skipped") or []:
+            print(f"[ai-report-prune] 跳过 {item['path']}：{item['reason']}")
+        print(f"[ai-report-prune] 实际删除 {len(tail.get('deleted') or [])} 个文件、"
+              f"{tail.get('deletedBytes', 0)} bytes。")
+
+
+def _run_prune(args, registry) -> int:
+    import json as _json
+    state_home = registry.path.parent
+    data_dir = args.data_dir.expanduser()
+    db_dir = state_home / "db"
+    plan = _build_prune_plan(state_home, registry, data_dir, db_dir)
+    tail: dict | None = None
+    if args.prune_apply:
+        pid = _server_pid_from(state_home)
+        if pid is not None and _pid_alive(pid) and not args.prune_force:
+            print(f"[ai-report-prune] 拒绝执行 --prune-apply：server.pid 记录的进程 "
+                  f"（pid {pid}）仍在运行。请先在报告管理页关闭服务，或确认服务已停后重试；"
+                  "确要边跑边删请显式加 --prune-force。", file=sys.stderr)
+            return 2
+        tail = _apply_prune(state_home, plan, data_dir, db_dir)
+    _print_prune_plan(plan, tail)
+    if args.prune_json:
+        out = tail if tail is not None else dict(plan)
+        out["serverPid"] = _server_pid_from(state_home)
+        try:
+            args.prune_json.expanduser().parent.mkdir(parents=True, exist_ok=True)
+            args.prune_json.expanduser().write_text(
+                _json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"[ai-report-prune] 结构化结果已写入 {args.prune_json}")
+        except OSError as exc:
+            print(f"[ai-report-prune] 结构化结果写盘失败：{exc}", file=sys.stderr)
+            return 2
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the AI report server")
     parser.add_argument("--host", default="0.0.0.0", help="bind host (default 0.0.0.0 for LAN sharing)")
@@ -485,6 +980,14 @@ def main() -> int:
     # 只会让人误以为加个参数就能放开跨域。
     parser.add_argument("--quiet", action="store_true", help="suppress reload warnings")
     parser.add_argument("--pid-file", type=Path, default=None, help="write process id for safe stop")
+    parser.add_argument("--prune", action="store_true",
+                        help="快照保留策略演练（dry-run）：逐文件列出 data/ 与 db/ 可回收项，不删除任何东西")
+    parser.add_argument("--prune-apply", action="store_true",
+                        help="真删 dry-run 列表中的文件；server.pid 活着时拒绝执行（先停服务，或 --prune-force 放行）")
+    parser.add_argument("--prune-json", type=Path, default=None,
+                        help="把 prune 结构化结果（entries/subtotals/total/deleted/skipped）写到 PATH")
+    parser.add_argument("--prune-force", action="store_true",
+                        help="--prune-apply 的显式放行：server.pid 对应进程仍活着时也执行")
     args = parser.parse_args()
 
     from server.store import create_engine
@@ -494,6 +997,10 @@ def main() -> int:
     # default registry/data live outside the skill package and may not exist.
     registry.path.parent.mkdir(parents=True, exist_ok=True)
     registry.data_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.prune or args.prune_apply:
+        # 保留策略（XP-01）是离线维护命令：不拉引擎、不起 HTTP，扫完即退出。
+        return _run_prune(args, registry)
 
     if args.register_report:
         # --register-report 双模（2026-09-26 温启动重注册）：活着的 LRM server

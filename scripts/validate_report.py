@@ -349,7 +349,10 @@ def max_table_rows_for_height(grid_h: int) -> int:
 
 def table_height_mode(chart: dict[str, Any]) -> tuple[str, int | None]:
     """WP-7：读 manifest 图表 editor.table.heightMode 三态（请求层形状 WP-3 冻结，
-    编译原样透传落 editor.table）。返回 (mode, bounded maxPx)；未知值收敛 grow。"""
+    编译原样透传落 editor.table）。返回 (mode, bounded maxPx)；未知值收敛 grow。
+    XU-01 行数口径：{'bounded':{'maxBodyRows': int 5..500}} 按 ROW_HEIGHT_PX×N +
+    HEADER_HEIGHT_PX 换算成 px 返回（与 layout_solver._bounded_max_px 同优先级：
+    行数优先于 maxPx；运行时真实行高随密度档由 autoFitTableCards 实测校正）。"""
     editor = chart.get("editor")
     tbl = editor.get("table") if isinstance(editor, dict) else None
     hm = tbl.get("heightMode") if isinstance(tbl, dict) else None
@@ -358,6 +361,9 @@ def table_height_mode(chart: dict[str, Any]) -> tuple[str, int | None]:
     if isinstance(hm, dict):
         b = hm.get("bounded")
         if isinstance(b, dict):
+            n = b.get("maxBodyRows")
+            if isinstance(n, int) and not isinstance(n, bool) and 5 <= n <= 500:
+                return "bounded", n * ROW_HEIGHT_PX + HEADER_HEIGHT_PX
             mx = b.get("maxPx")
             if isinstance(mx, int) and not isinstance(mx, bool) and 200 <= mx <= 4000:
                 return "bounded", mx

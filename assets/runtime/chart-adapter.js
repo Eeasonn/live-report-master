@@ -195,7 +195,13 @@
     // 「groupBy column '__measures__' not found」——表格分支自己按真实维度取数后
     // 本地展开，主管道只要求不崩）。matrix 判定同理：响应里没有第二分组列。
     if(roles.breakdown && roles.breakdown!==_grpDim && roles.breakdown!=='__measures__')payload.groupBy.push(roles.breakdown);
-    if(data.dimensionBucket&&_grpDim===dimension)payload.bucket=data.dimensionBucket;
+    // 分桶声明（NC-03 #7）：消费口径与本地聚合**同一条表达式**——本地路径读
+    // ``(roles&&roles.dimensionBucket)||dimensionBucket``（aggregate 的 bucketSpec），
+    // 这里曾只读顶层 dimensionBucket：声明写进 roles 的报告（singlefile 正常分桶）
+    // 服务端请求不带 bucket → 服务端按原始日期分组，轴域退化成逐日类目。服务端
+    // 还有一道自己的闸（dim==bucketed 才套 _bucket_expr），多发不越权。
+    var _bucketSpec=(roles&&roles.dimensionBucket)||data.dimensionBucket;
+    if(_bucketSpec&&_grpDim===dimension)payload.bucket=_bucketSpec;
     return fetch(serverBase+'/datasets/'+encodeURIComponent(datasetId)+'/aggregate',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)
@@ -304,6 +310,12 @@
     // LIMIT——否则分母只剩截断后的行集和，占比放大几十倍（真机：1.6% 显示成 430%）。
     var payload={groupBy:dims.slice(),measures:reqBases.map(function(col){return {column:col,aggregation:_pickMethod(method,col,data)};}).concat(reqAggs.map(function(dep){
       var it={column:dep.col,aggregation:dep.agg};if(dep.filters)it.filters=dep.filters;return it;})),filter:data.filter||[],orderBy:data.orderBy||[],limit:Number(data.aggregateLimit)||20000,offset:data.offset||0};
+    // 表格卡同样下发分桶声明（NC-03 #7）：fetchAggregate 一直带 bucket（图表轴按
+    // 服务端月度标签渲染），aggregateTable 曾漏发——服务端按原始日期分组返回逐日
+    // 行，表格卡在行集/合计口径上退化为 273 个原始日期（编译静态首屏是分桶后的
+    // 少量月度行，首次重聚合即漂）。服务端按 dim0==bucketed 自闸，多发不越权。
+    var _tblBucket=(data.roles&&data.roles.dimensionBucket)||data.dimensionBucket;
+    if(_tblBucket&&dims.length&&dims[0]!=='__measures__')payload.bucket=_tblBucket;
     var serverBase=normalizeServerBase();
     // 闸门必须与 aggregate() 同款：singlefile 数据带 datasetId（编译恒写）而
     // normalizeServerBase() 恒返回 '/api/v1'——旧闸 `!datasetId||!serverBase`
@@ -968,7 +980,26 @@
     measures.forEach(function(measure,index){
       // Derived measures are already computed (and %/count formatted); do not
       // re-round them through the base-measure scale (which coerces null→0).
-      if((data.derivedMeasures&&data.derivedMeasures[measure])||(data.derived&&data.derived[measure]&&data.derived[measure].base))return;
+      if((data.derivedMeasures&&data.derivedMeasures[measure])||(data.derived&&data.derived[measure]&&data.derived[measure].base)){
+        // D1（2026-10-23 拍板，fixture correctness-parity-v1.json
+        // formula_percent_display）：公式节点存**运算原值**（比率 0.2207），声明
+        // 显示格式 percent（measureType.format='percent'——format 键 = 「此列是
+        // 比率」；type:'percent' 是「作者已在 expr 里 ×100」的旧形状，直显零漂移）
+        // → 显示层 ×100（0.2207 → 22.07%），轴模板 {value}% / tooltip 消费缩放后
+        // 的序列。share/window.rate 已存百分数（derivedPercentUnits）豁免不变。
+        // 表格侧（editor-runtime fmtVal/aggExportCell）消费同一判据
+        // derivedFractionPercent——两端不许第二份形状判定。
+        if(derivedFractionPercent(data,measure)){
+          var _pfmt=measureFormat(data,measure,fallbackDecimals);
+          var _pdec=_pfmt&&_pfmt.decimals!=null?_pfmt.decimals:2;
+          entries.forEach(function(entry){
+            var _raw=entry.values[index];
+            if(_raw==null||_raw===''||!isFinite(Number(_raw)))return;   // 空档保持 null（不造 0）
+            entry.values[index]=roundNumber(Number(_raw)*100,_pdec);
+          });
+        }
+        return;
+      }
       var format=measureFormat(data,measure,fallbackDecimals);
       if(!format)return;
       // percent 表示缩放（2026-10-13 批 A3，与表格 fmtVal 同一判据
@@ -1422,6 +1453,48 @@
     if(n)return n.kind==='share'||(n.kind==='window'&&n.output==='rate');
     var legacy=data&&data.derived?data.derived[measure]:null;
     return !!(legacy&&legacy.kind==='share');
+  }
+  // D1（2026-10-23 拍板，NC-01 移交对齐）公式派生指标的「比率存值」判据——显示层
+  // ×100 的唯一形状闸（图表 applyMeasureScale 与表格 fmtVal/aggExportCell 共用，
+  // 不许第二份）。**逐位镜像** spec_to_report._formula_percent_scale /
+  // _formula_percent_units_ref / _mt_is_percent（运行时重聚合显示 == 静态首屏显示
+  // 的不变式要求两侧判定不可漂）：
+  //   · kind='formula'（存运算原值）+ 显式 percent 显示（节点 measureType 的
+  //     type **或** format 键；图表级 measureTypes 覆盖 dict/string 'percent' 兜底）；
+  //   · 公式 ref 闭包（含公式套公式的传递引用）含 share / window(rate) → false：
+  //     那些操作数求值时已 ×100，公式值已在百分数域，再乘 = 二次缩放；
+  //   · share / window(rate) 节点本身走 derivedPercentUnits 豁免（不受本函数管）。
+  // 注意两侧的 derivedPercentUnits 语义刻意不同：PY _derived_percent_units 对
+  // formula-percent 也 true（PY 在行产物层已 ×100），JS 版保持 share/window-only
+  //（JS 运行时聚合存原值、×100 落在显示层）——缩放落点不同， twin 不许互相照抄。
+  function mtIsPercent(mt){
+    if(mt&&typeof mt==='object')return mt.format==='percent'||mt.type==='percent';
+    return mt==='percent';
+  }
+  function formulaPercentUnitsRef(node,nmap){
+    if(!node||typeof node!=='object')return false;
+    var stack=[node.expr||null],visited={};
+    while(stack.length){
+      var cur=stack.pop();
+      if(!cur||typeof cur!=='object')continue;
+      if(cur.op!==undefined){stack.push(cur.left);stack.push(cur.right);continue;}
+      if(cur.ref!==undefined&&cur.ref!==null){
+        var target=nmap?nmap[cur.ref]:null;
+        if(target){
+          if(target.kind==='share'||(target.kind==='window'&&target.output==='rate'))return true;
+          if(!visited[cur.ref]){visited[cur.ref]=1;stack.push(target.expr||null);}
+        }
+      }
+    }
+    return false;
+  }
+  function derivedFractionPercent(data,measure){
+    var n=data&&data.derivedMeasures?data.derivedMeasures[measure]:null;
+    if(!n||n.kind!=='formula')return false;
+    if(formulaPercentUnitsRef(n,data.derivedMeasures))return false;
+    var mt=n.measureType;
+    var nodePct=!!(mt&&typeof mt==='object'&&(mt.type==='percent'||mt.format==='percent'));
+    return nodePct||mtIsPercent(data&&data.measureTypes?data.measureTypes[measure]:null);
   }
   // ---- percent 表示检测（2026-10-13 批 A2，Flint §3.4 representation detection）----
   // 同一个「percent 语义列」有两种存值表示：比率（0–1，显示需 ×100）与百分数
@@ -3040,6 +3113,40 @@
     var x=axisObject(option.xAxis);
     if(x&&Array.isArray(x.data)&&x.data.length>8&&vt!=='stackedBar')option.labelLayout={hideOverlap:true};
     if(data){applyGoalCompletion(option,data);}
+    // 占比堆叠轴口径（NC-03 #3，fixture stackmode_normalize_axis）：stackMode=
+    // 'normalize' 已把每柱各段归一到 0–100（normalizeStackData，编译侧同款），值轴
+    // 必须跟着切**百分比口径**——否则轴名/刻度仍按原指标（currency 万/千万）的量级
+    // 压缩读 0–100，刻度显示「¥100千万」（GLM 实锤；作者把 measureTypes 覆盖成
+    // percent 也救不回——applyMeasureScale 的自动档位按归一**前**的巨值选档）。
+    // 钉 0–100 + {value}% 刻度 + 轴名剥量级后缀 + tooltip 段值直显 %；作者显式
+    // min/max（axisConfig，BI-H4）仍优先。跑在补丁链最后：覆盖 applyMeasureFormats
+    // 的轴 formatter/名称与 applyGoalCompletion 的 tooltip（占比口径下完成率换算
+    // 失义，一并接管）。
+    if(vt==='stackedBar'&&data&&data.stackMode==='normalize'&&option.yAxis){
+      var _nmCfg=(ed&&ed.axisConfig&&ed.axisConfig[0])||null;
+      var _nmManual=_nmCfg&&((_nmCfg.min!=null&&_nmCfg.min!=='')||(_nmCfg.max!=null&&_nmCfg.max!==''));
+      var _nm0=(data.measures||[])[0];
+      var _nmFmt=_nm0?measureFormat(data,_nm0):null;
+      var _nmUnit=(_nmFmt&&_nmFmt.suffix)?('（'+_nmFmt.suffix+'）'):'';
+      (Array.isArray(option.yAxis)?option.yAxis:[option.yAxis]).forEach(function(axis){
+        if(!axis||axis.type!=='value')return;
+        if(!_nmManual){axis.min=0;axis.max=100;}
+        axis.scale=false;   // 百分比口径恒含 0（零基线）
+        axis.axisLabel=Object.assign({},axis.axisLabel||{},{formatter:'{value}%'});
+        if(_nmUnit&&typeof axis.name==='string'&&axis.name.indexOf(_nmUnit)>=0)axis.name=axis.name.split(_nmUnit).join('');
+      });
+      if(option.series&&option.series.length){
+        option.tooltip=Object.assign({},option.tooltip||{},{trigger:'axis',formatter:function(params){
+          var list=Array.isArray(params)?params:[params];
+          var out=[list[0]&&(list[0].name!=null?list[0].name:'')];
+          list.forEach(function(p){
+            var v=(p&&p.value!=null)?Number(p.value):NaN;
+            out.push((p&&p.seriesName?p.seriesName:'')+': '+(!isFinite(v)?'—':(Math.round(v*10)/10)+'%'));
+          });
+          return out.join('<br/>');
+        }});
+      }
+    }
     return option;
   }
   // 目标完成率: append actual/target = n% to the tooltip for measures that have
@@ -3841,5 +3948,5 @@
     out.sort(function(a,b){return b.score-a.score;});
     return out;
   }
-  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,applyBreakdownTopN:applyBreakdownTopN,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,nonAdditiveMeasureOf:nonAdditiveMeasureOf,flintAxisDomain:flintAxisDomain,semanticNameType:semanticNameType,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintResolvedEncoding:flintResolvedEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
+  global.AIReportChartAdapter={clone:clone,chartCatalog:chartCatalog,measureTypeKeys:MEASURE_TYPE_KEYS,derivedPercentUnits:derivedPercentUnits,derivedFractionPercent:derivedFractionPercent,percentRepresentation:percentRepresentation,percentRepOf:percentRepOf,flintDivergingDecision:flintDivergingDecision,setColumnAliases:setColumnAliases,aliasOf:aliasOf,setValueAliases:setValueAliases,valueAliasOf:valueAliasOf,applyValueAliases:applyValueAliases,measureTypeFormats:MEASURE_TYPE_FORMATS,currencySymbols:CURRENCY_SYMBOLS,currencyPrefixOf:currencyPrefixOf,currencySymbolOf:currencySymbolOf,currencySymbolFor:currencySymbolFor,measureFormat:measureFormat,resolveMeasureType:resolveMeasureType,normalizeMeasureType:normalizeMeasureType,fieldSemantic:fieldSemantic,channelAction:channelAction,applyMeasureScale:applyMeasureScale,applyMeasureFormats:applyMeasureFormats,chartDecimals:chartDecimals,isMatrix:isMatrix,matrixAgg:matrixAgg,roundNumber:roundNumber,capEntries:capEntries,applyBreakdownTopN:applyBreakdownTopN,dimensionKind:dimensionKind,bucketRange:bucketRange,timeDrillChild:timeDrillChild,valueGrain:valueGrain,TIME_DRILL_CHAIN:TIME_DRILL_CHAIN,nonAdditiveMeasure:nonAdditiveMeasure,nonAdditiveMeasureOf:nonAdditiveMeasureOf,flintAxisDomain:flintAxisDomain,semanticNameType:semanticNameType,anyNonAdditive:anyNonAdditive,colNonAdditiveForMerge:colNonAdditiveForMerge,applyReferences:applyReferences,applyDerivedMeasures:applyDerivedMeasures,derivedEvaluate:derivedEvaluate,derivedClosureNodes:derivedClosureNodes,derivedTimeKey:derivedTimeKey,derivedAggKey:derivedAggKey,derivedDepKey:derivedDepKey,derivedFmKey:derivedFmKey,derivedRequiredAggregations:derivedRequiredAggregations,applyCondFormat:applyCondFormat,condSlotColor:condSlotColor,condFormatPlanOf:condFormatPlanOf,patchSemantics:patchSemantics,inferEditorData:inferEditorData,numericColumns:numericColumns,dimensionColumns:dimensionColumns,rawDateSource:rawDateSource,availableTypes:availableTypes,shapeRules:shapeRules,aggregate:aggregate,optionFor:optionFor,patchFlags:patchFlags,filteredRows:filteredRows,fetchDetailRows:fetchDetailRows,fetchGlobalAggregates:fetchGlobalAggregates,dateParts:dateParts,fetchColumnValues:fetchColumnValues,fetchFilteredValues:fetchFilteredValues,fetchSampleValues:fetchSampleValues,aggregateTable:aggregateTable,setChartTheme:setChartTheme,themeCatalog:themeCatalog,chartThemeInk:chartThemeInk,defaultPalette:defaultPalette,chartThemeSlice:chartThemeSlice,applyChartTheme:applyChartTheme,flintGetType:flintGetType,flintCanonicalAlias:flintCanonicalAlias,flintInferVisCategory:flintInferVisCategory,flintEncoding:flintEncoding,flintResolvedEncoding:flintResolvedEncoding,flintZeroBaseline:flintZeroBaseline,flintZeroPad:flintZeroPad,flintAdditive:flintAdditive,flintFieldSemantics:flintFieldSemantics,recommendChartTypes:recommendChartTypes,flintZeroDecision:flintZeroDecision,flintPaddedDomain:flintPaddedDomain,hierarchyEdges:hierarchyEdges,hierarchyIndex:hierarchyIndex,hierarchyChildren:hierarchyChildren,hierarchyParent:hierarchyParent,hierarchyRoots:hierarchyRoots,hierarchyLevel:hierarchyLevel,hierarchyPath:hierarchyPath,hierarchyChain:hierarchyChain,hierarchyAsTree:hierarchyAsTree,validateHierarchy:validateHierarchy};
 })(window);

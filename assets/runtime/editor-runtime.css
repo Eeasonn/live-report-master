@@ -501,6 +501,11 @@ body.ai-report-editing #ai-report-runtime-panel[data-open="true"]{display:block}
 #ai-report-copilot .ai-cp-plan-impact-siblings small{color:var(--ink3);text-align:right}
 #ai-report-copilot .ai-cp-plan-impact-empty{color:var(--ink3);font-style:italic}
 #ai-report-copilot .ai-cp-plan-impact-error{margin-top:5px;padding:5px 6px;border-radius:5px;background:var(--semantic-error-bg,#fff3f1);color:var(--semantic-error-deep,#b42318);overflow-wrap:anywhere}
+/* XA-03：元数据 proposal（派生指标/别名确认）在计划预览里的专用呈现卡。 */
+#ai-report-copilot .ai-cp-plan-meta{margin:5px 0 0;padding:5px 7px;border:1px solid var(--line-soft);border-radius:6px;background:var(--surface,#fff);font-size:9px;display:flex;flex-wrap:wrap;gap:3px 9px;align-items:baseline;overflow-wrap:anywhere}
+#ai-report-copilot .ai-cp-plan-meta-fx{font-weight:700;color:var(--accent-deep,var(--accent))}
+#ai-report-copilot .ai-cp-plan-meta-alias{color:var(--accent-deep,var(--accent));font-weight:700}
+#ai-report-copilot .ai-cp-plan-meta small{width:100%;color:var(--ink3)}
 #ai-report-copilot .ai-cp-breadcrumb{padding:6px 10px 2px;color:var(--ink3,#787671);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #ai-report-copilot .ai-cp-proposal-diff{margin:8px 0;padding:7px 8px;border:1px dashed var(--line-strong,#c8c4be);border-radius:7px;background:var(--surface-soft,#fafaf9);font-size:10px}
 #ai-report-copilot .ai-cp-proposal-diff summary{cursor:pointer;color:var(--ink2);font-weight:700}
@@ -980,6 +985,10 @@ label>input[type=checkbox],label>input[type=radio]{margin:0}
 .ai-report-measure-list{display:grid;grid-template-columns:1fr 1fr;column-gap:12px;max-height:140px;overflow:auto}
 .ai-report-dimension-list{display:grid;grid-template-columns:1fr 1fr;column-gap:12px;max-height:140px;overflow:auto}
 .ai-report-hint{margin:7px 0 0;color:#787671;font-size:11px}
+/* NU-02 卡片面板底部「AI 改图」入口：按钮复用 .ai-report-secondary（Notion 黑白
+   按钮体系，不引新色），这里只补面板底部按钮行的占位与撑满。 */
+.ai-report-panel-airow{margin-top:12px}
+.ai-report-panel-ai-edit{width:100%;justify-content:center}
 .ai-report-hint-inline{font-weight:400;color:#787671;font-size:11px;margin-left:4px}
 .ai-report-primary{width:100%;margin-top:14px;border:1px solid var(--ink,#1a1a1a);background:var(--ink,#1a1a1a);color:#fff;border-radius:8px;padding:10px 18px;cursor:pointer}
 /* Generic secondary button (base). Contextual wrappers (help-footer / download-row /
@@ -1928,6 +1937,11 @@ body.ai-report-presenting #ai-report-present:hover{background:#2a2a2a;border-col
 .ai-pres-page-title.ai-pres-title-edit{pointer-events:auto;cursor:text;outline:1px dashed color-mix(in srgb,var(--accent) 45%,transparent);outline-offset:-4px;border-radius:8px;padding-right:14px}
 .ai-pres-page-title.ai-pres-title-edit:hover{background:linear-gradient(90deg,color-mix(in srgb,var(--accent) 12%,transparent),color-mix(in srgb,var(--accent) 5%,transparent))}
 .ai-pres-page-title.ai-pres-title-edit:focus{outline:2px solid var(--focus-ring);background:#fff}
+/* O8 页级隐藏标题（XU-02）：编辑布局态帧右上角的「隐藏标题」勾选徽章（D1 标题
+   编辑器入口旁，与左上角页码 chip 对侧同款药丸形）。noTitle 页勾选态反色提示。 */
+.ai-pres-notitle-toggle{position:absolute;right:10px;top:-12px;display:inline-flex;align-items:center;gap:5px;font:600 11px/1 var(--font-ui,Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);color:var(--accent);background:#fff;padding:3px 9px;border-radius:999px;border:1px solid var(--accent);letter-spacing:.02em;box-shadow:0 2px 4px color-mix(in srgb,var(--accent) 12%,transparent);cursor:pointer;user-select:none}
+.ai-pres-notitle-toggle input{accent-color:var(--accent);width:12px;height:12px;margin:0}
+.ai-pres-notitle-toggle:has(input:checked){background:#1a1a1a;border-color:#1a1a1a;color:#fff}
 /* 顶部说明：汇报分页与单页正文是两份独立布局（用户决策）。 */
 .ai-pres-note{display:inline-flex;align-items:center;gap:6px;font:500 12px/1.2 var(--font-ui,Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif);color:var(--ink3,#787671);background:var(--surface-soft,#fafaf9);border:1px solid var(--line,#e5e3df);border-radius:999px;padding:0 10px;height:var(--ctl-h);box-sizing:border-box;white-space:nowrap}
 .ai-pres-note-i{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border-radius:50%;background:#ede9e4;color:#5d5b54;font-size:10px;font-weight:700;font-style:normal;line-height:1}

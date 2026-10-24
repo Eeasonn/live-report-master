@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from typing import Any, Mapping
 
@@ -214,11 +215,281 @@ def _apply_alias_confirmation(manifest: dict[str, Any], proposal: Mapping[str, A
         values.append(alias)
     mapping[canonical] = sorted(set(values), key=str.casefold)
     dataset["aliases"] = {key: mapping[key] for key in sorted(mapping, key=str)}
+    # XA-02（roadmap NA-06）：alias 提案 **apply 成功** 的唯一写口 → 跨报告学习目录
+    # （本机 SQLite，tenant-scoped 只读建议）。隐私硬闸（NS-01）：canonical/alias 任一
+    # 命中 privacy.sensitiveColumns 绝不学入。record_confirmation 自身 fail-closed
+    # （库损坏/开关关闭都是 no-op），这里的外层兜底保证学习侧任何意外都不影响事务。
+    try:
+        from .alias_learning import default_state_home, record_confirmation, tenant_id
+        privacy = dataset.get("privacy") or {}
+        sensitive = {str(item) for item in ((privacy.get("sensitiveColumns") or [])
+                                            if isinstance(privacy, Mapping) else [])
+                     if isinstance(item, str)}
+        if canonical not in sensitive and alias not in sensitive:
+            raw_columns = dataset.get("columns")
+            columns = [str(item.get("name") if isinstance(item, Mapping) else item)
+                       for item in (raw_columns if isinstance(raw_columns, list) else [])]
+            record_confirmation(default_state_home(), tenant_id(), columns,
+                                canonical, alias, str(manifest.get("reportId") or ""))
+    except Exception:  # noqa: BLE001 — 学习是观测性增强，绝不拖垮 ProposalTransaction
+        logging.getLogger(__name__).warning("alias learning record skipped", exc_info=True)
+
+
+# ============================================================================
+# NA-04: aggregate-level derived measure proposals (派生指标)
+# ============================================================================
+# ``scripts/derived_model`` is the ONLY shape/semantics validator (normalize +
+# validate + topo).  This seam adds the proposal-transaction wrapper around it:
+# dataset identity, duplicate detection against the existing declaration,
+# sensitive-column fail-closed closure, a stable proposalId and a bounded
+# before/after diff.  It never evaluates the measure — evaluation stays on the
+# existing derived_eval path.
+
+
+def _derived_model():
+    """Import the single derived-measure model module (scripts/)."""
+    import sys
+    from pathlib import Path
+    scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import derived_model
+    return derived_model
+
+
+def _known_columns(dataset: Mapping[str, Any]) -> set[str]:
+    """Raw columns + row-level derived columns (the evaluator's column universe)."""
+    known: set[str] = set()
+    for column in dataset.get("columns") or []:
+        name = column.get("name") if isinstance(column, Mapping) else column
+        if isinstance(name, str):
+            known.add(name)
+    derived = dataset.get("derived") or {}
+    if isinstance(derived, Mapping):
+        for item in derived.get("columns") or []:
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str):
+                known.add(item["name"])
+    return known
+
+
+def _declared_time_columns(dataset: Mapping[str, Any]) -> set[str]:
+    """Columns with a declared time role/type (same sources the runner reads)."""
+    times: set[str] = set()
+    roles = dataset.get("columnRoles")
+    if isinstance(roles, Mapping):
+        times.update(str(name) for name, role in roles.items()
+                     if str(role).lower() in {"time", "temporal", "date", "datetime"})
+    for column in dataset.get("columns") or []:
+        if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
+            continue
+        kind = str(column.get("type") or column.get("role") or "").lower()
+        if kind in {"time", "temporal", "date", "datetime"}:
+            times.add(column["name"])
+    return times
+
+
+def _derived_sensitive_names(dataset: Mapping[str, Any]) -> set[str]:
+    privacy = dataset.get("privacy") or {}
+    raw = privacy.get("sensitiveColumns") if isinstance(privacy, Mapping) else None
+    return {item for item in (raw if isinstance(raw, list) else []) if isinstance(item, str)}
+
+
+def validate_derived_measure(entry: Mapping[str, Any], proposal: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one ``derived.measures`` node as a metadata-only proposal.
+
+    Reuses ``derived_model.normalize_measures``/``validate_measures``/``topo_order``
+    verbatim (single source, zero second validator), then adds the
+    proposal-transaction facts: duplicate name/id detection against the existing
+    declaration, a transitive sensitive-column fail-closed closure, a stable
+    ``proposalId`` and a bounded diff.  The returned ``addedMeasure`` is the
+    normalized node — apply persists exactly what was validated.
+    """
+    if not isinstance(proposal, Mapping) or proposal.get("kind") != "derived_measure":
+        raise ToolContractError("derived measure proposal kind is invalid")
+    dataset_id = str(proposal.get("datasetId") or "")
+    dataset = _dataset(entry, dataset_id)
+    raw_measure = proposal.get("measure")
+    if not isinstance(raw_measure, Mapping):
+        raise ToolContractError("derived measure proposal requires a measure object")
+    model = _derived_model()
+    derived_raw = dataset.get("derived")
+    existing: list[Mapping[str, Any]] = []
+    if isinstance(derived_raw, Mapping):
+        existing = [item for item in (derived_raw.get("measures") or []) if isinstance(item, Mapping)]
+    elif isinstance(derived_raw, list):
+        # Legacy flat canvas shape is measures-only (AGENTS: 旧扁平数组 → {columns,measures}).
+        existing = [item for item in derived_raw if isinstance(item, Mapping)]
+    existing_names = [str(item.get("name")) for item in existing if isinstance(item.get("name"), str)]
+    existing_ids = {str(item.get("id")) for item in existing if isinstance(item.get("id"), str)}
+    raw_name = raw_measure.get("name")
+    if isinstance(raw_name, str) and raw_name in existing_names:
+        raise ToolContractError(f"派生指标与既有指标重名：{raw_name!r}")
+    raw_id = raw_measure.get("id")
+    if isinstance(raw_id, str) and raw_id in existing_ids:
+        raise ToolContractError(f"派生指标 id 与既有指标重复：{raw_id!r}")
+    if len(existing) >= model.MAX_MEASURES:
+        raise ToolContractError(
+            f"derived.measures 已达上限 {model.MAX_MEASURES} 项，不能再新增派生指标")
+    try:
+        node = model.normalize_measures([dict(raw_measure)])[0]
+    except model.DerivedError as exc:
+        raise ToolContractError(str(exc)) from None
+    combined = [*existing, node]
+    known_columns = _known_columns(dataset)
+    time_columns = _declared_time_columns(dataset)
+    try:
+        model.validate_measures(combined, known_columns, time_columns,
+                                where=f"datasets[{dataset_id}].derived.measures")
+    except (model.DerivedError, KeyError, TypeError) as exc:
+        raise ToolContractError(str(exc)) from None
+    # Sensitive policy follows safe_derived_measures: the whole transitive
+    # dependency closure of the new node must avoid privacy.sensitiveColumns.
+    sensitive = _derived_sensitive_names(dataset)
+    if sensitive:
+        by_name = {str(item.get("name")): item for item in combined if isinstance(item.get("name"), str)}
+        stack, seen, touched = [str(node["name"])], set(), set()
+        while stack:
+            name = stack.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            current = by_name.get(name)
+            if current is None:
+                # A raw column referenced by a window input.ref — the evaluator
+                # aggregates it, so it counts as a touched column too.
+                touched.add(name)
+                continue
+            touched.update(model.node_columns(current))
+            for key in ("timeField", "parentField"):
+                value = current.get(key)
+                if isinstance(value, str) and value:
+                    touched.add(value)
+            stack.extend(model.node_refs(current))
+        blocked = sorted(touched & sensitive)
+        if blocked:
+            raise ToolContractError(
+                f"派生指标依赖了敏感字段「{blocked[0]}」，被敏感字段策略禁止")
+    after_names = existing_names + [str(node["name"])]
+    try:
+        summary = model.node_summary(node)
+    except Exception:  # node_summary is display-only; never fail the contract on it
+        summary = str(node.get("kind"))
+    before = {"datasetId": dataset_id, "measureNames": existing_names}
+    after = {"datasetId": dataset_id, "measureNames": after_names, "addedMeasure": node}
+    diff = {"derived.measures": {"before": existing_names, "after": after_names},
+            "addedMeasure": dict(node, summary=summary)}
+    # Impact is advisory and bounded: the new node only extends the dataset
+    # declaration, so no existing card changes until an editor binds it.
+    manifest = entry.get("manifest") or {}
+    charts_on_dataset = [item for item in manifest.get("charts") or []
+                         if isinstance(item, Mapping) and isinstance(_chart_data(item).get("datasetId"), str)
+                         and _chart_data(item).get("datasetId") == dataset_id]
+    impact = {"datasetId": dataset_id, "measureId": node.get("id"),
+              "measureName": node["name"], "kind": node["kind"],
+              "additive": bool(node.get("additive")),
+              "measureType": node.get("measureType"),
+              "declaredMeasureCount": {"before": len(existing), "after": len(existing) + 1},
+              "chartsOnDataset": len(charts_on_dataset),
+              "chartIds": [item.get("id") for item in charts_on_dataset[:8]]}
+    canonical_payload = {"kind": "derived_measure", "datasetId": dataset_id,
+                         "measure": node}
+    proposal_id = hashlib.sha256(json.dumps(canonical_payload, ensure_ascii=False,
+                                             sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"valid": True, "kind": "derived_measure", "proposalId": proposal_id,
+            "requiresApproval": True, "before": before, "after": after, "diff": diff,
+            "impact": impact,
+            "warnings": ["新指标只登记进数据集声明；既有卡片不变，把该指标加入卡片值区后可见。"]}
+
+
+def _apply_derived_measure(manifest: dict[str, Any], proposal: Mapping[str, Any]) -> None:
+    """Append a validated derived-measure node to the dataset declaration."""
+    dataset_id = str(proposal.get("datasetId") or "")
+    node = proposal.get("measure")
+    if not isinstance(node, Mapping) or not isinstance(node.get("name"), str) or not node.get("name"):
+        raise ToolContractError("derived measure proposal requires a normalized measure node")
+    dataset = next((item for item in manifest.get("datasets") or []
+                    if isinstance(item, dict) and item.get("id") == dataset_id), None)
+    if dataset is None:
+        raise ToolContractError(f"dataset {dataset_id!r} is not available")
+    derived = dataset.get("derived")
+    if isinstance(derived, Mapping):
+        slot = dict(derived)
+        measures = [dict(item) for item in (derived.get("measures") or []) if isinstance(item, Mapping)]
+    elif isinstance(derived, list):
+        # Promote the legacy flat canvas shape to the canonical object shape.
+        slot = {"columns": []}
+        measures = [dict(item) for item in derived if isinstance(item, Mapping)]
+    else:
+        slot = {}
+        measures = []
+    if any(str(item.get("name")) == str(node["name"]) for item in measures):
+        raise ToolContractError(f"派生指标与既有指标重名：{node['name']!r}")
+    measures.append(json.loads(json.dumps(node, ensure_ascii=False)))
+    slot.setdefault("columns", [])
+    slot["measures"] = measures
+    dataset["derived"] = slot
+
+
+def validate_derived_transaction_scope(entry: Mapping[str, Any],
+                                       proposals: list[Mapping[str, Any]],
+                                       *, engine: Any = None) -> dict[str, Any]:
+    """Bounded metadata-only scope for derived-measure proposals.
+
+    Mirrors the alias-confirmation transaction: it proves every referenced
+    dataset is declared and loaded, and forbids mixing families, but performs
+    no data mutation — the node only extends ``dataset.derived.measures``.
+    """
+    if not isinstance(proposals, list) or not proposals or len(proposals) > 8:
+        raise ToolContractError("transaction proposals must contain 1-8 items")
+    manifest = entry.get("manifest") or {}
+    datasets = {str(item.get("id")): item for item in manifest.get("datasets") or []
+                if isinstance(item, Mapping) and item.get("id")}
+    dataset_ids: set[str] = set()
+    seen_measures: set[tuple[str, str]] = set()
+    affected: list[dict[str, Any]] = []
+    for proposal in proposals:
+        if not isinstance(proposal, Mapping) or proposal.get("kind") != "derived_measure":
+            raise ToolContractError("derived transaction cannot mix other proposal kinds")
+        dataset_id = str(proposal.get("datasetId") or "")
+        if dataset_id not in datasets:
+            raise ToolContractError(f"transaction dataset {dataset_id!r} is not declared")
+        measure = proposal.get("measure") if isinstance(proposal.get("measure"), Mapping) else {}
+        name = str(measure.get("name") or "")
+        key = (dataset_id, name)
+        if key in seen_measures:
+            raise ToolContractError(f"duplicate derived measure proposal: {name}")
+        seen_measures.add(key)
+        dataset_ids.add(dataset_id)
+        affected.append({"datasetId": dataset_id, "measureName": name,
+                         "measureId": measure.get("id"),
+                         "changedFields": ["derived.measures"]})
+    sources = []
+    for dataset_id in sorted(dataset_ids):
+        dataset = datasets[dataset_id]
+        if engine is not None and engine.table_info(dataset_id) is None:
+            raise ToolContractError(f"transaction dataset {dataset_id!r} is not loaded")
+        sources.append({"datasetId": dataset_id,
+                        "label": dataset.get("label") or dataset_id,
+                        "rowCount": dataset.get("rowCount"),
+                        "dataAsOf": dataset.get("dataAsOf"),
+                        "dataRevision": dataset.get("dataRevision")})
+    return {"datasetIds": sorted(dataset_ids),
+            "crossDataset": len(dataset_ids) > 1,
+            "sourceCount": len(dataset_ids),
+            "sources": sources,
+            "affectedCharts": affected[:8],
+            "affectedChartCount": len(affected),
+            "engine": getattr(engine, "engine_name", None) if engine is not None else None,
+            "engineRevision": getattr(engine, "revision", None) if engine is not None else None,
+            "metadataOnly": True,
+            "validated": True}
 
 
 def validate_proposal(entry: Mapping[str, Any], proposal: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(proposal, Mapping):
         raise ToolContractError("proposal must be an object")
+    if proposal.get("kind") == "derived_measure":
+        return validate_derived_measure(entry, proposal)
     if proposal.get("kind") == "alias_confirmation":
         return validate_alias_confirmation(entry, proposal)
     chart_id = proposal.get("chartId")
@@ -328,6 +599,9 @@ def apply_proposals(manifest: Mapping[str, Any], proposals: list[Mapping[str, An
     out = json.loads(json.dumps(manifest, ensure_ascii=False))
     seen: set[str] = set()
     for proposal in proposals:
+        if proposal.get("kind") == "derived_measure":
+            _apply_derived_measure(out, proposal)
+            continue
         if proposal.get("kind") == "alias_confirmation":
             _apply_alias_confirmation(out, proposal)
             continue

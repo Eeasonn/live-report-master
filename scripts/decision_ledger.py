@@ -58,6 +58,9 @@ def _chart_line(c: dict[str, Any], spec_chart: dict[str, Any] | None) -> str:
             parts.append("table:" + ",".join(sorted(tbl.keys())))
         if isinstance(spec_chart.get("layout"), dict):
             parts.append("手工布局")
+    if c.get("question"):
+        # 分析主张/问题（NA-02）：作者声明落账，读者/复核者可见这张图「想回答什么」。
+        parts.append(f"主张：{str(c['question'])[:80]}")
     if c.get("sortOverride"):
         parts.append("自定义排序")
     return "，".join(parts) + ")"
@@ -156,6 +159,42 @@ def build_ledger(spec: dict[str, Any], manifest: dict[str, Any], *, mode: str,
             _exp_s = f"{_exp:,.10g}" if isinstance(_exp, (int, float)) else str(_exp)
             add(f"- ✅ {_a.get('label')}：{_a.get('measure')} {_a.get('aggregation') or 'sum'}"
                 f" 实算 **{_got_s}**（声明 {_exp_s}）")
+    # ---- 隐私提示（XS-02，2026-10-24）：作者自由文本命中敏感列取值的有界 warn 落账 ----
+    # 隐私闸覆盖数据面（剥离/引用闸/服务端投影），作者手写文字属作者责任面：这里只
+    # 记「哪个槽位命中了哪一列的几个值」，绝不回显值本身。
+    _pwarns = (manifest.get("quality") or {}).get("privacyAuthorWarnings") or []
+    if _pwarns:
+        add("")
+        add("## 隐私提示（作者自由输入，请自查）")
+        add("")
+        add("以下作者文本在构建期被发现包含敏感列（privacy.sensitiveColumns）的取值。"
+            "隐私闸只剥离数据，不改写作者文字——发布前请确认这些段落是否应当出现：")
+        add("")
+        for _w in _pwarns[:_LIST_CAP]:
+            if isinstance(_w, dict):
+                add(f"- ⚠️ `{_w.get('slot')}` 含敏感列「{_w.get('column')}」（dataset {_w.get('dataset')}）"
+                    f"的 {_w.get('hits')} 个取值")
+        if len(_pwarns) > _LIST_CAP:
+            add(f"- …等共 {len(_pwarns)} 条")
+    # ---- 数据事实（NA-01）：构建期 profile.facts 确定性抽取的六类事实落账 ----
+    # 与对账锚点同一通道（manifest.quality.*）：手册承诺的「脚本算出的事实可核对」
+    # ——模型写洞察时引用的 `fact:<类>:<序号>` id 在这里能逐条对回原始数据。
+    _facts = (manifest.get("quality") or {}).get("facts") or []
+    if _facts:
+        add("")
+        add("## 数据事实（脚本计算）")
+        add("")
+        add("以下事实由 profile_table 在构建期从源数据确定性抽取（非模型生成；"
+            "洞察/标题引用的 `fact:<类>:<序号>` id 即这里的条目，可在源数据逐条复核）：")
+        add("")
+        for _f in _facts[:_LIST_CAP]:
+            if isinstance(_f, dict):
+                add(f"- `{_f.get('id')}` {_f.get('statement')}")
+        if len(_facts) > _LIST_CAP:
+            add(f"- …等共 {len(_facts)} 条")
+        _skipped = (manifest.get("quality") or {}).get("factsSkipped") or {}
+        for _k, _reason in _skipped.items():
+            add(f"-（{_k} 未判定：{_reason}）")
     add("")
 
     # ---- 数据集级声明 vs 推断 ----

@@ -48,6 +48,48 @@ ALLOWED_BORDERS = {"none", "hairline", "soft"}
 ALLOWED_TEXT_STYLES = {"text", "annotation", "transparent", "white", "callout", "callout-transparent", "banner"}
 CARD_COLORS = ("default", "none", "white", "soft", "accent", "green", "amber", "red", "dark")
 SAFE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,79}$")
+
+# ---- fact 引用单一真源（NA-02，docs/product-optimization-roadmap-2026-10-23.md）----
+# free 档 {{fact:id}} 占位与 standard 档 insights[].facts 证据绑定**共用**这里的解析
+# 与存在性校验：spec_to_report 的替换循环、validate_request 的防幻觉闸都从这三个
+# 函数取，不许任何一侧再手写第二份 fact-id 正则。
+# 两个 id 命名空间刻意可区分：请求级声明 facts 用 SAFE_ID_RE（无冒号）；
+# 构建期 profile.facts 的 id 形如 `fact:<类>:<序号>`（含冒号）。
+FACT_REF_RE = re.compile(r"\{\{fact:([^{}\s]+)\}\}")
+
+
+def fact_refs_in(text: Any) -> list[str]:
+    """一段文本里经 {{fact:id}} 占位引用的全部 fact id（按出现序去重）。"""
+    if not isinstance(text, str):
+        return []
+    return list(dict.fromkeys(FACT_REF_RE.findall(text)))
+
+
+def fact_binding_ids(insight: Any) -> list[str]:
+    """standard 档 insights[].facts 证据绑定槽引用的 fact id（形状未检时的宽容读取）。"""
+    if isinstance(insight, dict) and isinstance(insight.get("facts"), list):
+        return [str(x) for x in insight["facts"] if isinstance(x, str) and x.strip()]
+    return []
+
+
+def check_fact_refs(refs: list[str], known_ids: set[str], where: str,
+                    universe_note: str = "") -> None:
+    """存在性闸（防幻觉关键闸）：引用了未知 fact id → 可行动报错并列出可用 id。
+
+    只在「可用 id 宇宙已知」的调用点生效（真实构建路径都会带上 profile ids）；
+    宇宙为空时跳过（纯请求层校验拿不到 profile，此时仅做形状检查）。"""
+    known = set(known_ids or ())
+    if not known:
+        return
+    missing = [r for r in refs if r not in known]
+    if missing:
+        avail = sorted(known)
+        shown = "、".join(f"`{i}`" for i in avail[:20]) + ("…（共 %d 个）" % len(avail) if len(avail) > 20 else "")
+        raise RequestValidationError(
+            f"{where} 引用了不存在的 fact id：{missing}。可用 id（构建期 profile.facts "
+            f"与请求级 facts 的并集）{('（' + universe_note + '）') if universe_note else ''}：{shown}。"
+            "先看构建日志 [fact] 行或 profile.json 的 facts/factsSkipped，只绑定真实存在的事实。")
+
 # 报告页面宽度档位（docs/page-width-and-table-autofit-design.md）。校验权威在此，
 # spec_to_report/build_manifest 经 resolve_page_width 复用——不许第二份常量表。
 # 下限 1280：1024 是文本容量估算的校准基线，更窄的档位会裁行，不提供。
@@ -103,6 +145,50 @@ COND_FORMAT_BASES = ("固定值", "百分比区间", "动态字段", "与0", "�
 COND_FORMAT_ACTIONS = ("text", "bg", "bold", "italic", "icon", "scale", "bar", "hideText", "fullRow")
 SUB_MEASURE_GRAINS = ("year", "quarter", "month", "week", "day")
 SUB_MEASURE_SHOWS = ("diff", "pct", "value")
+
+# ---- KPI fact 口径词汇（NC-01 #5，2026-10-23）-----------------------------------
+# 单一真源：spec_to_report._canon_kpi（别名归一）与这里的「不可求值闸」读同一份
+# 常量——词汇表写两份，两键并写的归一和校验必然漂移（正是 #5 缺陷的失效模式）。
+# 可计算 fact type = _compute_fact 能从声明直接求值的家族（含 sum/avg/mean 别名，
+# _compute_fact 末尾的别名映射同源）。作者口径家族标签（kpi.metric/metric 等）
+# 不是 fact type——绑定了 measure 时由聚合推断接管（_compute_fact 的「type 是
+# 作者家族标签」分支），没有绑定就没有任何求值路径 → 校验层必须拦下而不是静默丢卡。
+KPI_COMPUTABLE_FACT_TYPES = {"total", "count", "distinctCount", "topN", "shareOfTotal",
+                             "missingRate", "min", "max", "average", "sum", "avg", "mean"}
+# 声明了也永远算不出的 fact type（_compute_fact 对它们恒返回 None → 丢卡）：
+# growthRate 没有可声明的周期（正道 = kpi.derived rate / compare mom·yoy /
+# 数据源层窗口派生指标）、trend/rankChange 不是 KPI 口径（是图表语义）。
+KPI_NEVER_FACT_TYPES = {"growthRate", "trend", "rankChange"}
+# 这些 fact type 必须绑定指标列才有值（没有 measure 时 _compute_fact 走
+# ci=-1 分支返回 None → 静默丢卡）。
+KPI_FACT_TYPES_NEEDING_MEASURE = {"total", "min", "max", "average", "missingRate", "sum", "avg", "mean"}
+
+
+def canon_kpi(kpi: dict) -> dict:
+    """Map author-friendly KPI keys to the compiler's canonical names so a
+    model that writes factType/column/title/format/basis still computes a
+    real value instead of silently rendering "—". Canonical keys that are
+    already present win; `basis` is no longer part of the contract and is
+    dropped. Unknown keys are left untouched (validated elsewhere).
+
+    两键并写（NC-01 #5①，SKILL.md「去重计数类 KPI」示例就是
+    ``{"type:"kpi.metric","factType":"distinctCount",…}``）：``type`` 已存在时
+    别名不覆盖——但 ``type`` 里写的若是作者口径家族标签（kpi.metric 等，不是
+    可计算 fact type），真实口径在 factType 里，必须让位；两个都不可计算时
+    保持 canon 优先（校验层随后给可行动报错）。"""
+    out = dict(kpi)
+    if "factType" in out:
+        cur = out.get("type")
+        if cur is None or (str(cur) not in KPI_COMPUTABLE_FACT_TYPES
+                           and str(cur) not in KPI_NEVER_FACT_TYPES):
+            out["type"] = out["factType"]
+    aliases = {"factType": "type", "column": "measure", "field": "measure",
+               "title": "label", "format": "measureType"}
+    for src, dst in aliases.items():
+        if src in out and dst not in out:
+            out[dst] = out[src]
+    out.pop("basis", None)
+    return out
 
 
 def resolve_page_width(value: Any) -> int:
@@ -292,7 +378,7 @@ def _validate_datasets(request: dict) -> tuple[list[str], str]:
     for _i, ds in enumerate(declared):
         if not isinstance(ds, dict):
             raise RequestValidationError("each dataset must be an object")
-        unknown_ds = sorted(set(ds) - {"id", "label", "file", "columnRoles", "measureTypes", "hierarchy", "derived", "role", "calendar", "isDefault", "dimGroups", "primaryKey"})
+        unknown_ds = sorted(set(ds) - {"id", "label", "file", "columnRoles", "measureTypes", "hierarchy", "derived", "role", "calendar", "isDefault", "dimGroups", "primaryKey", "privacy"})
         if unknown_ds:
             raise RequestValidationError(f"unsupported dataset fields: {unknown_ds}")
         # 增量合并主键（datasets[].primaryKey，2026-09-15）：形状在这里校验；
@@ -305,6 +391,25 @@ def _validate_datasets(request: dict) -> tuple[list[str], str]:
                     or len(set(pk)) != len(pk):
                 raise RequestValidationError(
                     f"dataset {did} primaryKey must be a list of 1-8 distinct non-empty column names")
+        # privacy.sensitiveColumns（NS-01，2026-10-23 roadmap）：敏感列的**声明入口**。
+        # 语义 = 构建期物理剥离（spec_to_report 编译时把列从 rows/columns 剔除，
+        # 不可恢复；任何 chart/kpi/filter/derived/breakdown 引用即构建失败）。
+        # 这里只做形状与类型闸；「每项必须命中真实表列」由 compile_spec 对真实表
+        # 再校验一次（请求层不读文件——与上面 primaryKey 同一分工先例）。
+        if ds.get("privacy") is not None:
+            pv = ds["privacy"]
+            if not isinstance(pv, dict):
+                raise RequestValidationError(f"dataset {did} privacy must be an object")
+            unknown_pv = sorted(set(pv) - {"sensitiveColumns"})
+            if unknown_pv:
+                raise RequestValidationError(
+                    f"dataset {did} privacy unsupported fields: {unknown_pv}; supported: ['sensitiveColumns']")
+            sc = pv.get("sensitiveColumns")
+            if not isinstance(sc, list) or not sc or len(sc) > 64 \
+                    or not all(isinstance(c, str) and c.strip() for c in sc) \
+                    or len(set(sc)) != len(sc):
+                raise RequestValidationError(
+                    f"dataset {did} privacy.sensitiveColumns must be a list of 1-64 distinct non-empty column names")
         if not isinstance(did, str) or not SAFE_ID_RE.fullmatch(did) or did in seen:
             # Deterministic fallback: 'primary' for a single table, ds-1..n for many.
             candidate = "primary" if len(declared) == 1 else f"ds-{_i + 1}"
@@ -925,26 +1030,34 @@ def _validate_chart_table(tbl: Any) -> None:
                 raise RequestValidationError(
                     f"chart.table.subMeasures[{_si}].pos must be 'right'（一期仅支持「指标右侧」档）")
     # 高度三态（WP-7 消费）：grow(默认自适应生长) | fixed(=manualH 既有语义) | bounded 有界高度。
+    # XU-01：bounded 支持 {'maxPx': 200..4000} 或 {'maxBodyRows': 5..500} 两种形状，
+    # **二选一互斥**（双键直接报错；运行时容错路径才是「行数优先 + warn」）。
     if "heightMode" in tbl:
         hm = tbl["heightMode"]
         if isinstance(hm, str):
             if hm not in TABLE_HEIGHT_MODES:
                 raise RequestValidationError(
-                    f"chart.table.heightMode must be 'grow'|'fixed'|{{'bounded': {{'maxPx': 200..4000}}}}; got {hm!r}")
+                    f"chart.table.heightMode must be 'grow'|'fixed'|{{'bounded': {{'maxPx': 200..4000}} }}|{{'bounded': {{'maxBodyRows': 5..500}}}}; got {hm!r}")
         elif isinstance(hm, dict):
             unknown_hm = sorted(set(hm) - {"bounded"})
             if "bounded" not in hm or unknown_hm:
                 raise RequestValidationError(
-                    f"chart.table.heightMode object form only supports {{'bounded': {{'maxPx'}}}}; got keys {sorted(hm)}")
+                    f"chart.table.heightMode object form only supports {{'bounded': {{'maxPx'}}}} or {{'bounded': {{'maxBodyRows'}}}}; got keys {sorted(hm)}")
             b = hm["bounded"]
-            if not isinstance(b, dict) or sorted(b) != ["maxPx"]:
-                raise RequestValidationError("chart.table.heightMode.bounded only supports {'maxPx': 整数}")
-            mx = b.get("maxPx")
-            if not isinstance(mx, int) or isinstance(mx, bool) or not 200 <= mx <= 4000:
-                raise RequestValidationError("chart.table.heightMode.bounded.maxPx must be an integer 200-4000")
+            if not isinstance(b, dict) or sorted(b) not in (["maxPx"], ["maxBodyRows"]):
+                raise RequestValidationError(
+                    "chart.table.heightMode.bounded supports {'maxPx': 整数} or {'maxBodyRows': 整数}（二选一互斥，不可同给）")
+            if "maxPx" in b:
+                mx = b.get("maxPx")
+                if not isinstance(mx, int) or isinstance(mx, bool) or not 200 <= mx <= 4000:
+                    raise RequestValidationError("chart.table.heightMode.bounded.maxPx must be an integer 200-4000")
+            else:
+                n = b.get("maxBodyRows")
+                if not isinstance(n, int) or isinstance(n, bool) or not 5 <= n <= 500:
+                    raise RequestValidationError("chart.table.heightMode.bounded.maxBodyRows must be an integer 5-500")
         else:
             raise RequestValidationError(
-                f"chart.table.heightMode must be 'grow'|'fixed'|{{'bounded': {{'maxPx': 200..4000}}}}; got {hm!r}")
+                f"chart.table.heightMode must be 'grow'|'fixed'|{{'bounded': {{'maxPx': 200..4000}} }}|{{'bounded': {{'maxBodyRows': 5..500}}}}; got {hm!r}")
     # 行维形态（WP-8 消费）：mergeRowDims = 多行维合并一列（名称 + 列宽 px）。
     if "mergeRowDims" in tbl:
         mrd = tbl["mergeRowDims"]
@@ -988,7 +1101,14 @@ def _validate_chart_table(tbl: Any) -> None:
                     f"chart.table.totalCalc[{_tc_col!r}] must be one of {list(TABLE_TOTAL_CALCS)}; got {_tc_agg!r}")
 
 
-def validate_request(request: dict[str, Any]) -> dict[str, Any]:
+def validate_request(request: dict[str, Any], profile_fact_ids: Any = None) -> dict[str, Any]:
+    """校验请求协议。
+
+    ``profile_fact_ids``（NA-02）：构建期 profile.facts 的 id 宇宙（编译侧经
+    compile_spec 从 profile.json / canonical meta.facts 读出后传入）。给了它，
+    insights 的证据绑定与 {{fact:id}} 占位就做**存在性硬闸**（引用不存在的 id =
+    可行动报错，防幻觉）；不给（纯请求层校验）则只做形状检查——否则没有 profile
+    的调用方会误伤合法引用。"""
     if not isinstance(request, dict):
         raise RequestValidationError("request must be an object")
     if request.get("schemaVersion") != 1:
@@ -1109,7 +1229,11 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     def _check_chart(chart: dict) -> None:
         if not isinstance(chart, dict):
             raise RequestValidationError("each chart must be an object")
-        chart_keys = {"id", "presetId", "title", "encoding", "dimension", "dimensions", "breakdown", "breakdowns", "measures", "aggregation", "limit", "topK", "topKOther", "sort", "chartSpec", "annotation", "annotationPlacement", "datasetId", "style", "axis", "series", "layout", "dimensionBucket", "pagination", "table"}
+        chart_keys = {"id", "presetId", "title", "encoding", "dimension", "dimensions", "breakdown", "breakdowns", "measures", "aggregation", "limit", "topK", "topKOther", "sort", "chartSpec", "annotation", "annotationPlacement", "datasetId", "style", "axis", "series", "layout", "dimensionBucket", "pagination", "table",
+                      # chart.question（NA-02）：这张图要回答的分析主张/问题一句话。
+                      # 只查「有没有」（lint L23 advisory），不查对错——主张的真伪由
+                      # 证据绑定（insights[].facts）与读者对着数据核对。
+                      "question"}
         unknown_chart = sorted(set(chart) - chart_keys)
         if unknown_chart:
             # Actionable rejection: name the allowed chart fields and point the
@@ -1136,6 +1260,16 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             if len(_dims_list) > 3:
                 raise RequestValidationError(
                     f"chart.dimensions supports at most 3 row dimensions (行区最多 3 层); got {len(_dims_list)}")
+        # chart.question（NA-02）：分析主张/问题一句话。轻量声明——只查形状
+        # （非空字符串 ≤200 字），不查对错；「有图无主张」由 lint L23 advisory 提醒。
+        if chart.get("question") is not None:
+            _q = chart["question"]
+            if not isinstance(_q, str) or not _q.strip():
+                raise RequestValidationError(
+                    f"chart.question must be a non-empty string (这张图要回答的分析主张/问题一句话); got {_q!r}")
+            if len(_q) > 200:
+                raise RequestValidationError(
+                    f"chart.question is at most 200 chars (一句话主张，长论述请写进 section narrative); got {len(_q)}")
         # chart 级 measures 同款类型闸：裸字符串 "利润" 会对字符串逐字符迭代出
         # 「列名」，报不可行动的未知列错误（scatter 的 len==2 检查还会被 2 字符
         # 中文串骗过）。
@@ -1580,6 +1714,41 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
                 # 拼错的值（如 "wow"）曾静默无对比副行——运行时只认 mom/yoy。
                 raise RequestValidationError(f"kpi.compare must be 'mom' or 'yoy'; got {_cmp!r}")
             _validate_card_style(kpi.get("style"), "kpi")
+            # KPI 不可求值闸（NC-01 #5②，2026-10-23）：编译期对求不出值的 KPI 是
+            # 「value is None → continue」静默丢卡（页面凭空少一张、审计全绿）。
+            # 结构上永远算不出的声明必须在请求层给可行动报错——与「KPI×派生指标」
+            # 闸（2026-10-15）同一条纪律，用同一份 canon 词汇（canon_kpi）判定。
+            _ck = canon_kpi(kpi)
+            _has_value = _ck.get("value") is not None or _ck.get("rawValue") is not None
+            _klabel = _ck.get("label") or _ck.get("title") or _ck.get("measure") or f"[{_ki}]"
+            if not (_has_value or _ck.get("factId") or isinstance(_ck.get("derived"), dict)):
+                _ktype = str(_ck.get("type")) if _ck.get("type") is not None else None
+                _kmeasure = next((_ck.get(_k) for _k in ("measure", "column", "field")
+                                  if isinstance(_ck.get(_k), str) and _ck.get(_k).strip()), None)
+                _kdim = next((_ck.get(_k) for _k in ("dimension", "countDim")
+                              if isinstance(_ck.get(_k), str) and _ck.get(_k).strip()), None)
+                if _ktype in KPI_NEVER_FACT_TYPES:
+                    raise RequestValidationError(
+                        f"kpis[{_ki}]（{_klabel}）的 fact 口径 {_ktype!r} 无法从声明求值"
+                        "（编译期会静默丢卡）。三个出口：① 环比/同比改用 "
+                        "kpi.derived:{type:'rate',…} 或 compare:'mom'/'yoy'；"
+                        "② 用数据源层窗口派生指标（derived.measures kind:'window'）+ 图表承载；"
+                        "③ 提供静态 value（筛选后不会重算）。")
+                if _ktype not in KPI_COMPUTABLE_FACT_TYPES and not _kmeasure:
+                    raise RequestValidationError(
+                        f"kpis[{_ki}]（{_klabel}）没有任何可求值绑定：type {_ktype!r} 不是可计算 "
+                        "fact 口径，也没有 measure/factId/value。出口：绑定真实指标列"
+                        "（measure+aggregation）、去重计数写 {factType:'distinctCount',dimension:…}、"
+                        "或提供静态 value——否则编译期会静默丢卡。")
+                if _ktype in KPI_FACT_TYPES_NEEDING_MEASURE and not _kmeasure:
+                    raise RequestValidationError(
+                        f"kpis[{_ki}]（{_klabel}）的 fact 口径 {_ktype!r} 必须绑定指标列"
+                        "（measure）才能求值；缺绑定会被编译期静默丢卡。")
+                if _ktype == "distinctCount" and not (_kmeasure or _kdim):
+                    raise RequestValidationError(
+                        f"kpis[{_ki}]（{_klabel}）distinctCount 需要绑定 dimension（维度值去重）"
+                        "或 measure+aggregation:'countd'（指标值去重）；两者都缺会被编译期"
+                        "静默丢卡。")
         except RequestValidationError as exc:
             kpi_problems.append(f"kpis[{_ki}]: {exc}")
         if isinstance(kpi, dict) and kpi.get("value") is not None and _filters_declared:
@@ -1609,10 +1778,24 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     for _ii, ins in enumerate(request.get("insights") or []):
         if isinstance(ins, dict):
             # 对象形态的合法键 = 渲染端 _insight_text 实际读取的键（text/content/
-            # description/body/summary/finding/title/heading）；其它键一律拒绝。
-            unknown_ins = sorted(set(ins) - {"text", "content", "description", "body", "summary", "finding", "title", "heading"})
+            # description/body/summary/finding/title/heading）+ facts（NA-02 证据
+            # 绑定槽：引用构建期 profile.facts / 请求级 facts 的 id，渲染成
+            # 「依据（脚本计算）」脚注；存在性闸在 facts 声明解析之后统一执行）；
+            # 其它键一律拒绝。
+            unknown_ins = sorted(set(ins) - {"text", "content", "description", "body", "summary", "finding", "title", "heading", "facts"})
             if unknown_ins:
                 raise RequestValidationError(f"insights[{_ii}]: unknown fields {unknown_ins}（正文请用 text/title 等键）")
+            if ins.get("facts") is not None:
+                _refs = ins["facts"]
+                if not isinstance(_refs, list) or not _refs or \
+                        not all(isinstance(x, str) and x.strip() for x in _refs):
+                    raise RequestValidationError(
+                        f"insights[{_ii}].facts must be a non-empty list of fact ids "
+                        "(证据绑定：构建期 profile.facts 的 `fact:<类>:<序号>` 或请求级 facts 的 id)")
+                if len(_refs) > 6:
+                    raise RequestValidationError(f"insights[{_ii}].facts may reference at most 6 fact ids")
+                if len(set(_refs)) != len(_refs):
+                    raise RequestValidationError(f"insights[{_ii}].facts must not contain duplicate ids")
         elif not isinstance(ins, str):
             raise RequestValidationError(f"insights[{_ii}] must be a string or an object")
     # texts：独立文本块（2026-09-28「全部放开」批）。自由提示词最常见的「加一段
@@ -1674,6 +1857,18 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fact.get("id"), str) or not SAFE_ID_RE.fullmatch(fact["id"]) or fact["id"] in fact_ids:
             raise RequestValidationError(f"duplicate/invalid fact id: {fact.get('id')!r}")
         fact_ids.add(fact["id"])
+    # fact 引用存在性闸（NA-02 防幻觉关键闸）：insights[].facts 绑定槽与正文里的
+    # {{fact:id}} 占位共用同一解析（fact_refs_in / fact_binding_ids 单一真源），
+    # 引用了不存在的 id → 可行动报错并列出可用 id。宇宙 = 请求级 facts ∪ 构建期
+    # profile.facts；profile ids 缺席（纯请求层校验）时跳过存在性检查。
+    _known_fact_ids: set[str] = set(fact_ids)
+    for _pf in profile_fact_ids or ():
+        _known_fact_ids.add(str(_pf))
+    for _ii, ins in enumerate(request.get("insights") or []):
+        _refs = fact_binding_ids(ins)
+        _refs += fact_refs_in(ins.get("text") if isinstance(ins, dict) else ins)
+        if _refs:
+            check_fact_refs(_refs, _known_fact_ids, f"insights[{_ii}]", "构建日志 [fact] 行 / profile.json")
     # 对账锚点（brief-template v2 §口径槽的 P2 断言落地，2026-10-13 收尾批）：
     # 构建期勾稽的真值声明——shape 在请求层校验，数值断言在 compile_spec
     # （_check_anchors，物化计算列之后的真实表上重算），不符即编译失败。

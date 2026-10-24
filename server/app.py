@@ -36,14 +36,14 @@ from .aggregator import (AggregationError, aggregate, aggregate_multi, aggregate
                          explain_index_candidate, index_suggestions, parse_request)
 from .index_advisor import (IndexAdvisor, IndexAdvisorError, IndexProposalConflict,
                             IndexProposalNotFound)
-from .derived_columns import (DERIVED_KIND, apply_dataset_derived, apply_dim_groups, columns_decl,
-                              dim_group_table_defs, dim_groups_defs, ensure_dim_groups,
-                              ensure_table_defs, replay_all as replay_columns,
-                              table_defs)
+from .store import (DERIVED_KIND, apply_dataset_derived, apply_dim_groups, columns_decl,
+                    dim_group_table_defs, dim_groups_defs, ensure_dim_groups,
+                    ensure_table_defs, replay_all as replay_columns,
+                    table_defs)
 from . import SKILL_VERSION
 from . import jobs as _jobs
 from .registry import Registry, snapshot_data_file
-from .servers_index import (
+from ._platform import (
     load as index_load,
     ping as index_ping,
     prune_dead,
@@ -51,7 +51,7 @@ from .servers_index import (
     unregister as index_unregister,
 )
 from .store import Engine, TableInfo, TableSchemaError, get_engine
-from .truth import validate_truth
+from .aggregator import validate_truth
 
 _COPILOT_JOB_TIMEOUT_SECONDS = 120
 _COPILOT_RATE_WINDOW_SECONDS = 60
@@ -467,28 +467,17 @@ def respond_error(handler: BaseHTTPRequestHandler, status: int, code: str, messa
     respond_json(handler, status, {"error": {"code": code, "message": message}})
 
 
-def write_dataset_snapshot(path: Path, columns: list, rows: list) -> None:
-    """数据集快照流式写盘（性能 P1，2026-09-25）。
+def write_dataset_snapshot(path: Path, columns: list, rows: list) -> Path:
+    """数据集快照写盘（XP-01 双格式，2026-10-24）：薄委托 ``store.write_snapshot``。
 
-    逐行 ``json.dumps`` 直写临时文件，不再把整表先拼成一根 JSON 字符串——
-    345k 行替换的写盘点曾在内存里同时持有「合并后全表 + 完整 JSON 字符串」
-    两大份（尖峰 ~2× 表体积）。输出仍是同一份 JSON 文档（``json.load`` 读回
-    等值；行间以 ',\\n' 分隔）；临时文件 + ``os.replace`` 原子替换契约不变，
-    OSError 由调用方按既有文案转 BadRequest（fail-closed 不静默）。"""
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write('{"columns":')
-        f.write(json.dumps(list(columns), ensure_ascii=False))
-        f.write(',"rows":[')
-        first = True
-        for row in rows:
-            if first:
-                first = False
-            else:
-                f.write(",\n")
-            f.write(json.dumps(list(row), ensure_ascii=False))
-        f.write("]}")
-    os.replace(tmp, path)
+    逐行流式直写临时文件 + ``os.replace`` 原子落盘（JSON 是 2026-09-25 性能 P1
+    的原实现；SQLite 是 XP-01 新缺省——``LRM_SNAPSHOT_FORMAT``，缺省 sqlite）。
+    传入的 ``path`` 带何种后缀都会被换成当前格式的后缀，**返回实际落盘路径**：
+    调用点凡是把 path 记进 registry/manifest 的，都必须改用返回值（否则注册表
+    source 指向一个不存在的 .json，重启后数据集蒸发）。IO/SQLite 失败仍抛
+    OSError，由调用方按既有文案转 BadRequest（fail-closed 不静默）。"""
+    from .store import write_snapshot
+    return write_snapshot(path, columns, rows)
 
 
 def _register_full_entry(registry, report_id: str, entry: dict) -> None:
@@ -594,6 +583,145 @@ class BadRequest(ValueError): pass
 class NotFound(KeyError): pass
 class Conflict(ValueError): pass
 class ValidationFailed(ValueError): pass
+
+
+# ════════ S2 数据面隐私闸（XU-04/FS-01，2026-10-24 Wave 3，E1 拍板=闸）════════
+# NS-01 已经闸了两头：构建期 `_strip_sensitive_tables` 物理剥离（正常报告的表里
+# 根本没有敏感列）+ Agent 面 `copilot._sensitive_columns/_assert_filter_privacy`
+# 脱敏。这里补第三道：**server UI 数据面端点**（聚合/明细/值域）对「manifest 声明了
+# privacy.sensitiveColumns 但物理表仍有该列」的历史报告/手改 manifest 收口。
+# 语义与 Agent 面同口径（E1）：引用敏感列 → 400 可行动报错（只列列名，绝不回显
+# 敏感值）；明细读 → 投影剔除（作者/读者面无感）。无声明 = 敏感集合为空，所有
+# helper 第一行 short-circuit——代码路径与今天逐位一致（零漂移硬契约）。
+# 列宇宙归一口径同 NS-01 编译侧（scripts/spec_to_report.py::_ds_privacy）：只收
+# 非空字符串、列名逐字匹配（构建期剥离就是按这个集合剔的，这里不做大小写/空白
+# 变换，避免「闸的集合 ≠ 剥离的集合」）。
+
+def sensitive_cols_of(entry: Any, dataset_id: str) -> set[str]:
+    """manifest.datasets[].privacy.sensitiveColumns 的数据面读取口（纯内存，无 IO）。
+
+    只读调用方手里的注册表条目 dict（注册/重载时已加载进内存），绝不逐请求
+    重读磁盘 manifest；id 对不上或形状不对 = 无声明 = 空集合（short-circuit）。"""
+    out: set[str] = set()
+    if not isinstance(entry, dict):
+        return out
+    datasets = (entry.get("manifest") or {}).get("datasets")
+    if not isinstance(datasets, list):
+        return out
+    for d in datasets:
+        if not (isinstance(d, dict) and d.get("id") == dataset_id):
+            continue
+        privacy = d.get("privacy")
+        if not isinstance(privacy, dict):
+            continue
+        sc = privacy.get("sensitiveColumns")
+        if isinstance(sc, list):
+            out.update(c for c in sc if isinstance(c, str) and c)
+    return out
+
+
+def dataset_sensitive_cols(registry: Any, dataset_id: str) -> set[str]:
+    """一张物理表的敏感列宇宙 = 所有声明它的注册条目取**并集**（保守）。
+
+    多份报告可共享同一 dataset id（副本），任何一份声明了敏感列，数据面就按
+    敏感对待——与 h_dataset_rows_delete 的 declaring 遍历同型。只遍历内存
+    registry，无磁盘 IO。"""
+    out: set[str] = set()
+    try:
+        items = registry.items_raw()
+    except Exception:
+        return out
+    for _rid, e in items:
+        out |= sensitive_cols_of(e, dataset_id)
+    return out
+
+
+def assert_not_sensitive(cols: Any, sensitive: set, what: str) -> None:
+    """引用敏感列 → BadRequest（路由层统一转 400）。文案可行动：指明列名、
+    用途去向、两条出路；**绝不回显敏感值**（只列列名）。sensitive 空 = 放行。"""
+    if not sensitive:
+        return
+    hit = sorted({c for c in cols if isinstance(c, str) and c in sensitive})
+    if hit:
+        raise BadRequest(
+            f"敏感列保护（privacy.sensitiveColumns）：{'、'.join(hit)} 不能用于{what}。"
+            "该列已在构建期从报告数据中剥离；数据面仍出现它，说明本报告是历史构建"
+            "或 manifest 被手工修改——请修正引用（筛选/分组/指标改用非敏感列），"
+            "或重新构建报告后再试。")
+
+
+def project_sensitive_rows(columns: list, rows: list, sensitive: set) -> tuple[list, list]:
+    """明细投影剔除（E1：rows 读不 400，作者/读者面对敏感列无感）。
+
+    columns 与每行按位置剥掉敏感列；sensitive 空 = 原样返回入参对象（零拷贝
+    零漂移）。行长度与表头不一致的脏行保守整行保留（不按错位索引乱剥）。"""
+    if not sensitive:
+        return columns, rows
+    keep = [i for i, c in enumerate(columns) if isinstance(c, str) and c not in sensitive]
+    if len(keep) == len(columns):
+        return columns, rows
+    cols2 = [columns[i] for i in keep]
+    rows2 = [[row[i] for i in keep]
+             if isinstance(row, list) and len(row) == len(columns) else row
+             for row in rows]
+    return cols2, rows2
+
+
+def _aggregate_payload_cols(payload: Any) -> list[str]:
+    """一个聚合请求体里引用的全部列名（groupBy/measures/filter/orderBy/totalCalc/
+    bucket.source/aggregations 键）。只做形状容忍的平铺收集，不做语义校验
+    （校验仍归 aggregator.parse_request）。"""
+    out: list[str] = []
+    if not isinstance(payload, dict):
+        return out
+    out.extend(c for c in (payload.get("groupBy") or []) if isinstance(c, str))
+
+    def _walk_filter(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                _walk_filter(item)
+        elif isinstance(node, dict):
+            if isinstance(node.get("column"), str):
+                out.append(node["column"])
+            for key in ("all", "any"):
+                if node.get(key) is not None:
+                    _walk_filter(node.get(key))
+
+    filters = payload.get("filter")
+    if isinstance(filters, dict) and not ({"all", "any"} & set(filters)):
+        # 单谓词简写形状（{column,op,value}）——与 _filter_clause 的 list 形状并行。
+        _walk_filter([filters])
+    else:
+        _walk_filter(filters)
+    for m in (payload.get("measures") or []):
+        if isinstance(m, str):
+            out.append(m)
+        elif isinstance(m, dict):
+            if isinstance(m.get("column"), str):
+                out.append(m["column"])
+            _walk_filter(m.get("filters"))
+    for o in (payload.get("orderBy") or []):
+        if isinstance(o, dict) and isinstance(o.get("column"), str):
+            out.append(o["column"])
+    total_calc = payload.get("totalCalc")
+    if isinstance(total_calc, dict):
+        out.extend(c for c in total_calc if isinstance(c, str))
+    aggregations = payload.get("aggregations")
+    if isinstance(aggregations, dict):
+        out.extend(c for c in aggregations if isinstance(c, str))
+    bucket = payload.get("bucket") or payload.get("dimensionBucket")
+    if isinstance(bucket, dict) and isinstance(bucket.get("source"), str):
+        out.append(bucket["source"])
+    return out
+
+
+def assert_aggregate_privacy(payload: Any, sensitive: set, what: str) -> None:
+    """聚合族端点（aggregate / aggregate-multi / chart aggregate）的统一闸。
+
+    sensitive 空 = 立即返回（连列收集都不做——无声明时代的代码路径逐位不变）。"""
+    if not sensitive:
+        return
+    assert_not_sensitive(_aggregate_payload_cols(payload), sensitive, what)
 
 
 def _family_of(report_id: str) -> str:
@@ -895,6 +1023,13 @@ def dispatch_queued_job(engine: Engine, registry: Registry,
             if suffix == ".json":
                 with path.open("r", encoding="utf-8") as stream:
                     table = json.load(stream)
+            elif suffix == ".sqlite":
+                # XP-01：队列持久化输入随写盘格式走（write_dataset_snapshot 缺省
+                # sqlite）——按后缀分派读回，旧 .json 输入照读。
+                from .store import read_snapshot as _read_snapshot
+                _cols, _rows_iter = _read_snapshot(path)
+                _rows_iter = list(_rows_iter)
+                table = {"columns": _cols, "rows": _rows_iter}
             else:
                 progress(f"解析文件（{suffix.lstrip('.') or 'upload'}）中…")
                 from table_input import load_table_file as _load_table_file
@@ -1109,14 +1244,17 @@ def _process_replace_table_impl(engine, registry, reportId, datasetId, table, mo
     data_dir = getattr(registry, "data_dir", None)
     if data_dir:
         from pathlib import Path as _Path
-        snap_path = _Path(data_dir) / (_snapshot_stem(datasetId) + ".replaced.json")
         # 流式写盘（write_dataset_snapshot 内含临时文件 + os.replace 原子落盘）：
         # 裸 write_text 半途失败会留半份快照，重启 _reload_all 灌进半个表。
         # 写盘失败显式 400——引擎内已是新数据，必须告诉作者「重启会回退」，
         # 不能静默吞掉（状态撕裂不可归因）。
+        # XP-01：write_dataset_snapshot 按当前快照格式（缺省 sqlite）换后缀并
+        # 返回实际路径——回填 snap_path，注册表 source 记的一定是真实文件
+        # （否则指向一个不存在的 .json，重启后数据集蒸发）。
+        snap_path = _Path(data_dir) / (_snapshot_stem(datasetId) + ".replaced.json")
         try:
-            write_dataset_snapshot(snap_path, table_payload["columns"],
-                                   table_payload["rows"])
+            snap_path = write_dataset_snapshot(snap_path, table_payload["columns"],
+                                               table_payload["rows"])
         except OSError as exc:
             raise BadRequest(
                 f"替换数据的快照写盘失败：{exc}。引擎内已是新数据，但重启会回退到旧快照；"
@@ -1693,8 +1831,8 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         entry = registry.get(reportId)
         if entry is None:
             raise NotFound(f"report {reportId!r} not registered")
-        from .agent_proposals import (validate_alias_transaction_scope, validate_proposal,
-                                       validate_transaction_scope)
+        from .agent_proposals import (validate_alias_transaction_scope, validate_derived_transaction_scope,
+                                       validate_proposal, validate_transaction_scope)
         from .agent_tools import ToolContractError
         body = read_json(_handler)
         try:
@@ -1702,6 +1840,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             result = validate_proposal(entry, proposal)
             if proposal.get("kind") == "alias_confirmation":
                 result["transaction"] = validate_alias_transaction_scope(
+                    entry, [proposal], engine=engine)
+            elif proposal.get("kind") == "derived_measure":
+                result["transaction"] = validate_derived_transaction_scope(
                     entry, [proposal], engine=engine)
             else:
                 result["transaction"] = validate_transaction_scope(entry, [proposal], engine=engine)
@@ -1739,8 +1880,10 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             raise NotFound(f"report {reportId!r} not registered")
         body = read_json(_handler)
         _audit(_handler, reportId, "proposal.apply",
-               str((body.get("proposal") or {}).get("chartId") or ""),
-               {"count": len(body.get("proposals") or [body.get("proposal")])})
+               str((body.get("proposal") or {}).get("chartId")
+                    or (body.get("proposal") or {}).get("datasetId") or ""),
+               {"count": len(body.get("proposals") or [body.get("proposal")]),
+                "kind": (body.get("proposal") or {}).get("kind") or "chart"})
         gate = check_edit_gate(body, edit_policy_of(entry))
         if gate:
             respond_json(_handler, 403, {"error": {"code": "Forbidden", "message": gate}})
@@ -1749,7 +1892,8 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         if not raw or len(raw) > 8 or any(not isinstance(item, dict) for item in raw):
             raise BadRequest("proposals must contain 1-8 objects")
         from .agent_proposals import (apply_proposals, manifest_hash, validate_alias_transaction_scope,
-                                       validate_proposal, validate_transaction_scope)
+                                       validate_derived_transaction_scope, validate_proposal,
+                                       validate_transaction_scope)
         checks = []
         normalized_raw = []
         for proposal in raw:
@@ -1769,6 +1913,13 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                 # apply path persists it.
                 normalized["datasetId"] = check.get("after", {}).get("datasetId")
                 normalized["alias"] = proposal.get("alias", proposal.get("name"))
+            elif proposal.get("kind") == "derived_measure":
+                # Apply must persist exactly the node the server normalized —
+                # never a re-shape of the raw model payload.
+                after = check.get("after") or {}
+                normalized["datasetId"] = after.get("datasetId")
+                if isinstance(after.get("addedMeasure"), dict):
+                    normalized["measure"] = after["addedMeasure"]
             after_aggregations = check.get("after", {}).get("aggregations", {})
             if isinstance(after_aggregations, dict):
                 measure_name = str(proposal.get("measure") or "")
@@ -1777,12 +1928,16 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             normalized_raw.append(normalized)
         raw = normalized_raw
         alias_only = all(item.get("kind") == "alias_confirmation" for item in raw)
-        chart_only = all(item.get("kind") != "alias_confirmation" for item in raw)
-        if not alias_only and not chart_only:
-            raise BadRequest("alias proposal 不能与图表 proposal 混合提交")
+        derived_only = all(item.get("kind") == "derived_measure" for item in raw)
+        chart_only = all(item.get("kind") not in ("alias_confirmation", "derived_measure")
+                          for item in raw)
+        if not alias_only and not derived_only and not chart_only:
+            raise BadRequest("alias/派生指标 proposal 不能与图表 proposal 混合提交")
         try:
             if alias_only:
                 transaction_scope = validate_alias_transaction_scope(entry, raw, engine=engine)
+            elif derived_only:
+                transaction_scope = validate_derived_transaction_scope(entry, raw, engine=engine)
             else:
                 transaction_scope = validate_transaction_scope(entry, raw, engine=engine)
         except Exception as exc:
@@ -2429,6 +2584,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         info = engine.table_info(datasetId)
         if info is None:
             raise NotFound(f"dataset {datasetId!r} not loaded")
+        # S2 数据面闸（XU-04，E1 投影语义）：字段元数据里的敏感列整列剔除
+        # （min/max/mean 等统计也是敏感值的聚合，列名本身也不该再出现在作者面）。
+        _s2_sensitive = dataset_sensitive_cols(registry, datasetId)
         payload = {
             "id": datasetId,
             "label": datasetId,
@@ -2443,6 +2601,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                     **({"sampleMin": c.sample_min, "sampleMax": c.sample_max} if c.inferred_type == "time" else {}),
                 }
                 for c in info.schema
+                if not (_s2_sensitive and c.name in _s2_sensitive)
             ],
             "rowCount": info.row_count,
         }
@@ -2453,6 +2612,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         if info is None:
             raise NotFound(f"dataset {datasetId!r} not loaded")
         body = read_json(_handler)
+        # S2 数据面闸（XU-04）：引用敏感列 → 400；无声明 = 零漂移放行。
+        assert_aggregate_privacy(body, dataset_sensitive_cols(registry, datasetId),
+                                 f"数据集 {datasetId} 的聚合查询")
         request = parse_request(body)
         response = aggregate(engine, datasetId, request)
         respond_json(_handler, 200, response.to_dict())
@@ -2465,6 +2627,11 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             raise BadRequest("aggregate-multi requires a non-empty requests array")
         if len(sub_requests) > 16:
             raise BadRequest("aggregate-multi supports at most 16 sub-requests")
+        # S2 数据面闸（XU-04）：逐子请求按各自 datasetId 闸敏感列；无声明 = 零漂移。
+        for sub in sub_requests:
+            if isinstance(sub, dict) and isinstance(sub.get("datasetId"), str):
+                assert_aggregate_privacy(sub, dataset_sensitive_cols(registry, sub["datasetId"]),
+                                         f"数据集 {sub['datasetId']} 的批量聚合子查询")
         results = aggregate_multi(engine, sub_requests)
         respond_json(_handler, 200, {"results": results})
 
@@ -2480,6 +2647,12 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         unknown = [c for c in columns if c not in info.columns]
         if unknown:
             raise BadRequest(f"unknown columns: {unknown}")
+        # S2 数据面闸（XU-04，E1 投影语义）：明细读**不 400**——敏感列从请求列集
+        # 与返回行里直接剔除（作者/读者面对该列无感）；即使调用方显式点名也不回。
+        # includeRowIds 的 rowid 是伪列不是列值，不受影响。无声明 = 零漂移。
+        _s2_sensitive = dataset_sensitive_cols(registry, datasetId)
+        if _s2_sensitive:
+            columns = [c for c in columns if c not in _s2_sensitive]
         try:
             page = max(1, int(body.get("page", 1)))
             page_size = min(100, max(1, int(body.get("pageSize", 50))))
@@ -2501,6 +2674,17 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         if include_rid:
             select = 'rowid AS "__ai_rid", ' + select
         offset = (page - 1) * page_size
+        if not columns:
+            # 投影退化（S2）：请求列集全是敏感列——按投影语义回 200 空列空行
+            #（不 400、不泄漏），元数据（total/分页）照实。
+            total_row = engine.execute(f'SELECT COUNT(*) AS n FROM {_quote(datasetId)} {where}', tuple(params))
+            total = int(total_row[0]["n"] if total_row else 0)
+            respond_json(_handler, 200, {
+                "columns": [], "rows": [], "page": page, "pageSize": page_size,
+                "total": total, "hasNext": False,
+                **({"rowIds": []} if include_rid else {}),
+            })
+            return
         try:
             rows = engine.execute(
                 f'SELECT {select} FROM {_quote(datasetId)} {where} {order} LIMIT {page_size} OFFSET {offset}',
@@ -2532,6 +2716,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             raise NotFound(f"dataset {datasetId!r} not loaded")
         if column not in info.columns:
             raise BadRequest(f"unknown column: {column}")
+        # S2 数据面闸（XU-04）：敏感列的值域就是敏感值本体 → 400（不回显值）。
+        assert_not_sensitive([column], dataset_sensitive_cols(registry, datasetId),
+                             f"数据集 {datasetId} 的值域查询")
         from .aggregator import _quote
         rows = engine.execute(
             f'SELECT DISTINCT {_quote(column)} AS v FROM {_quote(datasetId)} ORDER BY 1',
@@ -2553,6 +2740,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             raise NotFound(f"dataset {datasetId!r} not loaded")
         if column not in info.columns:
             raise BadRequest(f"unknown column: {column}")
+        # S2 数据面闸（XU-04）：同 GET /values——敏感列值域 400。
+        assert_not_sensitive([column], dataset_sensitive_cols(registry, datasetId),
+                             f"数据集 {datasetId} 的级联值域查询")
         body = read_json(_handler)
         preds = body.get("filter") or []
         if not isinstance(preds, list):
@@ -2582,6 +2772,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             raise NotFound(f"dataset {datasetId!r} not loaded")
         if column not in info.columns:
             raise BadRequest(f"unknown column: {column}")
+        # S2 数据面闸（XU-04）：示例值 = 敏感值本体 → 400（与 values 同一家族）。
+        assert_not_sensitive([column], dataset_sensitive_cols(registry, datasetId),
+                             f"数据集 {datasetId} 的示例值查询")
         from .aggregator import _quote
         rows = engine.execute(
             f'SELECT DISTINCT {_quote(column)} AS v FROM {_quote(datasetId)} '
@@ -2749,6 +2942,14 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         mode = body.get("mode") or ("rowids" if body.get("rowIds") else "filter")
         if mode not in ("rowids", "filter"):
             raise BadRequest("mode must be 'rowids' or 'filter'")
+        # S2 数据面闸（XU-04）：filter 模式的删除谓词引用敏感列 → 400（按敏感值
+        # 删行=以敏感值为操作数且回显命中数）；rowids 模式按伪列删，照旧放行。
+        if mode == "filter":
+            _s2_sensitive: set[str] = set()
+            for _e in declaring.values():
+                _s2_sensitive |= sensitive_cols_of(_e, datasetId)
+            assert_not_sensitive(_aggregate_payload_cols({"filter": body.get("filter")}),
+                                 _s2_sensitive, f"数据集 {datasetId} 的按筛选删除")
         where, params = "", ()
         if mode == "rowids":
             raw_ids = body.get("rowIds")
@@ -2827,23 +3028,30 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                 try:
                     # 既有**权威**快照 → 单份 pre-delete 备份（下次删除覆盖它；
                     # 永不进 _reload_all 的候选，纯人工回滚用）。权威 = reload 的
-                    # 候选序：replaced > added > 记账 source 指向的构建期文件。
+                    # 候选序：replaced.* > added.* > 记账 source 指向的构建期文件。
+                    # XP-01：备份名后缀跟随源文件（.json/.sqlite 两代并存）——
+                    # 内容是 sqlite 时叫 .pre-delete.json 会骗过按后缀分派的读回。
                     src_names = {Path(d.get("source") or "").name
                                  for d in (entry.get("datasets") or [])
                                  if isinstance(d, dict) and d.get("id") == datasetId}
                     prev_files = _snapshot_files_for(Path(data_dir), str(rid), datasetId)
-                    backup_src = next((p for p in prev_files if p == snap_path), None) \
-                        or next((p for p in prev_files if p.name.endswith(".added.json")), None) \
+                    backup_src = next((p for p in prev_files
+                                       if p.name.startswith(f"{stem}.replaced.")), None) \
+                        or next((p for p in prev_files
+                                 if p.name.startswith(f"{stem}.added.")), None) \
                         or next((p for p in prev_files if p.name in src_names), None)
                     if backup_src is not None:
-                        os.replace(backup_src, Path(data_dir) / f"{stem}.pre-delete.json")
+                        os.replace(backup_src, Path(data_dir)
+                                   / f"{stem}.pre-delete{backup_src.suffix or '.json'}")
                     cols = list(info.columns)
                     def _row_iter():
                         for rec in engine.execute(
                                 f'SELECT {", ".join(_quote(c) for c in cols)} '
                                 f'FROM {_quote(datasetId)}'):
                             yield [rec.get(c) for c in cols]
-                    write_dataset_snapshot(snap_path, cols, _row_iter())
+                    # XP-01：write_dataset_snapshot 按当前快照格式换后缀并返回实际
+                    # 路径——回填 snap_path，注册表 source 记的一定是真实文件。
+                    snap_path = write_dataset_snapshot(snap_path, cols, _row_iter())
                     rewritten += 1
                     rel = os.path.relpath(snap_path, registry.path.parent)
                     for d in (entry.get("datasets") or []):
@@ -2995,7 +3203,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             from pathlib import Path as _Path
             snap_path = _Path(data_dir) / (_snapshot_stem(ds_id) + ".added.json")
             try:
-                write_dataset_snapshot(snap_path, cols, rows)
+                # XP-01：按当前快照格式（缺省 sqlite）换后缀并返回实际路径——
+                # 回填 snap_path，注册表 source 记的一定是真实存在的文件。
+                snap_path = write_dataset_snapshot(snap_path, cols, rows)
             except OSError as exc:
                 raise BadRequest(
                     f"新增数据源的快照写盘失败：{exc}。引擎内已有该表，但重启会丢失；"
@@ -3052,9 +3262,11 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         else:
             input_path = queue_dir / f"replace-{token}.json"
             try:
-                write_dataset_snapshot(input_path,
-                                       (table or {}).get("columns") or [],
-                                       (table or {}).get("rows") or [])
+                # XP-01：按当前快照格式换后缀并返回实际路径——payload 里的
+                # inputName 必须是真实落盘文件名（worker 按它读回）。
+                input_path = write_dataset_snapshot(input_path,
+                                                    (table or {}).get("columns") or [],
+                                                    (table or {}).get("rows") or [])
             except OSError as exc:
                 raise BadRequest(f"无法持久化异步数据：{exc}") from exc
         payload = {"inputName": input_path.name, "mode": mode,
@@ -3457,8 +3669,8 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         if entry is None:
             raise NotFound(f"report {reportId!r} not registered")
         chain = [t for t in (rel.get("tables") or []) if isinstance(t, str)]
-        from .relations import (derived_entry, load_relation, relation_wide_semantics,
-                                wide_label, wide_manifest_dataset)
+        from .registry import (derived_entry, load_relation, relation_wide_semantics,
+                               wide_label, wide_manifest_dataset)
         try:
             # The merge runs under the report-namespace-free identity of each table
             # so its column NAMES equal what a build-time merge produces.
@@ -3600,18 +3812,28 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         if handler_is_post(_handler):
             body = read_json(_handler)
             data = body.get("data") or body
-            request = _chart_to_request(chart, data)
             # 图表缺 editor.data（历史/手写 manifest）→ 400 可行动报错，不是裸 KeyError 500。
             _chart_data = data if body.get("data") else (chart.get("editor") or {}).get("data")
             if not isinstance(_chart_data, dict) or not _chart_data.get("datasetId"):
                 raise BadRequest(f"chart {chartId!r} has no editor.data (datasetId unknown); 请重新构建或补全 manifest")
-            response = aggregate(engine, _chart_data.get("datasetId"), request)
+            _ds_id = _chart_data.get("datasetId")
+            payload = _chart_request_payload(chart, data)
+            # S2 数据面闸（XU-04）：图表聚合引用敏感列 → 400（含派生指标依赖展开
+            # 后的列）；无声明 = 零漂移。
+            assert_aggregate_privacy(payload, dataset_sensitive_cols(registry, _ds_id),
+                                     f"报告 {reportId} 图表 {chartId} 的聚合查询")
+            request = parse_request(payload)
+            response = aggregate(engine, _ds_id, request)
         else:
             _chart_data = (chart.get("editor") or {}).get("data")
             if not isinstance(_chart_data, dict) or not _chart_data.get("datasetId"):
                 raise BadRequest(f"chart {chartId!r} has no editor.data (datasetId unknown); 请重新构建或补全 manifest")
-            request = _chart_to_request(chart, _chart_data)
-            response = aggregate(engine, _chart_data.get("datasetId"), request)
+            _ds_id = _chart_data.get("datasetId")
+            payload = _chart_request_payload(chart, _chart_data)
+            assert_aggregate_privacy(payload, dataset_sensitive_cols(registry, _ds_id),
+                                     f"报告 {reportId} 图表 {chartId} 的聚合查询")
+            request = parse_request(payload)
+            response = aggregate(engine, _ds_id, request)
         respond_json(_handler, 200, response.to_dict())
 
     def h_chart_truth(_handler, reportId, chartId):
@@ -3640,6 +3862,15 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         info = engine.table_info(ds_id)
         if info is None:
             raise NotFound(f"dataset {ds_id!r} not loaded")
+        # S2 数据面闸（XU-04）：真值校验会按映射列重算并回显 recomputed 值——
+        # 映射/维度引用敏感列 → 400（否则敏感列的聚合读数从 results 泄漏）。
+        _s2_sensitive = dataset_sensitive_cols(registry, ds_id)
+        if _s2_sensitive:
+            _s2_truth_cols = [truth.get("dimension")] + [
+                (src.get("column", rc) if isinstance(src, dict) else src)
+                for rc, src in (truth.get("mapping") or {}).items()]
+            assert_not_sensitive(_s2_truth_cols, _s2_sensitive,
+                                 f"报告 {reportId} 图表 {chartId} 的数据真值校验")
         declared = _extract_declared_series(chart)
         result = validate_truth(engine, ds_id, truth, declared, tolerance)
         respond_json(_handler, 200, {"chartId": chartId, **result})
@@ -3668,7 +3899,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
         # sources would otherwise merge against nothing). Registry-declared
         # 计算列 ALSO replay across ALL entries here — the reload of one report
         # must not drop a column another report (sharing the table id) declares.
-        from .relations import replay_entry
+        from .registry import replay_entry
         for _ds in replay_columns(engine, registry, verbose=True):
             reloaded.append({"id": _ds, "derivedColumns": True})
         for item in replay_entry(engine, entry, verbose=True):
@@ -3975,7 +4206,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             # second pass: 计算列 (union over ALL entries — a table shared by
             # report copies must keep every report's declared column) + derived
             # wide tables (need their sources loaded)
-            from .relations import replay_entry
+            from .registry import replay_entry
             try:
                 replay_columns(engine, registry)
                 replay_entry(engine, entry)
@@ -4019,6 +4250,24 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                 raise BadRequest("tenantId declarations must agree")
             if tenant_values and body.get("tenantId") and not manifest.get("tenantId"):
                 manifest["tenantId"] = tenant_values[0]
+        # NC-02 冲突闸（2026-10-23，缺陷 #8 拍板 D2）：upsert 只在 **title 一致**
+        # 时放行（正常重建/月度刷新契约——否则现有报告全部无法重建）；title 不同
+        # 几乎必然是 slug 撞车（典型：历史遗留的通用 id "report"、手写的短 id）
+        # ——注册是按 reportId 整条覆盖，静默 upsert 会把别人报告的 manifest 连
+        # 数据一起洗掉（2026-10-20 课程交付破坏性实锤，靠 archived 备份恢复）。
+        # 拦下并给出可行动出口：换 --report-id / 请求顶层 reportId，或确认要
+        # 覆盖同一 id 时显式带 force=true（roadmap D2）。
+        _existing = registry.get(report_id)
+        if _existing is not None and not body.get("force"):
+            _new_title = (manifest.get("title") if isinstance(manifest, dict) else None) \
+                or body.get("title") or report_id
+            _old_manifest = _existing.get("manifest") if isinstance(_existing.get("manifest"), dict) else {}
+            _old_title = _old_manifest.get("title") or _existing.get("title") or report_id
+            if str(_new_title) != str(_old_title):
+                raise Conflict(
+                    f"reportId '{report_id}' 已被标题「{_old_title}」的报告占用，本次注册的标题是「{_new_title}」。"
+                    "为防静默覆盖已有报告：请改用 --report-id（或请求顶层 reportId）换一个 id 注册；"
+                    "确认要覆盖同一 id 时，在注册 payload 显式传 force=true 后重试。")
         multi = bool(body.get("multi"))
         ds_items = body.get("datasets")
         if isinstance(ds_items, list):
@@ -4061,7 +4310,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                         not [t for t in (rel.get("tables") or []) if isinstance(t, str)]:
                     raise BadRequest("relation-derived dataset requires derived.relation.tables "
                                      "(>=2 dataset ids)")
-                from .relations import wide_label
+                from .registry import wide_label
                 ds_infos.append({
                     "id": ds_id,
                     "label": str(ds.get("label") or wide_label(rel)),
@@ -4175,7 +4424,7 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             # 的源表重建（源表在同一 payload 的装载轮里已就位）。失败不拖垮
             # 注册（可行动 WARN；重启/管理页重载还会再试）；重建校正的
             # rowCount/manifest 回写注册表。
-            from .relations import replay_entry as _replay_wide
+            from .registry import replay_entry as _replay_wide
             entry = registry.get(report_id) or entry
             for item in _replay_wide(engine, entry, verbose=True):
                 print(f"[ai-report-server] rebuilt derived {item['id']!r} ({item['rowCount']} rows)")
@@ -4297,6 +4546,9 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
             except Exception:
                 continue
             report_dir = reg_path.parent.parent
+            # XP-01：磁盘占用列——快照数据目录与该注册表同级（统一 manager 下
+            # 即本机 state home；隔离 LRM_STATE_HOME 的测试注册表自然取各自的）。
+            reg_data_dir = reg_path.parent / "data"
             for e in reg.raw_entries():   # 报告管理每 10s 拉一次：绝不能深拷贝整份注册表
                 manifest = e.get("manifest") or {}
                 rid = str(e.get("reportId") or "")
@@ -4318,13 +4570,23 @@ def make_handlers(engine: Engine, registry: Registry) -> Router:
                     "startedAt": entry.get("startedAt"),
                     "urlLocal": f"http://127.0.0.1:{port}/reports/{rid}",
                     "urlLan": f"http://{lan}:{port}/reports/{rid}",
+                    # XP-01 磁盘列：该报告全部数据集快照文件字节和（失败按 0 计，
+                    # 绝不让 stat 抖动拖垮管理页）。
+                    "diskBytes": _report_disk_bytes(reg_data_dir, e),
                 }
                 policy = edit_policy_of(e)
                 row["editEnabled"] = bool(policy["enabled"])
                 if is_loopback(handler):
                     row["editPassword"] = policy["password"] if policy["enabled"] else ""
                 rows.append(row)
-        respond_json(handler, 200, {"reports": rows, "lanIp": lan})
+        # XP-01：顶层本机状态目录体量（data 快照 + db 表缓存），管理页页脚总量。
+        state_home = Path(registry.path.parent)
+        state_home_bytes = {
+            "dataBytes": _dir_file_bytes(state_home / "data"),
+            "dbBytes": _dir_file_bytes(state_home / "db"),
+        }
+        respond_json(handler, 200, {"reports": rows, "lanIp": lan,
+                                    "stateHome": state_home_bytes})
 
     def h_edit_policy_get(_handler, reportId):
         """Read one report's online-edit policy (报告管理页用，仅限本机回环）。"""
@@ -4590,17 +4852,12 @@ def _find_chart(entry: dict, chart_id: str) -> dict | None:
     return None
 
 
-def _chart_to_request(chart: dict, data: dict) -> Any:
-    """Translate chart.editor.data into an AggregateRequest.
+def _chart_request_payload(chart: dict, data: dict) -> dict:
+    """Build the aggregate JSON payload from chart.editor.data (see _chart_to_request).
 
-    聚合级派生指标（``derivedMeasures``：formula/window/share）在服务端没有对应列，
-    直接把派生名当 measure 列会 400「measure column not found」——调试端点曾因此对
-    任何含派生指标的图误报「图坏了」（客户端运行时不走此端点，只有外部脚本/调试直呼
-    会踩到）。与客户端 fetchAggregate/aggregateTable 同一契约：派生名是占位符、不在
-    服务端聚合列里；其 ``{agg,col}`` 依赖序列按 derived_eval.required_aggregations
-    展开成额外 measure 一并返回，派生值仍由调用方在聚合结果上求值（derivedEvaluate），
-    服务端绝不求值派生指标（AGENTS：derived.measures 不进注册表表声明）。
-    """
+    Split from _chart_to_request so the S2 data-plane gate can inspect the raw
+    column references (groupBy/measures/filter/orderBy/bucket.source) before
+    parse_request consumes them."""
     measures = [m for m in (data.get("measures") or []) if isinstance(m, str)]
     measure_items = [{"column": m, "aggregation": data.get("aggregation", "sum")} for m in measures]
     derived_map = data.get("derivedMeasures")
@@ -4635,7 +4892,21 @@ def _chart_to_request(chart: dict, data: dict) -> Any:
     bucket = data.get("dimensionBucket")
     if bucket:
         payload["bucket"] = bucket
-    return parse_request(payload)
+    return payload
+
+
+def _chart_to_request(chart: dict, data: dict) -> Any:
+    """Translate chart.editor.data into an AggregateRequest.
+
+    聚合级派生指标（``derivedMeasures``：formula/window/share）在服务端没有对应列，
+    直接把派生名当 measure 列会 400「measure column not found」——调试端点曾因此对
+    任何含派生指标的图误报「图坏了」（客户端运行时不走此端点，只有外部脚本/调试直呼
+    会踩到）。与客户端 fetchAggregate/aggregateTable 同一契约：派生名是占位符、不在
+    服务端聚合列里；其 ``{agg,col}`` 依赖序列按 derived_eval.required_aggregations
+    展开成额外 measure 一并返回，派生值仍由调用方在聚合结果上求值（derivedEvaluate），
+    服务端绝不求值派生指标（AGENTS：derived.measures 不进注册表表声明）。
+    """
+    return parse_request(_chart_request_payload(chart, data))
 
 
 def _server_strip(manifest: dict) -> dict:
@@ -4742,6 +5013,55 @@ def _snapshot_files_for(data_dir: Path, reportId: str, datasetId: str) -> list[P
                 hits.append(p)
                 break
     return hits
+
+
+def _dir_file_bytes(d: Path) -> int:
+    """Total bytes of regular files directly inside ``d`` (missing → 0)."""
+    total = 0
+    try:
+        for p in d.iterdir():
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def _report_disk_bytes(data_dir: Path, entry: dict) -> int:
+    """One report's snapshot disk usage = byte sum of its dataset snapshot files.
+
+    Files are collected with the SAME matcher the reload/cleanup pipeline uses
+    (``_snapshot_files_for``: replaced/added/pre-delete/构建期 ns 前缀，json 与
+    sqlite 两代后缀都接）, over both the registry accounting ids and the
+    manifest dataset ids (记账可能落后于 manifest —— 真删以 manifest 为权威，
+    磁盘占用则两边都算，报告主人看到的是真实占地的总和). Shared tables count
+    once per report (dedup by path inside one report; cross-report attribution
+    intentionally double-counts — each report's row answers「这份报告占多少」).
+    """
+    rid = str(entry.get("reportId") or "")
+    ids: list[str] = []
+    for d in (entry.get("datasets") or []):
+        if isinstance(d, dict) and d.get("id") and str(d["id"]) not in ids:
+            ids.append(str(d["id"]))
+    for d in ((entry.get("manifest") or {}).get("datasets") or []):
+        if isinstance(d, dict) and d.get("id") and str(d["id"]) not in ids:
+            ids.append(str(d["id"]))
+    seen: set[str] = set()
+    total = 0
+    for ds_id in ids:
+        for p in _snapshot_files_for(data_dir, rid, ds_id):
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
 
 
 def _physical_tables(engine: Engine) -> dict[str, dict[str, Any]]:
@@ -4915,15 +5235,13 @@ def _is_derived_ds(d: dict) -> bool:
 
     NOTE: a 计算列 ('columns') entry is NOT this kind — it keeps its raw source
     and is reloaded normally; its declaration is replayed in the second pass
-    (server/derived_columns.py), never here.
+    (store.replay_all — former server/derived_columns.py), never here.
     """
     return isinstance(d, dict) and (d.get("derived") or {}).get("kind") == "relation"
 
 
 def _reload_dataset(engine, d: dict, registry: Registry | None = None) -> TableInfo | None:
     """Re-read a dataset from disk and reload into the engine."""
-    from .loader import load_table_file
-
     src = d.get("source")
     if not src:
         return None
@@ -4933,15 +5251,24 @@ def _reload_dataset(engine, d: dict, registry: Registry | None = None) -> TableI
         p = registry.path.parent / p
     if not p.exists():
         return None
+    # XP-01：装载统一走 store.engine_load_from_snapshot——.json 走 canonical
+    # 装载器（历史行为逐位一致），.sqlite 快照走 ATTACH 拷贝，csv/xlsx 源拷贝
+    # 照旧；DuckDB 等无该能力的引擎自动落回旧路径。失败语义与旧实现对齐：
+    # 快照读不出/不存在 → None（该数据集跳过，不 500 整个重载，引擎旧表原样
+    # 保留——先解析后落表）；表结构错误（TableSchemaError，旧 load_table 的
+    # 传播类）照旧向上抛。DROP+CREATE 由 load_table/_load_sqlite_snapshot 内部
+    # 完成，此处不再显式 pre-drop（旧实现 pre-drop 会把「解析失败」放大成
+    # 「连旧表一起丢」，非本批语义）。
+    from .store import engine_load_from_snapshot
     try:
-        table = load_table_file(p)
+        # 索引列声明随注册表 meta 透传（h_register 持久化）：重载是 DROP+CREATE，
+        # 不带回 = 索引悄悄消失（与 run_server._reload_all 同一条契约）。
+        return engine_load_from_snapshot(engine, d["id"], p,
+                                         index_columns=list(d.get("indexColumns") or []))
+    except TableSchemaError:
+        raise
     except Exception:
         return None
-    engine.drop_table(d["id"])
-    # 索引列声明随注册表 meta 透传（h_register 持久化）：重载是 DROP+CREATE，
-    # 不带回 = 索引悄悄消失（与 run_server._reload_all 同一条契约）。
-    return engine.load_table(d["id"], table["columns"], table["rows"],
-                             index_columns=list(d.get("indexColumns") or []))
 
 
 def _namespace_manifest(manifest: dict, old_id: str, new_id: str) -> dict:

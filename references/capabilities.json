@@ -287,7 +287,7 @@
       "permissions": [
         "viewer"
       ],
-      "verification": "authored/manifest aliases are accepted; inferred aliases remain requiresConfirmation until explicit confirmation, which emits an editor-approved proposal; sensitive/conflicting aliases fail closed"
+      "verification": "authored/manifest aliases are accepted; inferred aliases remain requiresConfirmation until explicit confirmation, which emits an editor-approved proposal; sensitive/conflicting aliases fail closed; applied confirmations feed a local cross-report learning directory (state-home alias-learning.sqlite3) that only ever returns read-only source=learned suggestions — confidence capped at 0.9, requiresConfirmation always true, sensitive columns never learned (LRM_ALIAS_LEARNING=0 disables)"
     },
     {
       "id": "agent-impact-graph",
@@ -331,6 +331,39 @@
         "model-admin"
       ],
       "verification": "server-only bounded provider /models discovery returns legal model IDs without exposing API keys or silently aliasing unknown models; final Chat Completions test remains authoritative"
+    },
+    {
+      "id": "agent-derived-measure-proposal",
+      "phrases": [
+        "加一个派生指标",
+        "断销有货国家数",
+        "造一个筛选指标",
+        "新增公式指标",
+        "加一个环比指标"
+      ],
+      "support": "agent",
+      "tool": "propose_derived_measure → proposals/validate → approve → apply",
+      "permissions": [
+        "viewer",
+        "editor"
+      ],
+      "verification": "scripts/derived_model is the single validator (重名/未知列/DAG 循环/窗口 timeField/filtered 谓词白名单 col-vs-column)；敏感列闭包 fail-closed；应用走 metadataOnly ProposalTransaction（snapshot/hash/rollback），回滚后 manifest 还原"
+    },
+    {
+      "id": "agent-psi-domain-pack",
+      "phrases": [
+        "库存勾稽",
+        "期末库存对不上",
+        "在库周数",
+        "断销有货",
+        "有货无销"
+      ],
+      "support": "agent",
+      "tool": "psi_balance_check + inventory_weeks + stockout_scan",
+      "permissions": [
+        "viewer"
+      ],
+      "verification": "columns are caller-declared (never guessed); balance reconciles with tiered tolerance (relative 1e-6 + absolute 0.5, optional tolerance/absTolerance args, applied pair reported as toleranceUsed) and marks the first period unverifiable instead of inventing an opening stock; weeks-of-supply states its 52/12 week conversion in evidence.assumptions; stockout_scan supports granularity=sum (default, in-group netting) and granularity=row (per-row verdict with row counts/ratio and bounded hit samples ≤50), bounded top-N and over-limit scans fail closed; evidence carries provenance with causalClaim=false and PSI CSV truth reconciliation is 0-error"
     }
   ]
 }

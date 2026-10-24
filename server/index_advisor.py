@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .store import Engine
-from .types import AggregateRequest
+from ._platform import AggregateRequest
 
 
 MAX_QUERY_SHAPES = 256

@@ -213,6 +213,17 @@ def preview_plan(plan: Mapping[str, Any], entry: Mapping[str, Any]) -> list[dict
                 item["kind"] = "proposal"
                 item["valid"] = False
                 item["error"] = str(exc)[:300]
+        elif tool in {"propose_derived_measure", "propose_alias_confirmation"}:
+            # 元数据类 proposal（造指标/别名确认）与图表 proposal 共用同一
+            # validate_proposal 分派（kind 驱动）；预览只读，不写 manifest。
+            try:
+                from .agent_proposals import validate_proposal
+                item["kind"] = "proposal"
+                item["proposal"] = validate_proposal(entry, args)
+            except Exception as exc:
+                item["kind"] = "proposal"
+                item["valid"] = False
+                item["error"] = str(exc)[:300]
         elif tool == "propose_multi_card_change":
             item["kind"] = "proposal"
             raw = args.get("proposals") if isinstance(args, Mapping) else None

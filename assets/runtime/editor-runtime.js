@@ -1,5 +1,17 @@
+// ============================================================================ 
+// editor-runtime.js —— 报告运行时唯一脚本（编辑态 + 只读态；IIFE，零构建零拆分）。
+// region 地图：自第一个 #region 起全文件被 region 连续铺满（本头注释块除外）。
+//   清册/所有权：docs/runtime-region-map-2026-10-24.md（由 tools/region_map.py 生成，勿手改）
+//   校验：python3 tools/region_map.py --check    触达映射：python3 tools/region_map.py --touched
+// 所有权规则：单写者；改动某 region 必须通过其 [tests: …] 契约测试；[tests: -] 的
+//   region 无专属契约测试——改动即跑全量 JS（run_tests --changed 的机械映射保持诚实）。
+// 标记语法：// #region NAME —— 一句话职责 [tests: a.cjs, b.cjs] [lane: x]  /  // #endregion NAME
+//   历史 17 对 NAME_BEGIN/NAME_END（含 UPSERT_MERGE 的 ==== 变体）是 tests/*.cjs
+//   逐字 indexOf 的切片锚点，属契约本体：只追加尾注，绝不改名。
+// ============================================================================ 
 (function(global){
   'use strict';
+  // #region RUNTIME_BOOT_CORE —— 启动前导（只读标记/manifest 解析/KPI 对比读数剥离/编辑快照）·服务端管线（serverBase/聚合预取）·统一文本段落模型·未保存提示与撤销栈·ESC 栈与弹窗基线·清单同步与布局回写 [tests: test_undo.cjs, test_rich_text_editing.cjs, test_ux_round2_editor.cjs, test_bugfix_sweep.cjs, test_interaction.cjs] [lane: core]
   // Read-only export: the downloading code stamps <body data-ai-report-readonly>
   // on a read-only copy. We must NOT bail the whole runtime — the read-only
   // report still needs GridStack layout + ECharts rendering. Instead we set a
@@ -687,7 +699,8 @@
       if(b)b.layout=next[id];
     });
   }
-  // #region COLUMN_UNIVERSE_BEGIN
+  // #endregion RUNTIME_BOOT_CORE
+  // #region COLUMN_UNIVERSE_BEGIN —— 列宇宙并集（ensureEditorData 唯一消费点：数据集列+图表合成列去重拼接） [tests: test_refresh_bigtable.cjs] [lane: table]
   // 列宇宙并集（ensureEditorData 唯一消费点）：数据集列在前（行数组下标对齐，
   // 物化计算列/维度值分组列在编译期之后追加也落在行尾），图表自有合成列（pivot
   // 固定组合的度量列等）按原相对顺序追加在后。支持 schema 对象 [{name,type}]
@@ -700,6 +713,7 @@
     return out;
   }
   // #endregion COLUMN_UNIVERSE_END
+  // #region EDITOR_DATA_CORE —— ensureEditorData 编辑数据窗格归一（列/角色/度量/派生闭包）+ 合并单元格 run + 明细跳转 + 分页按钮 HTML [tests: test_table_headers.cjs, test_table_row_forms.cjs, test_table_detail.cjs, test_kpi_panel.cjs, test_click_drill.cjs] [lane: table]
   function ensureEditorData(chart){
     chart.editor=chart.editor||{};
     if(chart.editor.editable===false)return null;
@@ -775,7 +789,19 @@
         var _dmByName={},_dmUsed={},_dmAny=false;
         _dmNodes.forEach(function(n){if(n&&n.name)_dmByName[n.name]=n;});
         (selection.measures||[]).forEach(function(m){if(_dmByName[m]){_dmUsed[m]=_dmByName[m];_dmAny=true;}});
-        if(_dmAny)merged.derivedMeasures=_dmUsed;else delete merged.derivedMeasures;
+        if(_dmAny){
+          // 沿 {ref} 闭包补依赖节点（与 syncChartDerivedMeasures / 编译侧
+          // derived_eval.closure_nodes 同一语义，NC-03 #2）：公式节点引用 filtered
+          // /另一公式而依赖不上图时（线上占比 = 线上销售额 ÷ SUM(销售额)），只烘
+          // used 会让 required_aggregations 把引用名当普通列下发——单文件本地
+          // groupSeries 取不到「线上销售额」列 → 依赖序列全 null → 整卡空态
+          // 「暂时没有可展示的数据」（审计 paintedContent 还绿，静默失败）。
+          // 编译期烘的闭包快照在这里被按当前 measures 重建，闭包必须在重建时补全。
+          var _dmUsedList=Object.keys(_dmUsed).map(function(k){return _dmUsed[k];});
+          var _dmClosed=(adapter.derivedClosureNodes?adapter.derivedClosureNodes(_dmUsedList,_dmNodes):_dmUsedList);
+          merged.derivedMeasures={};
+          _dmClosed.forEach(function(n){if(n&&n.name)merged.derivedMeasures[n.name]=n;});
+        }else delete merged.derivedMeasures;
       }else delete merged.derivedMeasures;
       merged.remote=!Array.isArray(dataset.rows);var ownCols=(merged.columns||[]).map(function(c){return (c&&typeof c==='object')?(c.name||''):c;});var dk=manifest.dimensionKeys||{};var scoped=reportFilter.map(function(f){if(!f)return null;if(f.dimensionKey){var group=dk[f.dimensionKey]||{};var col=null;(group.tables||[]).forEach(function(t){if(t.datasetId===selection.datasetId)col=t.column;});return (col!=null&&ownCols.indexOf(col)>=0)?{column:col,op:f.op,value:f.value}:null;}return ownCols.indexOf(f.column)>=0?f:null;}).filter(Boolean);merged.filter=(selection.filter||[]).concat(scoped);
       // 时间角色桥接（JS 管道修复批 P2-1/P1-2/P1-1 列序共因）：server 模式数据
@@ -878,13 +904,13 @@
   }
   // WP-2：档位集合进纯函数区（TABLE_PAGE_SIZES）；sizes 缺省=全档（旧调用方零变化）。
   function pageSizeSelectHtml(cur,sizes){return tablePageSizeSelHtml(cur,'grid-page-size',sizes);}
+  // #endregion EDITOR_DATA_CORE
+  // #region TABLE_COLWIDTH_BEGIN —— 表格列宽纯函数区（colWidths 读写/clamp/colgroup HTML；pure: no DOM/timer access，沙箱整段求值） [tests: test_table_detail.cjs, test_page_width.cjs] [lane: table]
   // ---- 表格列宽（Excel 式可调列宽，编辑态与阅读态都能用）----------------------
   // 每一列都可拖拽调宽：最小 COL_W_MIN（再窄就没法读），默认不写宽度时由浏览器按剩余
   // 空间均分；一旦用户拖过/双击过，宽度就写进 chart.editor.table.colWidths[col]
   // （随 manifest 落盘，reload/导出/放映都还原）。**超长列值不再撑变形整张表**——
   // 表格走 table-layout:fixed（CSS），值换行显示，列宽始终由列宽决定。
-  // #region TABLE_COLWIDTH_BEGIN  (pure: no DOM/timer access — tests/test_table_detail.cjs
-  // evaluates this block directly to guard the width contract)
   var COL_W_MIN=64, COL_W_DEFAULT=120, COL_W_MAX=800;
   function colWidthsOf(settings){return (settings&&settings.colWidths)||{};}
   function clampColWidth(w){w=Number(w);if(!isFinite(w)||w<=0)return null;return Math.max(COL_W_MIN,Math.min(COL_W_MAX,Math.round(w)));}
@@ -904,8 +930,7 @@
   // 列头右缘的拖拽手柄（每张表的每个数据列都有）。
   function colResizerHtml(col){return '<span class="ai-col-resizer" data-col="'+escapeHtml(col)+'" title="拖拽调列宽 · 双击自适应"></span>';}
   // #endregion TABLE_COLWIDTH_END
-  // #region TABLE_DISPLAY_BEGIN  (pure: no DOM access — tests/test_table_display.cjs
-  // evaluates this block directly; WP-1 表格显示层速赢批, docs/product-iteration-plan.md §2.2/§3)
+  // #region TABLE_DISPLAY_BEGIN —— 表格显示层纯函数区（密度/换行/对齐/序号列/卡高三态；pure: no DOM access，沙箱整段求值） [tests: test_table_display.cjs, test_bounded_table.cjs] [lane: table]
   // editor.table 显示层键：density / align / headStyle / wrapText / rankLabel /
   // rankHideOnTotal。全部是**卡级显示层**——运行时把变量与开关写在
   // .ai-report-table-wrap 的内联 style 与 data-* 上，消费端在 editor-runtime.css
@@ -954,19 +979,52 @@
     v.attrs.replace(/([a-zA-Z-]+)="([^"]*)"/g,function(_,k,val){w.setAttribute(k,val);return '';});
   }
   // ---- WP-7 卡高三态（docs/wp7-bounded-height-design.md §2）--------------------
-  // heightMode ∈ grow(缺省，含全部旧报告)|fixed(=manualH 既有语义收编)|{bounded:{maxPx}}。
-  // 未知值一律收敛 grow（colFitModeOf 同款）——三态语义的唯一读取口。
+  // heightMode ∈ grow(缺省，含全部旧报告)|fixed(=manualH 既有语义收编)|
+  // {bounded:{maxPx}} | {bounded:{maxBodyRows}}（XU-01 行数口径，与 maxPx 互斥声明；
+  // 两者都给 → maxBodyRows 优先并 console.warn 一次）。未知值一律收敛 grow
+  // （colFitModeOf 同款）——三态语义的唯一读取口。
   //   grow    = 现状 autoFitTableCards 生长，无 max-height、无 sticky（产物零变化）；
   //   fixed   = 不建第二套高度引擎：块级 manualH/hPx + .ai-fixh（captureManualResize）
   //             就是真身，这里只是声明层口径；切走保留 manualH 数据、切回即恢复；
   //   bounded = wrap max-height + 卡内滚动 + sticky thead 冻结表头（CSS [data-bounded]
   //             作用域消费）。sticky 只锚在有界 scroll 容器（wrap）里，绝不吸视口顶。
   var TABLE_BOUNDS_PRESETS=[352,672,1632];
+  // XU-01 行数→px 换算缺省常量：与 validate_report.ROW_HEIGHT_PX / HEADER_HEIGHT_PX
+  // 同源（28/28，静态编译行高）。真实渲染行高随密度档（32/40/48）——渲染后由
+  // autoFitTableCards 有界分支用实测 tbody tr 高度校正重写 max-height（密度/字号
+  // 变化自愈）；编译侧 layout_solver._bounded_max_px 用同一张期望表（PY↔JS parity
+  // 由 tests/test_bounded_table.{cjs,py} 双端锁，编译侧恒用缺省行高保证确定性）。
+  var TABLE_ROW_HEIGHT_PX=28;
+  var TABLE_HEADER_HEIGHT_PX=28;
+  var TABLE_MAX_BODY_ROWS=[5,500];
+  // 行数口径换算（唯一实现；heightModeOf 初始换算与 autoFitTableCards 实测校正共用）：
+  // maxPx = N × 行高 + thead 高。rowPx/headPx 缺省 28/28（validate_report 同源）。
+  function boundedRowsMaxPx(n,rowPx,headPx){
+    var r=Math.round(Number(n));
+    if(!(r>0))return 0;
+    var rp=(Number(rowPx)>0)?Number(rowPx):TABLE_ROW_HEIGHT_PX;
+    var hp=(Number(headPx)>0)?Number(headPx):TABLE_HEADER_HEIGHT_PX;
+    return r*rp+hp;
+  }
+  // 「两者都给」的 warn 只发一次（会话级；运行时容错口径，请求层 validate_request
+  // 对双键直接报错——这里兜的是手写 manifest/旧副本）。
+  var _boundedBothWarned=false;
   function heightModeOf(settings){
     var hm=settings&&settings.heightMode;
     if(hm==='fixed')return {mode:'fixed',maxPx:0};
     if(hm&&typeof hm==='object'&&!Array.isArray(hm)&&hm.bounded){
-      var raw=hm.bounded.maxPx;
+      var b=hm.bounded;
+      // XU-01 行数口径：int 5..500（validate_request 同白名单），越界/非数落回
+      // maxPx 通道（fail-closed 不猜）。maxPx 同给 → 行数优先（warn 一次）。
+      var rawRows=b.maxBodyRows;
+      if(typeof rawRows==='number'&&isFinite(rawRows)){
+        var rr=Math.round(rawRows);
+        if(rr>=TABLE_MAX_BODY_ROWS[0]&&rr<=TABLE_MAX_BODY_ROWS[1]){
+          if(b.maxPx!=null&&!_boundedBothWarned){_boundedBothWarned=true;try{console.warn('[ai-report] table.heightMode.bounded 同时声明了 maxPx 与 maxBodyRows，按行数（maxBodyRows）优先。');}catch(_e){}}
+          return {mode:'bounded',maxPx:boundedRowsMaxPx(rr),maxBodyRows:rr};
+        }
+      }
+      var raw=b.maxPx;
       // 只认 number（validate_request isint 同口径）；数字字符串/越界一律 grow。
       if(typeof raw==='number'&&isFinite(raw)){
         var mx=Math.round(raw);
@@ -993,7 +1051,7 @@
         ?'固定高度：当前 '+Number(blk.hPx||0)+'px，拖拽卡片底缘可调整。'
         :'固定高度：拖拽卡片底缘设定高度（「适应内容」控件可解除）。';
     }
-    if(hm&&hm.mode==='bounded')return '有界高度：表格在卡内滚动、表头冻结；与「显示行数」分页相互独立（滚动发生在页容量之内）。';
+    if(hm&&hm.mode==='bounded')return '有界高度：表格在卡内滚动、表头冻结；与「显示行数」分页相互独立（滚动发生在页容量之内）。'+(hm.maxBodyRows!=null?('本卡上限按行数设定（'+hm.maxBodyRows+' 行）。'):'');
     return '';
   }
   // headStyle.hideColHead：整条列表头（thead）不渲染；colgroup 保留（列宽体系不变）。
@@ -1033,6 +1091,7 @@
     return rankHideOnTotalOf(settings)?'':'<td></td>';
   }
   // #endregion TABLE_DISPLAY_END
+  // #region TABLE_COLRESIZE_RUNTIME —— 列宽运行时：canvas 量宽自适应/拖拽提交/横滚提示/bindColResize（applyAutoColFit 唯一出口） [tests: test_table_detail.cjs, test_page_width.cjs] [lane: table]
   function measureTextPx(text,font){
     try{
       var cv=measureTextPx.__c||(measureTextPx.__c=document.createElement('canvas'));
@@ -1177,7 +1236,8 @@
       applyAutoColFit(host,chart);
     });
   }
-  // #region SESSION_VIEW_BEGIN —— 会话视图态容器（WP-8 最小实现；WP-10 扩展）----
+  // #endregion TABLE_COLRESIZE_RUNTIME
+  // #region SESSION_VIEW_BEGIN —— 会话视图态容器（WP-8 最小实现；WP-10 扩展；读者折叠/字段自选/排序态不进 manifest） [tests: test_session_view.cjs, test_filter_zone.cjs] [lane: session]
   // 折叠态是「看报告的人」的视图状态，不是报告内容：**不进 manifest**。容器挂在
   // 模块级 __sessionViews（blockId → 状态对象）；chart.__sessionView 用**不可枚举**
   // getter/setter 暴露同一对象——JSON.stringify(manifest) 只序列化可枚举自有属性，
@@ -1336,6 +1396,7 @@
     });
   }
   // #endregion SESSION_VIEW_END
+  // #region TABLE_HOST_BIND —— 表格卡宿主事件绑定总入口 bindTableHost（每次渲染重绑；格级动作→行跳转） [tests: test_table_detail.cjs, test_session_view.cjs, test_table_row_forms.cjs, test_full_review_batch.cjs] [lane: table]
   function bindTableHost(host,chart,data){
     // 每次渲染都重绑：闭包捕获的 `data`（维度/breakdown/measures）在上一轮渲染后
     // 会过期，旧实现用 host.__tableBound 只绑一次，导致「改完维度再点维度2行」
@@ -1474,12 +1535,13 @@
     });
   }
   function bdOf(data){return (data.roles||{}).breakdown||null;}
+  // #endregion TABLE_HOST_BIND
+  // #region TABLE_XLSX_BEGIN —— 表格卡筛选/排序谓词 + 最小 xlsx writer（STORE zip + inline strings + 样式）纯函数区（不触 DOM） [tests: test_table_detail.cjs, test_filter_zone.cjs, test_filter_convergence.cjs, test_cond_format_engine.cjs] [lane: table]
   // ---- 表格 Excel 对齐（阅读态交互）：列头筛选 / 多级排序 / 导出 xlsx ----------
   // 交互原则（用户决策）：排序/筛选/导出是「看报告的人」的操作，直接显性化在卡片
   // 上（表格工具条 + 列头漏斗），阅读态可用；编辑侧边栏只留字段口径配置。
   // 下面到 TABLE_XLSX_END 为纯函数区（不触 DOM/外部闭包），
   // tests/test_table_detail.cjs 在标记之间整段求值守护行为。
-  // #region TABLE_XLSX_BEGIN
   var TABLE_FILTER_VALUE_CAP=500; // 值域勾选列表去重值上限；超出用面板内搜索
   // 规范化 chart.editor.table.columnFilters：丢弃非法/空约束。
   function tableColumnFiltersOf(table){
@@ -1816,7 +1878,7 @@
     return zipStore(Object.keys(parts).map(function(name){return {name:name,data:utf8Bytes(parts[name])};}));
   }
   // #endregion TABLE_XLSX_END
-  // #region TABLE_HEADERS_BEGIN —— 聚合表「中国式表头 / 合并同类单元格 / 总小计」纯函数区
+  // #region TABLE_HEADERS_BEGIN —— 聚合表「中国式表头 / 合并同类单元格 / 总小计」纯函数区 [tests: test_table_headers.cjs, test_measure_names.cjs, test_filter_zone.cjs, test_table_row3.cjs] [lane: table]
   // （不触 DOM、不引用闭包；tests/test_table_headers.cjs 在标记之间整段求值守护。
   //   批次一：交叉矩阵双度量两级表头 + 行总计列 + 合计行位置/别名 + 合并同类单元格。
   //   语义边界（docs/data-table-capability-plan.md §1）：数据表合并 = 显示层、渲染期推导，
@@ -2686,7 +2748,7 @@
     return out;
   }
   // #endregion TABLE_HEADERS_END
-  // #region TABLE_TOTAL_CALC_BEGIN —— WP-11 总计计算方式 + 行小计列（纯函数区，不触 DOM；
+  // #region TABLE_TOTAL_CALC_BEGIN —— WP-11 总计计算方式 + 行小计列（纯函数区，不触 DOM；PY 镜像 parity） [tests: test_total_calc_js.cjs, test_correctness_js_batch.cjs] [lane: table]
   //   tests/test_total_calc_js.cjs 在标记之间整段求值）。
   //   Python 地基（2026-09-15 已落地）= spec_to_report._effective_table_total_calc/_static_total_row
   //   + server/aggregator totalCalc 载荷（tests/test_table_total_calc.py 锁 PY 侧与 PY↔SQL parity）。
@@ -2792,8 +2854,98 @@
     var aggs=(data&&data.aggregations&&typeof data.aggregations==='object'&&!Array.isArray(data.aggregations))?data.aggregations:null;
     return (aggs&&aggs[m])||(data&&data.aggregation)||'sum';
   }
+  // 派生列的合计行（NC-03 #6，fixture correctness-parity-v1.json
+  // `table_total_derived_ratio`）：**公式派生列的合计 = 依赖列合计后重求公式**——
+  // 客单价 = SUM(销售额) ÷ SUM(订单数)，样例两行（1000/10、2000/40）全量合计 =
+  // 3000 ÷ 50 = 60；对逐行比率求 SUM（100 + 50 = 150）是错的（比率不可加，对齐
+  // AGENTS「_bucket_static_rows 不得再聚合派生列」同款原则，GLM 实锤过 ¥14,898
+  // 假合计）。窗口（prev/cum/ytd/rank）与 share 的合计不可由依赖合计重求 →
+  // null（渲染 —）；filtered 保持既有列合计口径（sum/count 可加；countd 跨组
+  // 去重失真属既有行为，不在本批扩大）。totalCalc 声明对派生列本就被
+  // effectiveTotalCalc 静默忽略（derived 闸），落到这里同理 = 重求而非聚合。
+  // 纯函数：不触 DOM / 适配器——原始行池聚合经 rawRows 参数传入。PY 镜像 =
+  // spec_to_report._static_total_row（NC-01 同一 fixture 双端锁）。
+  function derivedTotalRowValues(data,measures,colTotals,rawRows){
+    var out={};
+    var nodes=(data&&data.derivedMeasures)||null;
+    var names=Array.isArray(measures)?measures:[];
+    if(!nodes||!names.length)return out;
+    var cols=(data.columns||[]).map(function(c){return (c&&typeof c==='object')?(c.name||''):c;});
+    function depAgg(dep){return (dep&&dep.agg)||'sum';}
+    // 依赖列合计：{agg:'sum'} 且列在表上 → colTotals（恒为全量过滤行集的 SUM，
+    // 4902/4553 两处同口径）；其余聚合或列不上表 → 原始行池聚合（totalCalcLocalRow
+    // 同一套 NULL 语义：空串/非数值不进池；count 空池 0、average/min/max 空池 null）。
+    // server 模式（schema-only，rawRows=null）且依赖不上表 → undefined（合计不可得）。
+    function depTotal(dep){
+      if(!dep||dep.col==null)return undefined;
+      var mi=names.indexOf(dep.col);
+      if(mi>=0&&depAgg(dep)==='sum'){
+        var t=colTotals?colTotals[mi]:null;
+        return (t==null||!isFinite(Number(t)))?null:Number(t);
+      }
+      if(!Array.isArray(rawRows))return undefined;
+      var ci=cols.indexOf(dep.col);
+      if(depAgg(dep)==='count')return rawRows.length;
+      if(ci<0&&depAgg(dep)!=='countd')return undefined;
+      var pool=[],seen={};
+      rawRows.forEach(function(r){
+        var v=r?r[ci]:null;
+        if(depAgg(dep)==='countd'){if(v!=null)seen[String(v)]=1;return;}
+        if(v==null)return;
+        if(typeof v==='string'&&!v.trim())return;
+        var n=Number(v);
+        if(typeof v!=='boolean'&&isFinite(n))pool.push(n);
+      });
+      if(depAgg(dep)==='countd')return Object.keys(seen).length;
+      if(depAgg(dep)==='sum')return pool.length?pool.reduce(function(a,b){return a+b;},0):0;
+      if(!pool.length)return null;
+      if(depAgg(dep)==='average')return pool.reduce(function(a,b){return a+b;},0)/pool.length;
+      if(depAgg(dep)==='min')return Math.min.apply(null,pool);
+      if(depAgg(dep)==='max')return Math.max.apply(null,pool);
+      return null;
+    }
+    // 合计量级上的公式求值（derived_eval evalExpr 的合计版）：{agg,col} 叶 →
+    // 依赖合计；{ref} → 其他公式列的合计（多轮迭代解声明顺序无关的引用链）；
+    // div 0 / 空池 → null（—）。undefined = 本轮还解不出（留给下一轮）。
+    function evalTotalExpr(node,ctx){
+      if(!node||typeof node!=='object')return null;
+      if(node.const!==undefined){var c=Number(node.const);return isFinite(c)?c:null;}
+      if(node.ref!==undefined){return Object.prototype.hasOwnProperty.call(ctx,node.ref)?ctx[node.ref]:undefined;}
+      if(node.col!==undefined)return depTotal(node);
+      var l=evalTotalExpr(node.left,ctx),r=evalTotalExpr(node.right,ctx);
+      if(l===undefined||r===undefined)return undefined;
+      if(l===null||r===null)return null;
+      if(node.op==='add')return l+r;
+      if(node.op==='sub')return l-r;
+      if(node.op==='mul')return l*r;
+      if(node.op==='div')return r===0?null:l/r;
+      return null;
+    }
+    var formulaNames=names.filter(function(n){return !!(nodes[n]&&nodes[n].kind==='formula');});
+    var ctx={};
+    for(var pass=0;pass<3&&formulaNames.length;pass+=1){
+      var remaining=[];
+      formulaNames.forEach(function(name){
+        var v=evalTotalExpr(nodes[name].expr||{},ctx);
+        if(v===undefined){remaining.push(name);return;}
+        ctx[name]=v;
+      });
+      formulaNames=remaining;
+    }
+    formulaNames.forEach(function(name){ctx[name]=null;});   // 引用链解不出 → —
+    names.forEach(function(n){
+      var node=nodes[n];
+      if(!node)return;
+      if(node.kind==='formula'){out[n]=Object.prototype.hasOwnProperty.call(ctx,n)?ctx[n]:null;return;}
+      // 窗口/占比：跨期/占比语义在合计量级上无定义，显式 null（与 nonAdditive
+      // skip 闸同口径，双保险——hedge 非 rate 窗口漏判 additive 的形状）。
+      if(node.kind==='window'||node.kind==='share'){out[n]=null;}
+      // filtered：缺席 = 维持既有列合计口径。
+    });
+    return out;
+  }
   // #endregion TABLE_TOTAL_CALC_END
-  // #region TABLE_SUB_MEASURES_BEGIN —— 副指标（交叉表内嵌同环比对比列，WP-5，
+  // #region TABLE_SUB_MEASURES_BEGIN —— 副指标（交叉表内嵌同环比对比列，WP-5；纯函数区） [tests: test_sub_measures.cjs, test_sparkline.cjs] [lane: table]
   // docs/product-iteration-plan.md §2.2/§3；tests/test_sub_measures.cjs 在标记之间整段
   // 求值守护）。纯函数区：不触 DOM、不引用闭包——adapter.derivedEvaluate /
   // adapter.derivedAggKey / 列别名 / fmtVal 全部由 ctx 注入，沙箱可换桩。
@@ -2966,7 +3118,7 @@
     return {num:n,fmt:{kind:'num',dec:(dec==null?0:dec)},text:String(n)};
   }
   // #endregion TABLE_SUB_MEASURES_END
-  // #region TABLE_SPARKLINE_BEGIN —— 迷你图趋势列（WP-9，docs/product-iteration-plan.md
+  // #region TABLE_SPARKLINE_BEGIN —— 迷你图趋势列（WP-9；时间 chrono 排序 + SVG，纯函数区） [tests: test_sparkline.cjs] [lane: table]
   // §2.2/§3；tests/test_sparkline.cjs 在标记之间整段求值守护）。纯函数区：不触 DOM、
   // 不引用闭包。
   //
@@ -3091,7 +3243,7 @@
     return '<td class="ai-cell-spark">'+(series&&series.length?sparkSvgHtml(series):'')+'</td>';
   }
   // #endregion TABLE_SPARKLINE_END
-  // #region TABLE_PAGER_EXPORT_BEGIN —— 表格卡 分页/导出 纯函数区（WP-2，docs/product-iteration-plan.md
+  // #region TABLE_PAGER_EXPORT_BEGIN —— 表格卡 分页/导出 纯函数区（WP-2；pageBy/pagerMode/档位/导出名唯一读取口） [tests: test_table_pager_export.cjs] [lane: table]
   // §2.2/§3；tests/test_table_pager_export.cjs 在标记之间整段求值）。pageBy/pagerMode/pageSizeMax/
   // export 的唯一读取口；full/group 档下既有行为逐字节不变（row/simple 档才覆写）。
   // 页容量档位（军规 3：与 validate_request.TABLE_PAGE_SIZES 档位集合一致——此处只读不校验）。
@@ -3183,7 +3335,7 @@
     return n>TABLE_EXPORT_ROW_HINT?('数据量较大（共 '+n+' 行，超过 1 万行），正在导出全量，可能需要几秒'):'';
   }
   // #endregion TABLE_PAGER_EXPORT_END
-  // #region TABLE_STATS_BEGIN —— 明细表 表内搜索 / Σ统计 / 格子输入校验
+  // #region TABLE_STATS_BEGIN —— 明细表 表内搜索 / Σ统计 / 格子输入校验（纯函数区） [tests: test_tbl_h4_h8.cjs] [lane: table]
   // （纯函数区：不触 DOM、不引用闭包；dateParts 语义由参数注入以便沙箱测试）。
   // TBL-H5 表内搜索：跨「已选列」contains。**不区分大小写**（R16a 快赢 2026-09-25
   // ：本地两侧 toLowerCase；服务端 aggregator._filter_clause 的 contains 算子同批
@@ -3244,6 +3396,7 @@
     return {ok:true,value:raw};
   }
   // #endregion TABLE_STATS_END
+  // #region TABLE_EXPORT_POPS —— 表格导出写出器（CSV/XLSX 字节）+ 工具条/弹层（列头筛选/排序/字段自选/BI-H5 顺序）+ 加载与错误态 [tests: test_table_detail.cjs, test_session_view.cjs, test_filter_convergence.cjs, test_editor_iteration.cjs, test_panel_ia.cjs] [lane: table]
   // 下载一个字节 Blob（走 createObjectURL；data URL 有 ~2MB 导航上限）。
   function downloadBytes(bytes,filename,mime){
     var blob=new Blob([bytes],{type:mime||'application/octet-stream'});
@@ -4084,6 +4237,8 @@
     });}
   }
   function renderTableError(chart,version,error){renderDataError(chart,version,error,'表格数据加载失败');}
+  // #endregion TABLE_EXPORT_POPS
+  // #region TABLE_BODY_RENDER —— showTableBody 表格主体渲染总装（平表/分组/嵌套平铺/矩阵 1D/3D/多层/ND/层级下钻） [tests: test_table_headers.cjs, test_table_detail.cjs, test_sub_measures.cjs, test_table_row_forms.cjs, test_cond_format_engine.cjs, test_session_view.cjs] [lane: table]
   async function showTableBody(chart,version){
     var host=document.getElementById(chart.elementId);if(!host)return;
     // 常驻筛选条挂点（表格路径专属）：renderCardFilterBar 原先只在 echarts 分支
@@ -4266,6 +4421,25 @@
         totalCalcRow={};
         Object.keys(tcEff).forEach(function(c){var raw=tcStatic[c];var v=(raw==null)?NaN:Number(raw);totalCalcRow[c]=Number.isFinite(v)?v:null;});   // null 原样保留（Number(null)=0 会把编译侧空池 null 合计显示成 0）
       }
+      // NC-01 移交（totalRowDerived 消费契约）：PY 编译侧在作者声明 totalCalc 时
+      // 把派生列合计烘进 `option.totalRowDerived`（与 totalRow 平级兄弟键；公式派生
+      // 列 = 依赖合计后重求的数值，窗口/占比/筛选/排名类 → null）。同一新鲜度闸下
+      // 并入 totalCalcRow 的键空间（绝不改 totalRow 本身——test_table_total_calc 的
+      // totalRow exact 断言依赖其键集）：公式 → 数值（tcHasOverride 放行显示），
+      // null → 「—」。闸失效（读者改了筛选）不并入 → 落 tcTotalVal 的 live
+      // 派生重求（derivedTotalRowValues，按当前筛选宇宙重算，与基础列的服务端/
+      // 本地重算同批语义）。server 报告依赖列不上表时 live 求不出 → 静态烘焙值
+      // 在闸内兜底，正是它存在的意义。
+      var _trd=(chart.option&&chart.option.totalRowDerived&&typeof chart.option.totalRowDerived==='object')?chart.option.totalRowDerived:null;
+      if(_trd&&chart.__tcFilterBase===tcOwnJson){
+        totalCalcRow=totalCalcRow||{};
+        Object.keys(_trd).forEach(function(k){
+          if(!Object.prototype.hasOwnProperty.call(totalCalcRow,k)){
+            var tv=_trd[k];
+            totalCalcRow[k]=(tv==null||!isFinite(Number(tv)))?null:Number(tv);
+          }
+        });
+      }
       if(!totalCalcRow){
         if(data.remote&&data.datasetId){
           try{
@@ -4278,11 +4452,25 @@
       }
     }
     // 合计行格子取值：声明覆盖生效 → 覆盖值（null=空池 → 渲染 —）；否则回退现有口径。
+    // 派生列（NC-03 #6）插在覆盖与回退之间：公式列 = 依赖合计后重求公式（sum-of-ratios
+    // 假合计退役），窗口/占比 = null（—）；filtered 不进 map，维持列合计口径。
+    // colTotals 是**分支局部变量**（平表 4902 / 嵌套 4553 两处全量 SUM），map 按
+    // 其数组身份记忆化——分支切换即重算，绝不跨分支复用错口径。
+    var _dtRaw=null,_dtRawDone=false,_dtMemo={src:null,val:null};
+    function derivedTotalMap(){
+      if(!_dtRawDone){_dtRaw=(Array.isArray(data.rows)&&adapter.filteredRows)?adapter.filteredRows(data):null;_dtRawDone=true;}
+      if(_dtMemo.src===colTotals)return _dtMemo.val;
+      _dtMemo.src=colTotals;
+      _dtMemo.val=derivedTotalRowValues(data,measures,colTotals,_dtRaw);
+      return _dtMemo.val;
+    }
     function tcTotalVal(m,fallback){
       if(totalCalcRow&&Object.prototype.hasOwnProperty.call(totalCalcRow,m)){
         var v=totalCalcRow[m];
         return (v==null||!Number.isFinite(v))?null:v;
       }
+      var _dt=derivedTotalMap();
+      if(Object.prototype.hasOwnProperty.call(_dt,m))return _dt[m];
       return fallback;
     }
     // 该指标是否有**生效的** totalCalc 覆盖（三载体任一落到本卡的覆盖值）。覆盖 =
@@ -4794,6 +4982,11 @@
       var vv=v/div;
       var type=fmt&&fmt.type;
       var isPct=/percent|百分比|Percentage/i.test(String(type||''));
+      // D1（fixture formula_percent_display）：公式节点 + measureType.format=
+      // 'percent' 存的是运算原值（比率 0.2207）——fmt.type 仍是 'number'，但显示
+      // 口径是 percent（suffix '%'）→ 并入 percent 链 ×100（22.07%）。type:'percent'
+      // 旧形状（expr 已 ×100）走原有直显，不重复缩放。
+      if(!isPct&&adapter.derivedFractionPercent&&adapter.derivedFractionPercent(data,measure))isPct=true;
       // 派生 share/window.rate 的值已是百分数单位（adapter.derivedPercentUnits 唯一
       // 判据）——不再二次 ×100，否则 1.6% 显示成 160%（真机 2026-09-15）。
       // 表示检测（2026-10-13 批 A2，Flint §3.4）：0–100 存值的 percent 列
@@ -4863,6 +5056,9 @@
       var div=(fcfg&&fcfg.unitScale&&fcfg.unitScale!=='raw')?unitDivisor(fcfg.unitScale):(fmt&&fmt.divisor&&fmt.divisor!==1?fmt.divisor:1);
       var dec=(fcfg&&fcfg.decimals!=null)?Math.max(0,Math.min(6,Number(fcfg.decimals)||0)):(decimals!=null?decimals:(fmt&&fmt.decimals!=null?fmt.decimals:0));
       var isPct=/percent|百分比|Percentage/i.test(String((fmt&&fmt.type)||''));
+      // D1（fmtVal 同批）：公式节点 + format:'percent' 存比率 → 导出口径并入
+      // percent 链（×100；XLSX num 槽落 vv/100）。type:'percent' 旧形状直显不变。
+      if(!isPct&&adapter.derivedFractionPercent&&adapter.derivedFractionPercent(data,m))isPct=true;
       // share / window(rate) 派生指标存的是**已 ×100 的百分数**（fmtVal 同款
       // 豁免判据）——旧版再 ×100 把 1.6% 导出成 160%，Excel pct numFmt 还会
       // 对 num 再乘一次（三重复利）。豁免列：文本直出、num 落回比率。
@@ -5796,6 +5992,8 @@
     // 平表也要绑事件（模式切换/排序/列宽/分页）——否则聚合模式下点「明细」开关不生效。
     bindTableHost(host,chart,data);
   }
+  // #endregion TABLE_BODY_RENDER
+  // #region FIELD_GOVERNANCE_DRILL —— 字段治理（别名/隐藏/值别名/备注/影响面）+ 图表层级/时间下钻与面包屑 + chrono 轴对齐 + 懒挂载 + renderAll + 表格子类型/明细目标 [tests: test_field_governance.cjs, test_field_refs.cjs, test_click_drill.cjs, test_time_drill.cjs, test_hierarchy_features.cjs] [lane: core]
   // ---- 层级下钻（3b）：柱/线/饼图点击切片钻到子级，面包屑回退。 ----------
   // 数据集解析唯一实现 = datasetById（DERIVED_MODEL 区，manifest.datasets 单源；
   // server 模式重载会整体替换 manifest.datasets，Map/主表兜底版本是死代码且被
@@ -6497,7 +6695,8 @@
       +'<span class="ai-pb-track"><span class="ai-pb-fill" style="width:'+g.width+'%;background:'+color+'"></span></span>'
       +'<span class="ai-pb-label" style="color:'+color+'">'+escapeHtml(g.label)+'</span></div>';
   }
-  // #region COND_ENGINE_BEGIN —— 表格条件格式规则引擎（WP-4，docs/product-iteration-plan.md §3 WP-4）
+  // #endregion FIELD_GOVERNANCE_DRILL
+  // #region COND_ENGINE_BEGIN —— 表格条件格式规则引擎（WP-4；规则归一/求值出口/decorateCell 单口，纯函数区） [tests: test_cond_format_engine.cjs] [lane: table]
   // 纯函数区（不触 DOM；html 装配器只做字符串拼接——tests/test_cond_format_engine.cjs
   // 在标记之间整段求值守护）。**所有表格分支**（明细两路 / 平表 / 分组 / 嵌套平铺 /
   // 1D 矩阵 / 3D 矩阵 / ND 长表）的单元格装饰决策都必须经 decorateCell —— 不许任何
@@ -6859,6 +7058,7 @@
     return out;
   }
   // #endregion COND_ENGINE_END
+  // #region DETAIL_BIND_AUTOFIT —— 明细/服务端明细事件绑定与模式切换 + 条件格式分支出口（目标条/全行）+ resizeCharts + 文本卡 hug/手动高度 [tests: test_table_detail.cjs, test_cond_format_engine.cjs, test_manual_height.cjs, test_bounded_table.cjs] [lane: table]
   // 目标条预设的调用点解析（非纯——读 detailTargetOf/unitDivisor，模块级函数）：
   // 目标值按「单位」换算（与既有分支 goal=t.value*unitDivisor(unitScale) 逐位一致）。
   function condTargetMapFor(chart,cols){
@@ -7577,7 +7777,8 @@
     syncManualFitButton(item,false);
     syncManifest();
   }
-  // #region GRID_TABLE_BEGIN —— 自由表格卡（kind:'grid'）：模型纯函数 + 渲染 + 卡内编辑 + 全屏轻 Excel 编辑器
+  // #endregion DETAIL_BIND_AUTOFIT
+  // #region GRID_TABLE_BEGIN —— 自由表格卡（kind:'grid'）：模型纯函数 + 渲染 + 卡内编辑 + 全屏轻 Excel 编辑器 [tests: test_grid_model.cjs, test_grid_editing.cjs, test_grid_render.cjs, test_grid_export.cjs] [lane: grid]
   // 契约：docs/grid-table-design.md。总纲「取编辑手感、不取数据能力」—— 公式/排序筛选/
   // 填充柄/数字格式彻底 OUT（不做第二套计算通道，与计算字段/数据表卡职责不重叠）。
   // 渲染真源只有 JS gridTableHtml：自由表格是运行时手工卡，持久化走 DOM 快照
@@ -8539,6 +8740,7 @@
     });
   }
   // #endregion GRID_TABLE_END
+  // #region CARD_AUTOFIT_FILTER_STATE —— 卡片自动贴合（grid/text/table/KPI + 观察器）+ 报告级筛选条状态/读者默认(BI-H8) + KPI 值工具 + renderFilterBar 入口 [tests: test_manual_height.cjs, test_bounded_table.cjs, test_filter_defaults.cjs, test_kpi_panel.cjs] [lane: filter]
   function autoFitTextBlocks(){
     // 自由表格卡与文本卡同一 hug 语义 —— 挂在这里让全部 15 处调用点自动带上。
     autoFitGridCards();
@@ -8635,17 +8837,34 @@
       // presentation.cardHeightPx 与纵向手柄隐藏消费——不冒用 .ai-fixh（那是用户
       // 手动语义）。
       var _bc=chartForBlock(item.getAttribute('data-report-block-id'));
-      var _hm=heightModeOf((_bc&&_bc.editor&&_bc.editor.table)||{});
+      var _tset=(_bc&&_bc.editor&&_bc.editor.table)||{};
+      var _hm=heightModeOf(_tset);
       if(_hm.mode==='bounded'){
         item.__aiTableFitting=1;
         try{
           var bChrome=item.offsetHeight-wrap.offsetHeight;if(bChrome<0)bChrome=0;
           var bCell=Number(inst.opts&&inst.opts.cellHeight)||48;
+          // XU-01 行数口径：初始 max-height 按 ROW_HEIGHT_PX=28 换算（编译 parity 表，
+          // tblDisplayVars 写入）；这里用**真实 tbody tr 高度**（密度/字号已烘进 DOM）
+          // 校正重写一次——密度/字号变化重渲后重算，自愈。data-bounded 与 gs-h 预留
+          // 同口径重写（audit boundedTable 的「预留 ≥ 帽」不变量才能对上）。
+          var bMax=_hm.maxPx;
+          if(_hm.maxBodyRows!=null){
+            var _tr0=table.querySelector('tbody tr');
+            var _rowPx=(_tr0&&_tr0.offsetHeight>0)?_tr0.offsetHeight:(TABLE_DENSITY_PX[tableDensityOf(_tset)]||TABLE_ROW_HEIGHT_PX);
+            var _th0=table.querySelector('thead');
+            var _headPx=(_th0&&_th0.offsetHeight>0)?_th0.offsetHeight:TABLE_HEADER_HEIGHT_PX;
+            bMax=boundedRowsMaxPx(_hm.maxBodyRows,_rowPx,_headPx);
+            if(String(wrap.getAttribute('data-bounded'))!==String(bMax)){
+              wrap.style.maxHeight=bMax+'px';
+              wrap.setAttribute('data-bounded',String(bMax));
+            }
+          }
           // 真实内容高：wrap 真溢出取 scrollHeight（被 max-height 裁掉的部分只有
           // 它知道），否则取 table.offsetHeight（同生长路径的口径）。
           var bContent=(wrap.scrollHeight>wrap.clientHeight+2)?wrap.scrollHeight:table.offsetHeight;
-          var bPx=Math.ceil(Math.min(bContent,_hm.maxPx)+bChrome);
-          var bRows=Math.max(TBL_FIT_MIN_H,boundedReserveRows(_hm.maxPx,bChrome,bCell));
+          var bPx=Math.ceil(Math.min(bContent,bMax)+bChrome);
+          var bRows=Math.max(TBL_FIT_MIN_H,boundedReserveRows(bMax,bChrome,bCell));
           item.classList.remove('ai-hug');item.classList.remove('ai-fixh');
           item.classList.add('ai-bounded');
           item.style.height=bPx+'px';
@@ -8808,6 +9027,8 @@
       }finally{item.__aiKpiFitting=0;}
     });
   }
+  // #endregion CARD_AUTOFIT_FILTER_STATE
+  // #region FILTER_HIER_CARD_LOCAL —— 层级合并筛选 + 级联/值域活取(fillLiveValues) + 常驻筛选条渲染 + 卡片本地筛选（收窄/多选菜单/清除） [tests: test_hierarchy_features.cjs, test_filter_scope.cjs, test_manual_input_fixes.cjs, test_filter_convergence.cjs] [lane: filter]
   // ---- report-wide filter bar (interactive) ---------------------------------
   // The request's ``filters`` become a working control (not just a summary):
   // per filter column we render a multi-select of the column's distinct
@@ -8954,16 +9175,28 @@
   function kpiCurrencySymbol(kp){
     var col=kp&&(kp.countDim||kp.measure);
     var ds=col?kpiDataset(kp):null;
-    // 跟随 hideCurrency（2026-10-13 收尾批）：指标芯片关掉货币符号后，同一数据集上
-    // 引用该列的 KPI 也不再显示前缀——图表/表格/KPI 三处口径一致，「图表无 ¥、
-    // KPI 有 ¥」的自相矛盾不再出现。
+    // 跟随 hideCurrency（2026-10-13 收尾批声明数据集级；NU-01/D6 补芯片通道）：
+    // 指标芯片 ⚙「货币符号」取消勾选写 chart.editor.data.hideCurrency[col]=true
+    //（updateChart 的 hc map），同一数据集上引用该列的 KPI 不再显示前缀——图表/
+    // 表格/KPI 三处口径一致，「图表无 ¥、KPI 有 ¥」的自相矛盾不再出现。查表即
+    // 所得（零缓存）：勾回/删键即自愈；数据集级声明（authoring 直写）优先。
     if(ds&&ds.hideCurrency&&ds.hideCurrency[col])return '';
+    var charts=(typeof manifest!=='undefined'&&manifest.charts)||[];
+    for(var ci=0;ci<charts.length;ci++){
+      var d=charts[ci]&&charts[ci].editor&&charts[ci].editor.data;
+      if(!(d&&d.hideCurrency&&d.hideCurrency[col]))continue;
+      var cds=(d.datasetId&&datasets.get(d.datasetId))||primaryDataset();
+      if(cds===ds)return '';
+    }
     var mt=(ds&&ds.measureTypes)?ds.measureTypes[col]:null;
     return (typeof adapter!=='undefined'&&adapter.currencySymbolOf)?adapter.currencySymbolOf(mt):'¥';
   }
   function formatKpiValue(raw,kind,symbol){
     var n=Number(raw);if(!isFinite(n))return escapeHtml(String(raw==null?'—':raw));
-    if(kind==='currency'){var cur=symbol||'¥';if(Math.abs(n)>=1e8)return cur+(n/1e8).toFixed(2)+'亿';if(Math.abs(n)>=1e4)return cur+(n/1e4).toFixed(2)+'万';return cur+Math.round(n).toLocaleString('zh-CN');}
+    // NU-01（D6）：symbol==null → 缺省 ¥；symbol===''（hideCurrency 命中）是**显式
+    // 置空**——绝不能落 falsy 陷阱（旧写法对空串取或缺省符）把空串打回 ¥（图表/表格侧
+    // measureFormat 同一条契约：只藏前缀，万元口径/小数位语义全保留）。
+    if(kind==='currency'){var cur=(symbol==null)?'¥':symbol;if(Math.abs(n)>=1e8)return cur+(n/1e8).toFixed(2)+'亿';if(Math.abs(n)>=1e4)return cur+(n/1e4).toFixed(2)+'万';return cur+Math.round(n).toLocaleString('zh-CN');}
     if(kind==='percent'||kind==='missingRate'||kind==='growthRate')return (n*100).toFixed(2)+'%';
     if(kind==='count'||kind==='integer'||Number.isInteger(n))return Math.round(n).toLocaleString('zh-CN');
     if(kind==='duration')return n.toFixed(2)+'天';
@@ -10068,6 +10301,8 @@
     var tog=box.querySelector('[data-card-filter-open]');
     if(tog)tog.addEventListener('click',function(e){e.stopPropagation();openCardFilter(blockId,tog);});
   }
+  // #endregion FILTER_HIER_CARD_LOCAL
+  // #region GRID_INIT_TABS —— GridStack 初始化（.ai-grid-ready 揭示/48px 行高）/makeGrid + 工作台页签与 tab-card 模型 + tabs 布局/页签筛选卡/工具条停靠 [tests: test_boot_reveal.cjs, test_filter_popover.cjs, test_filter_scope.cjs, test_page_width.cjs, test_text_cards.cjs] [lane: session]
   function initGridElement(element){
     // 无 gridstack 兜底也揭示：脚本损坏时宁可回到堆叠旧观感，也不把页面永远
     // 钉在 SHELL_CSS 的「正在加载报告…」预备态上。
@@ -10493,6 +10728,8 @@
     if(document.body)document.body.insertBefore(toolbar,document.body.firstChild);
   }
   function toggleGrid(on){document.querySelectorAll('[data-report-grid]').forEach(function(element){var grid=element.__aiReportGrid;if(grid){grid.enableMove(on);grid.enableResize(on);}});}
+  // #endregion GRID_INIT_TABS
+  // #region PANEL_CHIPS_ZONES —— 面板 chrome/聚焦/类型选择/列分类 + 指标芯片族（聚合/分桶/单位/小数/货币/参考线/极值/条件格式）+ 芯片设置弹层 + 行列值三区字段控件 [tests: test_field_panel_ux.cjs, test_measure_names.cjs, test_cond_format_engine.cjs, test_filter_zone.cjs, test_panel_ia.cjs] [lane: panel]
   function panel(title,content){
     var node=document.getElementById('ai-report-runtime-panel');
     // 面板内容整体重建：先关掉所有芯片设置浮窗——旧浮窗节点将随 innerHTML 消失，
@@ -11729,6 +11966,11 @@
       +'</span>';
   }
   // 「＋ 新建派生指标」= 跳转到数据源配置（唯一的定义处），不是第二套定义 UI（D3/D5）。
+  // XA-03：Copilot diff 卡「在派生构建器中编辑」经 pendingDerivedEdit 一次性投递
+  // （{node, idx?}）—— idx 命中 = 节点已 apply，走既有编辑路径；无 idx = 提案未落盘，
+  // 以归一节点预填构建器（只填表单，保存仍走 derivedValidate）。入口签名保持无参，
+  // 既有接线/守卫不动；消费即清（只影响随后一次打开）。
+  var pendingDerivedEdit=null;
   function openSemanticCanvasForDerived(){
     var sel=selected&&selected.chart;
     var ed=sel&&sel.editor&&sel.editor.data;
@@ -11740,6 +11982,13 @@
       var blk=document.querySelector('[data-der-block="measures"]');
       if(blk&&blk.scrollIntoView)blk.scrollIntoView({block:'center'});
       else if(stage){var wrap=stage.querySelector('.ai-sem-derive-wrap');if(wrap&&wrap.scrollIntoView)wrap.scrollIntoView({block:'center'});}
+      var pending=pendingDerivedEdit;pendingDerivedEdit=null;
+      if(pending&&pending.node){
+        var pkind=(pending.node.kind==='formula'?'formula':(pending.node.kind==='share'?'share':(pending.node.kind==='filtered'?'filtered':'window')));
+        if(pending.idx!=null&&pending.idx>=0)openCalcFieldModal(pkind,pending.idx);
+        else openCalcFieldModal(pkind,null,pending.node);
+        return;
+      }
       // 消费端新建 = 同一个弹窗，但把当前卡片的上下文带进去（时间列/分桶/首指标），
       // 少填三项、也就少一次「粒度不匹配」的返工。
       var bucket=ed&&ed.dimensionBucket;
@@ -12187,7 +12436,8 @@
       +'<div class="ai-lib-col">'+unselZone+'</div>'
       +'</div>';
   }
-  // #region FILTER_ZONE_BEGIN —— 面板第四区「过滤器」（WP-14，docs/quickbi-filter-zone-research.md
+  // #endregion PANEL_CHIPS_ZONES
+  // #region FILTER_ZONE_BEGIN —— 面板第四区「过滤器」（WP-14；条件驱动芯片 ⇔ columnFilters/dimScopes 同一模型） [tests: test_filter_zone.cjs] [lane: filter]
   // §6 拍板：方案 A）。对标 QBI 交叉表过滤器区：与行/列/值并列的字段区，拖入字段 → 条件构建器。
   // 模型契约（**零新过滤模型**）：区内条目 = 既有 editor.table.columnFilters（tblFilters）∪
   // editor.table.dimScopes（P3 维度范围，归一为区内条目类型——维度芯片「范围」按钮与区是
@@ -12341,6 +12591,7 @@
     notify('已移除「'+((chart.editor&&chart.editor.data&&colAliasOf(datasetById(chart.editor.data.datasetId),col))||col)+'」的过滤条件');
   }
   // #endregion FILTER_ZONE_END
+  // #region PANEL_CONTROLS —— 轴单位/显示/排序TopK/表格四层设置面板 + updateControlVisibility + openChart 面板装配 + 块搬移 + 字段角色映射 [tests: test_panel_ia.cjs, test_table_display.cjs, test_table_pager_export.cjs, test_filter_zone.cjs] [lane: panel]
   // Y 轴（值轴）设置：单位跟轴走。每个值轴有名称 + 单位（原始/K/万/百万）；同一根轴上的指标共用其
   // 单位，并显示在轴名称上方（见 chart-adapter 拼轴名时附单位后缀）。左/右归属由指标 chip 的「Y 轴」
   // 指定(data.seriesAxis)。缺省单位 = 该轴首指标当前生效的尺度（遵循「no 自动」契约，不显示「自动」）。
@@ -12725,16 +12976,18 @@
           +checkRow('ai-table-bars','单元格数据条',settings.showBars!==false,false)
           // WP-7 卡高三态（docs/wp7-bounded-height-design.md §3.5）：互斥单选，
           // 提交链唯一写入口。fixed=manualH 收编（无 manualH 时提示拖拽底缘）；
-          // bounded=预设 352/672/1632 + 自定义数字输入（边界同 validate_request 200..4000）。
+          // bounded=预设 352/672/1632 + 自定义数字输入（边界同 validate_request 200..4000）；
+          // XU-01 行数档「限制行数」= {bounded:{maxBodyRows}}（5..500，缺省 30，冻结表头）。
           +(function(){
             var hm=heightModeOf(settings);
-            var cur=hm.mode==='fixed'?'fixed':(hm.mode==='bounded'?(TABLE_BOUNDS_PRESETS.indexOf(hm.maxPx)>=0?String(hm.maxPx):'custom'):'grow');
+            var cur=hm.mode==='fixed'?'fixed':(hm.mode==='bounded'?(hm.maxBodyRows!=null?'rows':(TABLE_BOUNDS_PRESETS.indexOf(hm.maxPx)>=0?String(hm.maxPx):'custom')):'grow');
             return ctlRow('卡高','<select id="ai-table-heightmode" data-bi-control="true">'
               +'<option value="grow" '+(cur==='grow'?'selected':'')+'>自适应生长</option>'
               +'<option value="fixed" '+(cur==='fixed'?'selected':'')+'>固定高度</option>'
+              +'<option value="rows" '+(cur==='rows'?'selected':'')+'>限制行数（卡内滚动）</option>'
               +TABLE_BOUNDS_PRESETS.map(function(n){return '<option value="'+n+'" '+(cur===String(n)?'selected':'')+'>限定 '+n+'px（卡内滚动）</option>';}).join('')
               +'<option value="custom" '+(cur==='custom'?'selected':'')+'>限定自定义…</option>'
-              +'</select> <input id="ai-table-maxpx" data-bi-control="true" type="number" min="200" max="4000" step="8" value="'+(hm.mode==='bounded'?hm.maxPx:672)+'" title="自定义上限 200..4000px"'+(cur==='custom'?'':' hidden')+'>','ai-table-heightmode')
+              +'</select> <input id="ai-table-maxrows" data-bi-control="true" type="number" min="5" max="500" step="1" value="'+(hm.maxBodyRows!=null?hm.maxBodyRows:30)+'" title="最多可见行数 5..500（缺省 30）"'+(cur==='rows'?'':' hidden')+'> <input id="ai-table-maxpx" data-bi-control="true" type="number" min="200" max="4000" step="8" value="'+(hm.mode==='bounded'?hm.maxPx:672)+'" title="自定义上限 200..4000px"'+(cur==='custom'?'':' hidden')+'>','ai-table-heightmode')
               +(function(){var ht=tableHeightHint(hm,chart.blockId?blockForId(chart.blockId):null);
                 return ht?'<p class="ai-report-hint" id="ai-table-heightmode-hint">'+escapeHtml(ht)+'</p>':'<p class="ai-report-hint" id="ai-table-heightmode-hint" hidden></p>';})();
           })()
@@ -12867,6 +13120,9 @@
       // 样式（Y 轴/图例/网格线）+ 交互（点击下钻）由 displayControls 一并返回。
       +displayControls(chart,flags,data)
       +tabMoveOptions(chart.blockId)
+      // NU-02（model-understanding 提案 P2 残余接线）：卡片级「AI 改图」入口，
+      // 仅 server 模式渲染（Copilot 是 server-only 能力，与工具栏入口同一显隐判据）。
+      +(isServerMode()?panelCopilotEntryHtml(chart):'')
       +'<p class="ai-report-hint">所有更改会立即生效。</p>';
     panel('图表设置',controls);
     updateControlVisibility(current);
@@ -12890,6 +13146,14 @@
       var _tg=_zn?_zn.querySelector('.ai-report-chip[data-col="'+_colQ+'"]'):null;
       if(_tg&&_tg.scrollIntoView)_tg.scrollIntoView({block:'nearest'});
     }
+  }
+  // NU-02：卡片配置面板底部的「AI 改图」入口。点击 = 打开 Copilot 抽屉并把上下文
+  // 定位到当前卡（copilotOpenCard）——复用读者在 Copilot 里手动选卡的同一通道
+  // （copilotSelectCard）与既有抽屉打开函数（copilotOpen），不新增执行路径/旁路。
+  // 仅 server 模式调用（openChart 里 isServerMode() 门控）；singlefile 不渲染该按钮。
+  // 样式 = 既有 .ai-report-secondary（Notion 黑白按钮体系，不引新色）+ 一行占位。
+  function panelCopilotEntryHtml(chart){
+    return '<div class="ai-report-panel-airow"><button type="button" class="ai-report-secondary ai-report-panel-ai-edit" data-runtime-action="copilot-open-card" data-block-id="'+escapeHtml(chart.blockId||'')+'" title="打开 Agent 抽屉并选中这张卡片：先给方案，确认后应用；原始数据不会被修改">✦ AI 改图</button></div>';
   }
   function tabMoveOptions(blockId){
     if(!tabsEnabled())return '';
@@ -12947,6 +13211,8 @@
   // fieldRoles 条目 → 下拉值。``id`` 归一为 ``ignore``（两个角色行为相同，已合并）。
   function roleToOption(fr){if(!fr)return 'auto';if(fr.role==='time')return 'time';if(fr.role==='category'||fr.role==='ordinal')return 'category';if(fr.role==='measure')return 'measure';if(fr.role==='ignore'||fr.role==='id')return 'ignore';return 'auto';}
   function autoRoleFor(ds,col){var fs=adapter.fieldSemantic(ds,col);if(!fs)return 'category';if(fs.kind==='measure')return 'measure';if(fs.kind==='time')return 'time';return 'category';}
+  // #endregion PANEL_CONTROLS
+  // #region SEM_CANVAS_STATE —— 语义画布状态与角色变更（角色/聚合/格式选项、类目树拖拽、列采样、重命名联动、字段筛选） [tests: test_data_source_config.cjs, test_derived_model.cjs] [lane: panel]
   // ---- 数据配置画布 (semantic canvas) -----------------------------------------
   // The toolbar「数据配置」opens this full-screen canvas DIRECTLY (no row-list
   // drawer): every field is a node card (bold name + zone badge + 聚合/小数位
@@ -13558,6 +13824,8 @@
     var countEl=stage.querySelector('.ai-sem-search-count');
     if(countEl)countEl.textContent=q?('匹配 '+shown+' / '+total):'';
   }
+  // #endregion SEM_CANVAS_STATE
+  // #region SEM_WIDE_DERIVED —— 数据预览/数据管理弹层 + 字段引用与统计行 + v4 宽表合并渲染/重命名 + 维度组 + 派生定义区 + 列/值别名弹层 [tests: test_data_manage.cjs, test_relation_merge.cjs, test_quickbi_ui_batch.cjs, test_quickbi_batch3.cjs, test_derived_ui.cjs, test_field_governance.cjs] [lane: panel]
   // 数据预览：字段配置旁边必须能「看一眼真实数据」（传统 BI 的标配）。服务端走
   // POST /datasets/:id/rows（有界 pageSize ≤100），singlefile 直接切内存行。
   // 数据管理弹层（2026-09-28）：旧「数据预览 · 前 50 行只读」升级为可筛选、
@@ -15051,7 +15319,8 @@
   // 运算库里每一项都标出它**展开成什么**，并且只列求值器真的能算的东西
   // （四则 + 常量 + 求和/平均/计数/去重计数/最大/最小 + 时间窗口 prev/cum）——不假装有一个
   // 公式语言，也不给不可用的配置（占比需要跨维度窗口，模型里没有，就明说不支持）。
-  // #region FORMULA_PARSER —— 公式表达式编辑器的解析/序列化（唯一文本↔AST 边界）
+  // #endregion SEM_WIDE_DERIVED
+  // #region FORMULA_PARSER —— 公式表达式编辑器的解析/序列化（唯一文本↔AST 边界） [tests: test_derived_ui.cjs, test_derived_model.cjs] [lane: derived]
   // Python 编译侧只见 AST 不见文本，所以解析器只有这一份（无 parity 负担）。
   // 文法与边界见 docs/formula-editor-design.md：白名单聚合 + 四则 + 括号 + 数字常量
   // + [列]/[派生指标] 引用；裸普通列报错（与 derivedValidate 同一条 bare-col 规则）。
@@ -15174,6 +15443,7 @@
     return go(ast,0,'l');
   }
   // #endregion FORMULA_PARSER_END
+  // #region CALC_FIELD_BUILDER —— 计算字段/派生指标统一构建器弹窗（行级/公式/窗口/筛选聚合四方法 + 字段库/运算库/预览/校验） [tests: test_derived_ui.cjs, test_panel_ia.cjs] [lane: derived]
   // 弹窗字段宇宙（含派生列），按名称去重 —— 已物化的计算列会同时出现在
   // semColsAll 与派生清单里，不去重会在字段库/操作数下拉里出现两次（真机截图抓到）。
   function calcColsAll(){
@@ -15197,6 +15467,27 @@
   // WP-6b：排名族（组内排名）。partition = 当前聚合维度组合，无时间语义 ——
   // 与 scripts/derived_model.RANK_WINDOW_FNS、chart-adapter DERIVED_RANK_FNS 同一名单。
   var CALC_RANK_FNS=['rank','dense_rank','percent_rank'];
+  // XA-03：openCalcFieldModal 第三参可收「服务端归一节点」（kind 命中此表）——
+  // Copilot diff 卡「在派生构建器中编辑」用它把提案节点预填进构建器；否则第三参
+  // 按旧「预设」对象（inputCol/grain/timeField/shareScope/parentField）消费。
+  var CALC_NODE_KINDS=['formula','window','share','filtered','column'];
+  // XA-03：节点 → 弹窗会话态的唯一映射。编辑还原（idx 路径）与提案预填（prefill
+  // 路径）共用同一条，绝不出现第二份形状翻译；WP-6b 窗口六算子/排名族清残留规则
+  // 与原内联版本逐字段一致（纯函数：不触 DOM，可被 test_derived_ui.cjs 沙箱求值）。
+  function calcStateFromMeasureNode(n){
+    var nfn=n.fn||'prev';
+    var nwin={input:n.input||{agg:'sum',col:''},fn:nfn,
+          grain:n.grain||'month',offset:Number(n.offset||1),timeField:n.timeField||'',
+          output:(n.output||(nfn==='cum'||nfn==='ytd'?'delta':(nfn==='percent_rank'?'rate':(CALC_RANK_FNS.indexOf(nfn)>=0?'value':'rate'))))};
+    if(nfn==='cum'||nfn==='ytd'||CALC_RANK_FNS.indexOf(nfn)>=0)nwin.kind=nfn;
+    if(CALC_RANK_FNS.indexOf(nfn)>=0){delete nwin.grain;delete nwin.offset;delete nwin.timeField;}
+    var nmethod=(n.kind==='formula'?'formula':(n.kind==='share'?'share':(n.kind==='filtered'?'filtered':'window')));
+    return {tab:'measure',method:nmethod,name:n.name||'',semantic:n.semantic||'',
+           exprText:(n.expr?exprAstToText(n.expr):''),
+           win:nwin,
+           share:{input:n.input||{agg:'sum',col:''},scope:(n.scope||'all'),parentField:(n.parentField||'')},
+           fm:{agg:n.agg||'countd',col:n.col||'',filters:JSON.parse(JSON.stringify(n.filters||[{col:'',op:'eq',value:''}]))}};
+  }
   function calcLibrary(tab,method){
     if(tab==='column')return [
       {g:'四则运算',items:CALC_OPS.map(function(o){return {l:o.l,s:o.s,mk:{op:o.v}};})}
@@ -15237,8 +15528,12 @@
       .then(function(res){return {cols:(res&&res.columns)||want,rows:((res&&res.rows)||[]).slice(0,n)};})
       .catch(function(err){return {cols:[],rows:[],note:'取数失败：'+(err&&err.message||'未知')};});
   }
-  function openCalcFieldModal(kind,idx,preset){
-    preset=preset||{};
+  function openCalcFieldModal(kind,idx,prefill){
+    prefill=prefill||{};
+    // XA-03：第三参双形状。kind 命中 CALC_NODE_KINDS = 服务端归一节点 → 只预填表单
+    // （state 是会话态，不写 ds.derived/semCanvas —— 落盘仍要用户点保存走
+    // derivedValidate）；否则按旧「预设」（inputCol/grain/timeField/…）消费。
+    var prefillNode=(prefill&&CALC_NODE_KINDS.indexOf(prefill.kind)>=0)?prefill:null;
     if(!semCanvas.ds){global.alert('请先打开「数据源配置」选择一个数据源。');return;}
     var old=document.getElementById('ai-calc-modal');if(old)old.remove();
     var editing=(idx!=null&&idx>=0);
@@ -15255,37 +15550,30 @@
                left:calcOperandState(d.left),right:calcOperandState(d.right)};
       }else{
         var n=JSON.parse(JSON.stringify(semDerivedMsrs()[idx]||{}));
-        // WP-6b：窗口六算子的编辑还原。rank/ytd 的方式直接命中下拉（kind=fn）；
-        // 排名族无时间语义 —— grain/offset/timeField 不进会话态（清残留），输出由
-        // 方式固定（percent_rank→rate 已×100、rank/dense_rank→value），与 PY normalize 一致。
-        var nfn=n.fn||'prev';
-        var nwin={input:n.input||{agg:'sum',col:''},fn:nfn,
-              grain:n.grain||'month',offset:Number(n.offset||1),timeField:n.timeField||'',
-              output:(n.output||(nfn==='cum'||nfn==='ytd'?'delta':(nfn==='percent_rank'?'rate':(CALC_RANK_FNS.indexOf(nfn)>=0?'value':'rate'))))};
-        if(nfn==='cum'||nfn==='ytd'||CALC_RANK_FNS.indexOf(nfn)>=0)nwin.kind=nfn;
-        if(CALC_RANK_FNS.indexOf(nfn)>=0){delete nwin.grain;delete nwin.offset;delete nwin.timeField;}
-        var nmethod=(n.kind==='formula'?'formula':(n.kind==='share'?'share':(n.kind==='filtered'?'filtered':'window')));
-        state={tab:'measure',method:nmethod,name:n.name||'',semantic:n.semantic||'',
-               exprText:(n.expr?exprAstToText(n.expr):''),
-               win:nwin,
-               share:{input:n.input||{agg:'sum',col:''},scope:(n.scope||'all'),parentField:(n.parentField||'')},
-               fm:{agg:n.agg||'countd',col:n.col||'',filters:JSON.parse(JSON.stringify(n.filters||[{col:'',op:'eq',value:''}]))}};
+        state=calcStateFromMeasureNode(n);
       }
+    }else if(prefillNode&&prefillNode.kind==='column'){
+      var pd=JSON.parse(JSON.stringify(prefillNode));
+      state={tab:'column',method:'formula',name:pd.name||'',op:pd.op||'sub',unit:pd.unit||'day',
+             left:calcOperandState(pd.left),right:calcOperandState(pd.right)};
+    }else if(prefillNode){
+      // XA-03 提案预填：与编辑路径同一映射（calcStateFromMeasureNode），预填不落盘。
+      state=calcStateFromMeasureNode(JSON.parse(JSON.stringify(prefillNode)));
     }else if(tab==='column'){
       state={tab:'column',method:'formula',name:'',op:'sub',left:{t:'col',v:''},right:{t:'col',v:''}};
     }else if(method==='formula'){
       state={tab:'measure',method:'formula',name:'',exprText:'',semantic:''};
     }else if(method==='share'){
       state={tab:'measure',method:'share',name:'',semantic:'',
-             share:{input:{agg:'sum',col:preset.inputCol||''},scope:(preset.shareScope||'all'),parentField:(preset.parentField||'')}};
+             share:{input:{agg:'sum',col:prefill.inputCol||''},scope:(prefill.shareScope||'all'),parentField:(prefill.parentField||'')}};
     }else if(method==='filtered'){
       state={tab:'measure',method:'filtered',name:'',semantic:'',
-             fm:{agg:'countd',col:preset.inputCol||'',filters:[{col:'',op:'eq',value:''}]}};
+             fm:{agg:'countd',col:prefill.inputCol||'',filters:[{col:'',op:'eq',value:''}]}};
     }else{
       state={tab:'measure',method:'window',name:'',semantic:'',
-             win:{input:{agg:'sum',col:preset.inputCol||''},fn:'prev',
-                  grain:preset.grain||'month',offset:1,
-                  timeField:(preset.timeField||semTimeCols()[0]||''),output:'rate'}};
+             win:{input:{agg:'sum',col:prefill.inputCol||''},fn:'prev',
+                  grain:prefill.grain||'month',offset:1,
+                  timeField:(prefill.timeField||semTimeCols()[0]||''),output:'rate'}};
     }
     var fieldQuery='',focus=null,message=null,preview=null,previewToken=0;
     var box=document.createElement('div');
@@ -15492,10 +15780,10 @@
     //  弹窗停在旧 DOM，方法按钮「点了没反应」）。
     function ensureMethodState(){
       if(state.exprText==null)state.exprText='';
-      if(!state.win)state.win={input:{agg:'sum',col:preset.inputCol||''},fn:'prev',
-        grain:preset.grain||'month',offset:1,timeField:(preset.timeField||semTimeCols()[0]||''),output:'rate'};
-      if(!state.share)state.share={input:{agg:'sum',col:preset.inputCol||''},scope:'all',parentField:''};
-      if(!state.fm)state.fm={agg:'countd',col:preset.inputCol||'',filters:[{col:'',op:'eq',value:''}]};
+      if(!state.win)state.win={input:{agg:'sum',col:prefill.inputCol||''},fn:'prev',
+        grain:prefill.grain||'month',offset:1,timeField:(prefill.timeField||semTimeCols()[0]||''),output:'rate'};
+      if(!state.share)state.share={input:{agg:'sum',col:prefill.inputCol||''},scope:'all',parentField:''};
+      if(!state.fm)state.fm={agg:'countd',col:prefill.inputCol||'',filters:[{col:'',op:'eq',value:''}]};
       if(!state.left)state.left={t:'col',v:''};
       if(!state.right)state.right={t:'col',v:''};
     }
@@ -16264,6 +16552,8 @@
   }
   // 兼容别名：旧入口（图表面板/旧测试）指向统一弹窗。
   function openDerivedMeasureModal(kind,idx){openCalcFieldModal(kind,idx);}
+  // #endregion CALC_FIELD_BUILDER
+  // #region SEM_CANVAS_LIFECYCLE —— 派生虚拟列注册/删除 + 服务端表清单/落表 + 表清单渲染/关系增删 + 画布保存/取消/关闭 + 数据集删除 + 数据集映射 + 打开画布 [tests: test_data_source_config.cjs, test_data_manage.cjs, test_relation_merge.cjs, test_undo.cjs, test_refresh_bigtable.cjs] [lane: panel]
 
   // 派生指标名是虚拟列：让它在图表面板的“未选择”里也看得见（并带上 ƒ 标识）。
   // 该名字不进 ds.columns（不是真列）；只作声明，供图表编辑器列出。
@@ -17517,6 +17807,8 @@
     if(typeof updateChart==='function')updateChart();
   }
 
+  // #endregion SEM_CANVAS_LIFECYCLE
+  // #region TEXT_CARD_MODEL —— 文本卡统一段落模型（textStyle/cardColor 归一 + DOM 段落采集 + 封面镜像）+ 卡片打开/选择/面板关闭 [tests: test_text_cards.cjs, test_rich_text_editing.cjs] [lane: compose]
   // ---- Unified inline text-card model -----------------------------------------
   // ONE text-card model: block.paragraphs=[{level:'h1'|'h2'|'h3'|'body',text}]
   // + 类型 textStyle ∈ text|annotation × 颜色 cardColor（两个正交维度，2026-09-15
@@ -17880,6 +18172,8 @@
   }
   function closePanel(){var p=document.getElementById('ai-report-runtime-panel');if(p)p.dataset.open='false';syncPanelClass();exitFocus();}
   function selectBlock(element,open){document.querySelectorAll('.ai-report-selected').forEach(function(node){node.classList.remove('ai-report-selected');});element.classList.add('ai-report-selected');if(open!==false)openBlock(element.getAttribute('data-report-block-id'));}
+  // #endregion TEXT_CARD_MODEL
+  // #region KPI_CARD_LIFECYCLE —— 指标卡生命周期（值计算/对比窗口闭包/显示设置/面板/图表互转/重排） [tests: test_kpi_panel.cjs, test_field_panel_ux.cjs, test_nu_small_batch.cjs, test_derived_ui.cjs] [lane: panel]
   // ---- reusable value/metric component (Issue 4: KPI is a data-bound BI block) ----
   // A KPI block binds a measure + aggregation + measureType and recomputes its
   // value live as the report filter changes — the same mechanism as a chart. It
@@ -18132,9 +18426,14 @@
         +escapeHtml(cmpLabel)+' '+(upv?'+':'')+escapeHtml(dv.text)+escapeHtml(dv.unit)+'</span>'+kpiCompareBaseSeg(kp);
     }
     var t=Number(kp.target);
-    if(kp.target!=null&&kp.target!==''&&isFinite(t)&&t!==0&&val!=null&&isFinite(Number(val))){
+    // 静态值卡的 val 是编译烘死的显示字符串（"980,000" 带千分位）——Number() 会
+    // NaN 导致目标进度条对静态卡永不出现（tickets2026 全量审计 96 项唯一红项，
+    // trio 门槛 2026-10-24 抓到）。显示口径用 val，算数口径回退 rawValue。
+    var vn=Number(val);
+    if(!isFinite(vn)&&kp.rawValue!=null)vn=Number(kp.rawValue);
+    if(kp.target!=null&&kp.target!==''&&isFinite(t)&&t!==0&&vn!=null&&isFinite(vn)){
       // 目标值与卡片显示的数值同口径（同单位），所以百分比在显示空间里算。
-      var shown=Number(val)/unitDivisor(kp.unitScale);
+      var shown=vn/unitDivisor(kp.unitScale);
       var pct=Math.round(shown/t*100);
       html+='<span class="kpi-progress" title="目标 '+escapeHtml(String(t))+(KPI_UNIT_SUFFIX[kp.unitScale]||'')+'"><span class="kpi-track"><i style="width:'+Math.max(0,Math.min(100,pct))+'%"></i></span><em>'+pct+'%</em></span>';
     }
@@ -18695,6 +18994,8 @@
     out+='</div>';
     return out;
   }
+  // #endregion KPI_CARD_LIFECYCLE
+  // #region DATASET_BUBBLES_INSERT —— 数据源选择器 + 卡片数据气泡 + 值/文本/筛选/BI/明细卡插入 + 交叉表 KPI + 关系编辑器/模拟合并 [tests: test_compose_draft.cjs, test_gallery.cjs, test_filter_scope.cjs, test_data_source_config.cjs] [lane: compose]
   // ---- 数据源选择器（多表可用性）：新建图表/指标/明细先选表；图表设置面板可换表 -----
   function datasetMeta(d){
     var n=((d&&d.columns)||[]).length;
@@ -19663,6 +19964,8 @@
     return out;
   }
 
+  // #endregion DATASET_BUBBLES_INSERT
+  // #region COPILOT_PANEL —— Copilot 侧栏（任务树/证据/计划预览与 diff/执行与轮询/设置/动作路由） [tests: test_copilot_ui.cjs, test_nu_small_batch.cjs] [lane: copilot]
   function serverApiBase(){
     var sb=(global.__AI_REPORT_SERVER_BASE__||'/api/v1');
     if(!/\/api\/v1$/.test(sb))sb=sb.replace(/\/api$/,'')+'/api/v1';
@@ -19993,6 +20296,50 @@
     if(steps.length>16)trace+='<li class="ai-cp-plan-step-note">其余步骤已折叠（共 '+escapeHtml(String(steps.length))+' 步）。</li>';
     return '<section class="ai-cp-plan-result"><div class="ai-cp-plan-head"><strong>执行轨迹</strong><small>'+escapeHtml(result.status||'')+' · '+escapeHtml(String(result.elapsedMs||0))+'ms</small></div><ol>'+trace+'</ol></section>';
   }
+  // XA-03：元数据类 proposal（propose_derived_measure / propose_alias_confirmation）
+  // 在计划预览里的**专用呈现**——不再走通用 diff 行（通用分支对其他工具零变化）。
+  // 派生：ƒ 名称 = 摘要（复用 derivedNodeSummary，与 diff 卡 F7 前缀 / addedMeasure.summary
+  // 同源）+ 依赖列（derivedNodeCols）；别名：别名 → 规范列（需确认）。
+  // 纯函数（入参 check、出参 HTML 片段；derivedNodeSummary/derivedNodeCols 为
+  // DERIVED_MODEL 区域的纯函数）——可被 test_derived_ui.cjs 沙箱求值。
+  function copilotAliasPairsFromCheck(check){
+    var diff=(check&&check.diff&&check.diff.aliases&&typeof check.diff.aliases==='object')?check.diff.aliases:null;
+    if(!diff)return [];
+    var before=(diff.before&&typeof diff.before==='object')?diff.before:{};
+    var after=(diff.after&&typeof diff.after==='object')?diff.after:{};
+    var pairs=[];
+    Object.keys(after).forEach(function(canonical){
+      var prev=Array.isArray(before[canonical])?before[canonical]:[];
+      (Array.isArray(after[canonical])?after[canonical]:[]).forEach(function(alias){
+        if(prev.indexOf(alias)<0)pairs.push([String(alias),String(canonical)]);
+      });
+    });
+    return pairs;
+  }
+  function copilotMetaProposalPreviewHtml(check){
+    if(!check||check.valid===false)return '';
+    if(check.kind==='derived_measure'){
+      var node=(check.diff&&check.diff.addedMeasure&&typeof check.diff.addedMeasure==='object')?check.diff.addedMeasure:null;
+      if(!node)return '';
+      var summary='';
+      try{summary=derivedNodeSummary(node)||'';}catch(err){summary='';}
+      if(!summary&&node.summary)summary=String(node.summary);
+      var deps=(typeof derivedNodeCols==='function'?derivedNodeCols(node):[]).slice(0,8);
+      return '<div class="ai-cp-plan-meta ai-cp-plan-meta-derived"><span class="ai-cp-plan-meta-fx" aria-hidden="true">ƒ</span><b>'+escapeHtml(node.name||'')+'</b>'
+        +(summary?'<span> = '+escapeHtml(summary)+'</span>':'')
+        +(deps.length?'<small>依赖列：'+escapeHtml(deps.join('、'))+'</small>':'')
+        +'<small>数据源元数据提案：只写派生指标声明，既有卡片不变</small></div>';
+    }
+    if(check.kind==='alias_confirmation'){
+      var pairs=copilotAliasPairsFromCheck(check);
+      if(!pairs.length)return '';
+      var body=pairs.slice(0,4).map(function(pair){
+        return '<span class="ai-cp-plan-meta-alias">'+escapeHtml(pair[0])+' → '+escapeHtml(pair[1])+'（需确认）</span>';
+      }).join('')+(pairs.length>4?'<small>等 '+pairs.length+' 项别名</small>':'');
+      return '<div class="ai-cp-plan-meta ai-cp-plan-meta-alias">'+body+'<small>别名确认：写入当前数据集 authored aliases</small></div>';
+    }
+    return '';
+  }
   function copilotPlanPreviewHtml(preview){
     if(!Array.isArray(preview)||!preview.length)return '';
     function previewValue(value){
@@ -20024,6 +20371,11 @@
       if(item.proposal)checks.push(item.proposal);
       if(Array.isArray(item.proposals))checks=checks.concat(item.proposals.slice(0,8));
       var invalid=item.valid===false||checks.some(function(check){return check&&check.valid===false;});
+      // XA-03：元数据类 proposal 专用呈现（校验失败的仍落通用错误行，不吞诊断）。
+      var metaHtml=(!invalid&&item.proposal)?copilotMetaProposalPreviewHtml(item.proposal):'';
+      if(metaHtml){
+        return '<li class="ai-cp-plan-preview-row"><div><b>'+escapeHtml(item.stepId||item.tool||'步骤')+'</b><span>'+escapeHtml(item.requiresApproval?'待审批':'只读')+' · 数据源元数据提案，不动卡片</span></div>'+metaHtml+'</li>';
+      }
       var impactCount=checks.reduce(function(sum,check){return sum+(Number(check&&check.impact&&check.impact.affectedChartCount)||0);},0);
       var detail=item.error||(invalid?'存在无法校验的提案':(!checks.length?'只读步骤，无写入影响':('预计影响 '+String(impactCount||1)+' 张图表')));
       var status=invalid?'无法预览':(item.requiresApproval?'待审批':'只读');
@@ -20092,9 +20444,21 @@
     // must not infer aggregation legality or discover additional affected
     // cards locally; Flint keeps that semantic decision at the caller-owned
     // aggregate boundary (refs/flint/src/core/aggregate.ts:7-20).
-    function diffLabel(key){return ({chartId:'目标卡片',datasetId:'数据源',dimension:'维度',dimensions:'维度序列',measures:'指标',aggregations:'指标聚合',breakdown:'展开维度',dimensionBucket:'时间分桶',viewType:'图表类型',topN:'TOP-N',filter:'卡片筛选'})[key]||key;}
+    function diffLabel(key){return ({chartId:'目标卡片',datasetId:'数据源',dimension:'维度',dimensions:'维度序列',measures:'指标',aggregations:'指标聚合',breakdown:'展开维度',dimensionBucket:'时间分桶',viewType:'图表类型',topN:'TOP-N',filter:'卡片筛选','derived.measures':'派生指标',addedMeasure:'新增指标定义'})[key]||key;}
     function diffValue(value,key){
       if(value===null||value===undefined||value==='')return '—';
+      if(key==='derived.measures'&&value&&typeof value==='object'&&!Array.isArray(value)){
+        var before=Array.isArray(value.before)?value.before:[],after=Array.isArray(value.after)?value.after:[];
+        var fmt=function(list){return list.length?list.slice(0,6).map(function(n){return escapeHtml(copilotText(n));}).join('、')+(list.length>6?' 等 '+list.length+' 项':''):'无';};
+        return '<b>'+fmt(before)+'</b> → '+fmt(after);
+      }
+      if(key==='addedMeasure'&&value&&typeof value==='object'){
+        var bits=[];
+        if(value.summary)bits.push(escapeHtml(copilotText(value.summary)));
+        else if(value.name)bits.push('<b>'+escapeHtml(copilotText(value.name))+'</b>'+(value.kind?'（'+escapeHtml(copilotText(value.kind))+'）':''));
+        else bits.push(escapeHtml(copilotText(value)));
+        return bits.join(' · ');
+      }
       if(key==='aggregations'&&value&&typeof value==='object'&&!Array.isArray(value)){
         var aggs=Object.keys(value).slice(0,12).map(function(name){return escapeHtml(name)+'：'+escapeHtml(copilotAggLabel(value[name]));});
         return aggs.length?aggs.join(' · '):'未声明';
@@ -20112,7 +20476,15 @@
     }).join('');
     if(!items)items='<li class="ai-cp-diff-empty">服务端判断：没有有效变化</li>';
     var impact=check.impact||{},siblings=Array.isArray(impact.siblingCharts)?impact.siblingCharts.slice(0,8):[],tx=check.transaction||{};
-    var scope=tx.crossDataset?'跨数据源事务 · '+(tx.sourceCount||2)+' 个数据源':'同一数据源事务';
+    // XA-03：metadataOnly 派生提案的 diff 卡带「在派生构建器中编辑」。addedMeasure
+    // 只会由 validate_derived_measure 产出（别名 diff 永远没有它），所以它本身就是
+    // 精确的 family 判据。点击行为在 copilotEditDerived：apply 前用提案节点预填，
+    // apply 后节点已在 ds.derived.measures → 定位 idx 打开编辑。
+    var addedMeasureNode=(check&&check.diff&&check.diff.addedMeasure&&typeof check.diff.addedMeasure==='object')?check.diff.addedMeasure:null;
+    var editDerivedBtn=addedMeasureNode
+      ?'<button type="button" class="ai-cp-retry" data-cp-action="edit-derived" data-cp-node-id="'+escapeHtml(String(addedMeasureNode.id||''))+'" data-cp-node-name="'+escapeHtml(String(addedMeasureNode.name||''))+'">在派生构建器中编辑</button>'
+      :'';
+    var scope=tx.metadataOnly?'数据源元数据事务（派生指标/别名，不动卡片）':tx.crossDataset?'跨数据源事务 · '+(tx.sourceCount||2)+' 个数据源':'同一数据源事务';
     var approval=check.requiresApproval===false?'无需审批':'需要编辑审批';
     var affectedCharts=Array.isArray(tx.affectedCharts)?tx.affectedCharts.slice(0,8):[];
     var impactRows=(affectedCharts.length?affectedCharts:siblings).map(function(item){
@@ -20128,7 +20500,7 @@
     var graphHtml=graph?'<div class="ai-cp-impact-graph"><b>跨报告影响图谱</b><span>只读 · '+escapeHtml(String(graph.affectedChartCount||0))+' 张受影响卡片</span>'+(graphRows?'<ul>'+graphRows+'</ul>':'<small>当前租户没有更多共享字段卡片</small>')+(graph.truncation&&graph.truncation.truncated?'<small>图谱已按服务端上限截断</small>':'')+'</div>':'';
     var graphButton=isServerMode()?'<button type="button" class="ai-cp-retry ai-cp-impact-graph-btn" data-cp-action="impact-graph">'+(graph?'刷新跨报告影响图':'查看跨报告影响图')+'</button>':'';
     var impactHtml='<div class="ai-cp-impact-summary"><span>预计影响 '+escapeHtml(String(impact.affectedChartCount||1))+' 张相关图表</span><span>'+escapeHtml(scope)+'</span><span>'+escapeHtml(approval)+'</span>'+(siblings.length?'<small>共享字段：'+escapeHtml(siblings.slice(0,4).map(function(item){return item.title||item.chartId;}).join('、'))+(siblings.length>4?' 等':'')+'</small>':'')+'</div>'+(impactRows?'<div class="ai-cp-impact-list"><b>影响明细</b><ul>'+impactRows+'</ul></div>':'')+warningHtml+graphButton+graphHtml;
-    return '<details class="ai-cp-proposal-diff" open><summary>服务端校验的修改明细 <small>'+escapeHtml(check.proposalId?check.proposalId.slice(0,10):'')+'</small></summary>'+impactHtml+'<ul>'+items+'</ul></details>';
+    return '<details class="ai-cp-proposal-diff" open><summary>服务端校验的修改明细 <small>'+escapeHtml(check.proposalId?check.proposalId.slice(0,10):'')+'</small></summary>'+impactHtml+editDerivedBtn+'<ul>'+items+'</ul></details>';
   }
   function copilotFollowupHtml(message){
     var e=message&&message.evidence||null;
@@ -20148,7 +20520,12 @@
     var user=m.role==='user',pending=m.pending;
     var plan=m.plan,planHtml=plan&&Array.isArray(plan.steps)?'<section class="ai-cp-plan"><div class="ai-cp-plan-head"><strong>分析计划</strong><small>'+(plan.steps.length)+' 步'+(m.requiresApproval?' · 含审批':'')+'</small></div><ol>'+plan.steps.map(function(step){return '<li><b>'+escapeHtml(step.tool||step.id||'步骤')+'</b><span>'+escapeHtml(step.requiresApproval?'需要确认':'可自动执行')+'</span></li>';}).join('')+'</ol><small class="ai-cp-plan-end">完成条件：'+escapeHtml(plan.termination||'取得可验证证据')+'</small>'+copilotPlanPreviewHtml(m.planPreview)+(m.planResult?copilotPlanResultHtml(m.planResult,m.jobId):'<button type="button" class="ai-cp-plan-run" data-cp-action="execute-plan" data-cp-plan-index="'+index+'"'+(m.planExecuting?' disabled':'')+'>'+escapeHtml(m.planExecuting?'正在执行…':(m.requiresApproval?'执行可读步骤（审批项暂不执行）':'执行分析计划'))+'</button>')+'</section>':'';
     var followup=!user&&!pending&&(m.evidence||m.planResult)?copilotFollowupHtml(m):'';
-    return '<div class="ai-cp-message '+(user?'is-user':'is-assistant')+(pending?' is-pending':'')+(m.stale?' is-stale':'')+'"><div class="ai-cp-avatar">'+(user?'你':'✦')+'</div><div class="ai-cp-message-main"><div class="ai-cp-message-label">'+(user?'你':'报告 Copilot')+'</div>'+(m.contextTitle&&!user?'<div class="ai-cp-message-context">针对卡片 · '+escapeHtml(m.contextTitle)+'</div>':'')+'<div class="ai-cp-msg">'+escapeHtml(m.content||'')+'</div>'+planHtml+copilotEvidenceHtml(m.evidence,m.jobId,index,m.evidencePage)+followup+(m.retry?'<button class="ai-cp-retry" data-cp-action="retry" data-cp-retry-index="'+index+'">↻ 重试本次查询</button>':'')+(m.rollbackSnapshot?'<button class="ai-cp-retry" data-cp-action="rollback" data-cp-snapshot="'+escapeHtml(m.rollbackSnapshot)+'">↶ 回滚本次服务端修改</button>':'')+(m.redoSnapshot?'<button class="ai-cp-retry" data-cp-action="redo" data-cp-snapshot="'+escapeHtml(m.redoSnapshot)+'">↷ 重做本次服务端修改</button>':'')+'</div></div>';
+    // XA-03：元数据类提案（造指标）的 diff 卡随消息留存——apply 后
+    // copilotState.proposalCheck 已清空，但消息里的 proposalCheck 让「在派生构建器中
+    // 编辑」按钮仍然可达（此时节点已在 ds.derived.measures，点击定位 idx 打开编辑）。
+    // 图表类提案不在这里渲染：提案区已展示同一条 diff（避免双卡）。
+    var metaDiffHtml=(m.proposalCheck&&m.proposalCheck.diff&&m.proposalCheck.diff.addedMeasure)?copilotProposalDiffHtml(m.proposalCheck):'';
+    return '<div class="ai-cp-message '+(user?'is-user':'is-assistant')+(pending?' is-pending':'')+(m.stale?' is-stale':'')+'"><div class="ai-cp-avatar">'+(user?'你':'✦')+'</div><div class="ai-cp-message-main"><div class="ai-cp-message-label">'+(user?'你':'报告 Copilot')+'</div>'+(m.contextTitle&&!user?'<div class="ai-cp-message-context">针对卡片 · '+escapeHtml(m.contextTitle)+'</div>':'')+'<div class="ai-cp-msg">'+escapeHtml(m.content||'')+'</div>'+planHtml+metaDiffHtml+copilotEvidenceHtml(m.evidence,m.jobId,index,m.evidencePage)+followup+(m.retry?'<button class="ai-cp-retry" data-cp-action="retry" data-cp-retry-index="'+index+'">↻ 重试本次查询</button>':'')+(m.rollbackSnapshot?'<button class="ai-cp-retry" data-cp-action="rollback" data-cp-snapshot="'+escapeHtml(m.rollbackSnapshot)+'">↶ 回滚本次服务端修改</button>':'')+(m.redoSnapshot?'<button class="ai-cp-retry" data-cp-action="redo" data-cp-snapshot="'+escapeHtml(m.redoSnapshot)+'">↷ 重做本次服务端修改</button>':'')+'</div></div>';
   }
   // 主入口聚焦“语义改图”而不是泛问答：Flint 将字段身份与 channel/visual
   // 决策分离（refs/flint/src/core/field-semantics.ts:138-150），pivot 也把
@@ -20215,6 +20592,14 @@
   }
   function copilotStopTaskSync(){if(copilotTaskTimer){clearInterval(copilotTaskTimer);copilotTaskTimer=null;}}
   function copilotOpen(){copilotState.open=true;copilotRender();copilotLoadTasks();copilotLoadProposalHistory();copilotStartTaskSync();}
+  // NU-02：卡片面板「AI 改图」按钮的落点——打开抽屉并把上下文定位到该卡。
+  // 选卡走 copilotSelectCard（与 Copilot 内 select-card 动作同一条通道，含
+  // 高亮/页签激活/滚动定位/历史播报），开抽屉走 copilotOpen（工具栏入口同款）。
+  function copilotOpenCard(blockId){
+    var chart=(manifest.charts||[]).filter(function(item){return item&&item.blockId===blockId;})[0];
+    if(chart)copilotSelectCard(chart.id);
+    copilotOpen();
+  }
   function copilotCancelRun(run){if(run&&run.jobId)copilotApi('/reports/'+encodeURIComponent(manifest.reportId||'')+'/copilot/jobs/'+encodeURIComponent(run.jobId)+'/cancel',{method:'POST',body:JSON.stringify({retryToken:run.retryToken||''})}).catch(function(){});}
   function copilotRecoverTask(jobId,token){
     if(!jobId||!token)return;
@@ -20366,6 +20751,41 @@
   function copilotUndoPreview(){
     var b=copilotState.previewBackup;if(!b)return;copilotRestorePreviewSilently();copilotState.history.push({role:'assistant',content:'已撤销预览，报告配置未改变。',chartId:b.chartId});copilotRender();
   }
+  // XA-03：diff 卡「在派生构建器中编辑」的动态解析——按钮只带节点 id/name，点击时：
+  // ① 节点已在当前数据集 ds.derived.measures（提案已 apply）→ 定位 idx 走既有编辑路径；
+  // ② 未落盘 → 用提案校验里的归一节点预填构建器（openCalcFieldModal 第三参）。
+  // 定义永远只在数据源层一处，预填/编辑都不产生第二份。
+  function copilotDerivedNodeFromCheck(check,nodeId,nodeName){
+    var node=(check&&check.diff&&check.diff.addedMeasure&&typeof check.diff.addedMeasure==='object')?check.diff.addedMeasure:null;
+    if(!node)return null;
+    if(nodeId&&node.id&&String(node.id)!==nodeId)return null;
+    if(nodeName&&node.name&&String(node.name)!==nodeName)return null;
+    return node;
+  }
+  function copilotEditDerived(el){
+    var nodeId=(el&&el.getAttribute?el.getAttribute('data-cp-node-id')||'':'');
+    var nodeName=(el&&el.getAttribute?el.getAttribute('data-cp-node-name')||'':'');
+    var node=copilotDerivedNodeFromCheck(copilotState.proposalCheck,nodeId,nodeName);
+    if(!node){
+      var msgs=Array.isArray(copilotState.history)?copilotState.history:[];
+      for(var i=msgs.length-1;i>=0&&!node;i-=1){
+        var m=msgs[i];
+        if(m&&m.proposalCheck)node=copilotDerivedNodeFromCheck(m.proposalCheck,nodeId,nodeName);
+      }
+    }
+    if(!node)return;
+    var ch=copilotChart(),dsId=(ch&&ch.editor&&ch.editor.data&&ch.editor.data.datasetId)||'';
+    var ds=(manifest.datasets||[]).filter(function(item){return item&&item.id===dsId;})[0]||null;
+    var derived=(ds&&ds.derived&&!Array.isArray(ds.derived)&&typeof ds.derived==='object')?ds.derived:null;
+    var measures=(derived&&Array.isArray(derived.measures))?derived.measures:[];
+    var idx=-1;
+    for(var j=0;j<measures.length;j+=1){
+      var candidate=measures[j];
+      if(candidate&&((nodeId&&candidate.id===nodeId)||(nodeName&&candidate.name===nodeName))){idx=j;break;}
+    }
+    pendingDerivedEdit=(idx>=0)?{node:measures[idx],idx:idx}:{node:JSON.parse(JSON.stringify(node))};
+    openSemanticCanvasForDerived();
+  }
   function copilotApply(){
     var p=copilotState.proposal,ch=copilotChart();if(!p||!ch)return;
     if(p.chartId&&p.chartId!==ch.id){copilotRestorePreviewSilently();copilotState.proposal=null;copilotState.history.push({role:'assistant',content:'当前交互卡片已变化，旧的图表修改提案未应用。',chartId:ch.id});copilotRender();return;}
@@ -20423,6 +20843,7 @@
     }
     if(action==='select-card'){copilotSelectCard(el.getAttribute('data-cp-card-id')||'');return;}
     if(action==='apply'){copilotApply();return;}
+    if(action==='edit-derived'){copilotEditDerived(el);return;}
     if(action==='preview'){copilotPreview();return;}
     if(action==='undo-preview'){copilotUndoPreview();return;}
     if(action==='rollback'||action==='rollback-history'){
@@ -20474,6 +20895,8 @@
     if(action==='prompt'){var prompt=root.querySelector('#ai-cp-input');if(prompt){copilotState.composerDraft=el.getAttribute('data-cp-prompt')||'';prompt.value=copilotState.composerDraft;prompt.focus();}return;}
   }
 
+  // #endregion COPILOT_PANEL
+  // #region CARD_DECORATE_RICH_TEXT —— 关系物化（服务端/本地宽表）+ 卡片装饰/帮助/删除/卡样式 + 拖拽守卫 + 轻富文本编辑与格式条 [tests: test_rich_text_editing.cjs, test_text_cards.cjs, test_full_review_batch.cjs, test_data_source_config.cjs] [lane: text]
   // server 模式：服务端持有全部源表，直接请它用同一个 merge_tables.materialize 物化成
   // 真实宽表（POST /api/reports/:id/materialize-relation），回来就是可查的数据集。
   function serverMaterializeRelation(rel){
@@ -21762,6 +22185,8 @@
     syncParaDragAttrs();
   }
   function setTextEditing(on){if(!on)deactivateText();document.querySelectorAll('[data-editable-text]').forEach(function(element){if(!on||element!==activeText)element.removeAttribute('contenteditable');});}
+  // #endregion CARD_DECORATE_RICH_TEXT
+  // #region EDIT_MODE_UPDATE_CHART —— 编辑/阅读模式切换 + 数据时点徽章 + updateChart 面板提交总入口 [tests: test_field_panel_ux.cjs, test_table_colmulti.cjs, test_table_row_forms.cjs, test_measure_names.cjs] [lane: core]
   // 编辑模式/阅读模式 toggle icons: transparent stroke-only (fill="none").
   var EDIT_MODE_ICON='<svg class="ai-tb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
   var READ_MODE_ICON='<svg class="ai-tb-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>';
@@ -22208,13 +22633,18 @@ var pmdEl=document.getElementById('ai-table-pagermode');
 if(pmdEl){if(pmdEl.value==='simple')chart.editor.table.pagerMode='simple';else delete chart.editor.table.pagerMode;}
 // WP-7 卡高三态提交（docs/wp7-bounded-height-design.md）：三态互斥的唯一写入口。
 // grow=缺省不落盘（旧 manifest 零漂移）；fixed=manualH 既有语义收编（manualH 数据
-// 保留，切走再切回即恢复）；bounded={bounded:{maxPx}}（边界同 validate_request）。
+// 保留，切走再切回即恢复）；bounded={bounded:{maxPx}}（边界同 validate_request）；
+// XU-01 行数档 rows={bounded:{maxBodyRows}}（5..500，越界删键 fail-closed，缺省 30）。
 // id 读不到=面板没渲染，绝不动已存值。
 var hmodeEl=document.getElementById('ai-table-heightmode');
 if(hmodeEl){
   var hv=hmodeEl.value;
   if(hv==='fixed')chart.editor.table.heightMode='fixed';
   else if(hv==='grow')delete chart.editor.table.heightMode;
+  else if(hv==='rows'){
+    var mrv=Math.round(Number((document.getElementById('ai-table-maxrows')||{}).value)||0);
+    if(mrv>=5&&mrv<=500)chart.editor.table.heightMode={bounded:{maxBodyRows:mrv}};else delete chart.editor.table.heightMode;
+  }
   else{
     var mxv=hv==='custom'?Math.round(Number((document.getElementById('ai-table-maxpx')||{}).value)||0):Number(hv);
     if(mxv>=200&&mxv<=4000)chart.editor.table.heightMode={bounded:{maxPx:mxv}};else delete chart.editor.table.heightMode;
@@ -22226,6 +22656,8 @@ if(hmodeEl){
   }
   var hmpx=document.getElementById('ai-table-maxpx');
   if(hmpx)hmpx.hidden=(hv!=='custom');
+  var hmrs=document.getElementById('ai-table-maxrows');
+  if(hmrs)hmrs.hidden=(hv!=='rows');
 }
 // export 重建：全空=删整键（headStyle 同款，不留 {} 尸体）。
 var exEn=document.getElementById('ai-table-export-enabled'),exNm=document.getElementById('ai-table-export-name'),exWm=document.getElementById('ai-table-export-watermark');
@@ -22309,6 +22741,8 @@ if(rfEl){
     // rule banner). This keeps the enforced limits visible and in sync.
     if(prevViewType!==chart.viewType&&selected&&selected.kind==='chart')openChart(chart);
   }
+  // #endregion EDIT_MODE_UPDATE_CHART
+  // #region EXPORT_SAVE_UPLOAD —— 单文件下载（可编辑/只读快照）+ 剪贴板 + 服务端保存/口令/数据集上传与替换任务轮询/数据任务卡 [tests: test_save_snapshot.cjs, test_editor_iteration.cjs, test_interaction.cjs, test_ninth_review.cjs, test_refresh_bigtable.cjs] [lane: core]
   // Download the report. Two flavours:
 //   - editable (default): keeps #ai-report-runtime-ui, contenteditable hooks
 //     and the runtime CSS, so the recipient can click 编辑 and continue
@@ -22912,6 +23346,8 @@ if(rfEl){
   }
   // Back-compat: the top-bar button still calls a no-arg download().
   function download(){downloadVariant(false);}
+  // #endregion EXPORT_SAVE_UPLOAD
+  // #region SHARE_READONLY —— 分享链接 + 保存与分享中心（PPTX/PDF 导出反馈/快速保存/口令）+ 只读查看器工具条 [tests: test_save_snapshot.cjs, test_eighth_review.cjs, test_editor_iteration.cjs, test_field_panel_ux.cjs] [lane: pptx]
   // server 模式分享：复制局域网链接（可编辑/只读），而非下载 HTML 快照。
   function copyShareLink(readonly){
     var origin=manifest.shareOrigin||window.location.origin;
@@ -23218,6 +23654,8 @@ if(rfEl){
     // 编辑模式 ⇄ 阅读模式：纯切态，不带任何保存/下载副作用。
     setEditing(!editing);
   });
+  // #endregion SHARE_READONLY
+  // #region TOOLBAR_THEME_WIDTH —— 工具栏三菜单（插入/主题/宽度）+ 报告主题轴应用/预览/回滚 + 页宽档位 + 只读工具条接线 + 分隔文本解析工具 [tests: test_report_theme.cjs, test_page_width.cjs, test_refresh_bigtable.cjs] [lane: core]
   // Dropdown toggles for 插入卡片 / 主题 / 宽度 menus. Clicking a menu item just
   // performs its action and closes; clicking outside closes any open menu.
   // A2：收起唯一出口 closeToolbarMenus（内含 unbindEsc）；打开时 bindEsc → ESC 关。
@@ -23486,6 +23924,7 @@ if(rfEl){
     var action=actionEl?actionEl.getAttribute('data-runtime-action'):null;if(!action)return;
     if(action==='close'){document.getElementById('ai-report-runtime-panel').dataset.open='false';syncPanelClass();exitFocus();}
     else if(action==='copilot-open'){copilotOpen();}
+    else if(action==='copilot-open-card'){copilotOpenCard(actionEl.getAttribute('data-block-id'));}
     else if(action==='download')download();
     else if(action==='share-editable')shareOpEditable();
     else if(action==='share-readonly')shareOpReadonly();
@@ -23755,7 +24194,8 @@ if(rfEl){
     throw new Error('仅支持 .xlsx / .csv / .tsv / .json 文件');
   }
   function datasetById(dsid){return (manifest.datasets||[]).filter(function(d){return d.id===dsid;})[0]||null;}
-  // #region DERIVED_MODEL_BEGIN
+  // #endregion TOOLBAR_THEME_WIDTH
+  // #region DERIVED_MODEL_BEGIN —— 派生声明 P1 模型（chartDerivedToNodes 迁移 + 引用/列收集 + 环检测 + 摘要 + 校验 + 窗口闸门）纯函数区 [tests: test_derived_model.cjs, test_derived_ui.cjs, test_data_source_config.cjs] [lane: derived]
   // ---- Derived declarations (P1 model) -------------------------------------
   // dataset.derived = {columns:[{name,op,left,right,…}],   // 行级计算列
   //                    measures:[{kind:'formula'|'window', …}]}  // 聚合级派生指标
@@ -24099,6 +24539,7 @@ if(rfEl){
     return out;
   }
   // #endregion DERIVED_MODEL_END
+  // #region DERIVED_APPLY_IMPORT —— 派生列/维度组物化应用 + 图表派生同步（闭包烘焙）+ 列布局比对 + 列导入向导 [tests: test_derived_model.cjs, test_tbl_h4_h8.cjs, test_upsert_merge.cjs, test_bugfix_sweep.cjs] [lane: derived]
   // Derived columns (docs/semantic-config-enhancement.md §2): whitelist ops on
   // the materialised dataset column. Mirrors Python DERIVED_OP_FNS exactly so a
   // data update / grid edit never drifts from the compile-time values.
@@ -24353,7 +24794,8 @@ if(rfEl){
     importProposal=null;
     applyImportMap(ds,table,map,false,zone);
   }
-  // ==== #region UPSERT_MERGE ====
+  // #endregion DERIVED_APPLY_IMPORT
+  // ==== #region UPSERT_MERGE ==== —— 增量合并（主键 upsert；PY upsert_merge.py 镜像，纯函数区） [tests: test_upsert_merge.cjs] [lane: core]
   // 增量合并（按主键 upsert：有则覆盖、无则插入）——PY 真源 scripts/upsert_merge.py
   // 的 JS 镜像（singlefile 内存合并）。语义逐分支一致：键归一（trim + 整数值浮点
   // 折叠：1902.0/"1902.0"/1902 同一键）、守卫 fail-closed（列集不一致/主键空值/
@@ -24455,6 +24897,7 @@ if(rfEl){
     return {rows:merged,stats:{inserted:inserted,updated:updated}};
   }
   // ==== #endregion UPSERT_MERGE ====
+  // #region DATASET_COMPOSE_FLOW —— 数据集替换/新增向导（替换模式记忆/确认/应用更新）+ 行列值三区读写状态/芯片拖拽 + 拖拽拼版画廊/compose 草稿 + 全局 API 导出 [tests: test_upsert_merge.cjs, test_refresh_bigtable.cjs, test_table_headers.cjs, test_quickbi_ui_batch.cjs, test_compose_draft.cjs, test_gallery.cjs] [lane: compose]
   // 增量合并的行身份只认**原始列**：物化列（计算列/维度值分组）是声明的产物，
   // 合并后由 applyDerivedToDataset/applyDimGroupsToDataset 重算（与服务端
   // replace 管线同一秩序）。
@@ -26313,3 +26756,4 @@ function appendNewDataset(table, label){
 
   global.AIReportRuntime={manifest:manifest,renderChart:renderChart,setEditing:setEditing,isEditing:function(){return editing;},selectBlock:selectBlock,openBlock:openBlock,addBI:addBI,addValue:addValue,addDetail:addDetail,addText:addText,addFilter:addFilter,addGrid:addGrid,openGridEditor:openGridEditor,appendNewDataset:appendNewDataset,deleteBlock:deleteBlock,download:download,downloadEditable:function(){downloadVariant(false);},downloadReadonly:function(){downloadVariant(true);},syncLayouts:syncLayouts,syncManifest:syncManifest,resizeCharts:function(){try{resizeCharts();}catch(e){}},clearFilters:clearAllFilters,isUnsaved:function(){return unsaved;},openValueAliasModal:openValueAliasModal,setColHidden:setColHidden,valAliasOf:valAliasOf,colIsHidden:colIsHidden,filterCardChips:filterCardChips,openGallery:function(){openGallery();},galleryApplyPattern:function(p){galleryApplyPattern(p);},addCompose:function(pos){addComposeOn(pos);},openComposePanel:function(id){openComposePanel(id);},refreshDraftEmptyState:refreshDraftEmptyState,isComposeDraft:isComposeDraft,mdInlineText:mdInlineText};
 })(window);
+  // #endregion DATASET_COMPOSE_FLOW

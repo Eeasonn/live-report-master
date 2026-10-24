@@ -193,7 +193,21 @@
         "type": [
           "string",
           "object"
-        ]
+        ],
+        "description": "字符串或对象。对象形态正文键 = text/content/description/body/summary/finding/title/heading；另支持 facts:[]（≤6 条去重 id）证据绑定——渲染为洞察后的「依据（脚本计算）」脚注；引用不存在的 fact id 构建失败（防幻觉闸）。",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "facts": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+              "type": "string"
+            },
+            "description": "fact id 引用（构建期 `fact:<类>:<序号>` 或请求级 facts 的 id），存在性在构建期校验。"
+          }
+        }
       }
     },
     "texts": {
@@ -826,6 +840,27 @@
               "minLength": 1
             },
             "description": "增量合并（按主键 upsert）的主键列；列必须存在于本表（compile 期对真实表再校验）"
+          },
+          "privacy": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "sensitiveColumns"
+            ],
+            "properties": {
+              "sensitiveColumns": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 64,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "敏感列声明（NS-01）：构建期物理剥离、不可恢复——该列从数据集 rows/columns 剔除，不进任何产物；每项必须命中本表真实列名（compile 期校验）；任何 chart/kpi/filter/derived/breakdown 引用即构建失败"
+              }
+            },
+            "description": "隐私声明：sensitiveColumns 中的列在编译期从表中物理剔除（singlefile 内联 rows、mixed 内联表、server/mixed 表声明一视同仁），manifest 保留本声明供 server Agent 链脱敏投影消费"
           }
         }
       }
@@ -1221,7 +1256,10 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["gregorian", "fiscal"]
+          "enum": [
+            "gregorian",
+            "fiscal"
+          ]
         },
         "fiscalStartMonth": {
           "type": "integer",
@@ -1405,6 +1443,11 @@
         "title": {
           "type": "string",
           "maxLength": 120
+        },
+        "question": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "分析主张/问题一句话（NA-02）：这张图要回答什么。只查有无（lint L23 advisory），不查对错；主张的证据用 insights[].facts 绑定构建期 profile.facts 的 id。"
         },
         "encoding": {
           "type": "object",
@@ -2022,7 +2065,7 @@
               }
             },
             "heightMode": {
-              "description": "高度三态（WP-7）：grow 自适应生长（缺省）/ fixed（=manualH 既有语义）/ bounded 有界高度（maxPx 200..4000，冻结表头前置）。",
+              "description": "高度三态（WP-7）：grow 自适应生长（缺省）/ fixed（=manualH 既有语义）/ bounded 有界高度（maxPx 200..4000 或 maxBodyRows 5..500（XU-01 行数口径，二选一互斥），冻结表头前置）。",
               "anyOf": [
                 {
                   "enum": [
@@ -2039,17 +2082,34 @@
                   "properties": {
                     "bounded": {
                       "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "maxPx"
-                      ],
-                      "properties": {
-                        "maxPx": {
-                          "type": "integer",
-                          "minimum": 200,
-                          "maximum": 4000
+                      "oneOf": [
+                        {
+                          "required": [
+                            "maxPx"
+                          ],
+                          "properties": {
+                            "maxPx": {
+                              "type": "integer",
+                              "minimum": 200,
+                              "maximum": 4000
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        {
+                          "required": [
+                            "maxBodyRows"
+                          ],
+                          "properties": {
+                            "maxBodyRows": {
+                              "type": "integer",
+                              "minimum": 5,
+                              "maximum": 500
+                            }
+                          },
+                          "additionalProperties": false
                         }
-                      }
+                      ]
                     }
                   }
                 }

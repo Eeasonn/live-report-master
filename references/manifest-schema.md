@@ -19,6 +19,16 @@ manifest 是编译器和浏览器运行时之间的内部契约。Agent 不直�
 
 `mode` 只有 `singlefile` 或 `server`。singlefile 的 dataset 可以含 `rows`；server dataset 必须只有 schema（`columns`、`rowCount`），不能泄漏原始行。server 首屏 option 可以含编译期聚合结果，但用户切字段时通过 `/api/v1` 重新请求。
 
+`quality` 是开放对象（additionalProperties: true），除数据质量外还携带两类构建期勾稽产物：
+
+- `quality.anchors`：对账锚点勾稽记录（声明值 vs 实算值，编译期硬闸通过后落账）；
+- `quality.facts` / `quality.factsSkipped`：构建期 `profile.facts` 六类确定性事实
+  （`{id, kind, statement, evidence, columns}`，id 形如 `fact:<类>:<序号>`）与无法判定类的
+  跳过原因——decision_ledger「数据事实（脚本计算）」节与 lint（L21 发散依据）从这里读。
+
+chart entry 可携带可选 `question`（NA-02 分析主张/问题一句话，作者经 `chart.question` 声明）；
+insights 条目是已完成占位替换与证据脚注拼装的字符串（脚注行以「依据（脚本计算）：」开头）。
+
 ## dataset 与 chart
 
 singlefile dataset：

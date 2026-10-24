@@ -33,7 +33,7 @@ if str(SKILL_DIR / "scripts") not in sys.path:
 
 DEFAULT_SERVER = "http://127.0.0.1:8765"
 
-from server.loopback import urlopen_loopback  # noqa: E402
+from server._platform import urlopen_loopback  # noqa: E402
 
 
 def _http_json(method: str, url: str, body: dict | None = None, timeout: int = 30) -> dict:
@@ -208,7 +208,7 @@ def cmd_register(args):
     server_base = "/api/v1"
 
     # Load data
-    from server.loader import load
+    from server.registry import load
     table = load(Path(args.data))
     # 列统计（数据源配置字段副行）：server 模式刻意不写 canonical JSON，所以
     # report_build 把 profile 产物直接传进来；_compiled_manifest 会把 table 写成临时
@@ -246,7 +246,7 @@ def cmd_register(args):
     # compiler uses (server/derived_columns.py → scripts/derived_eval.py), and
     # the snapshot file stays raw. The declaration is taken from the compiled
     # manifest (single source) and shipped with the dataset payload.
-    from server.derived_columns import columns_decl
+    from server.store import columns_decl
     _primary_ds = (manifest.get("datasets") or [{}])[0] or {}
     derived_decl = columns_decl(_primary_ds.get("derived"))
     primary_pk = _primary_ds.get("primaryKey")

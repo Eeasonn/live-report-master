@@ -41,7 +41,7 @@ DEFAULT_SINGLEFILE_BYTES = 50 * 1024 * 1024
 if str(SKILL) not in sys.path:
     sys.path.insert(0, str(SKILL))
 from server import SKILL_VERSION  # noqa: E402
-from server.loopback import urlopen_loopback  # noqa: E402
+from server._platform import urlopen_loopback  # noqa: E402
 _WINDOWS_RESERVED_RE = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE)
 
 
@@ -401,8 +401,18 @@ def _post_registry_payload(server_base: str, payload: bytes) -> dict:
     req = urllib.request.Request(server_base.rstrip('/') + '/api/admin/registry/register',
                                  data=payload, headers={'Content-Type': 'application/json'},
                                  method='POST')
-    with urlopen_loopback(req, timeout=300) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    try:
+        with urlopen_loopback(req, timeout=300) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        # 冲突闸 409（NC-02）：urlopen 抛的裸 HTTPError 只有状态码，可行动文案
+        # （撞了哪个 id / 两边 title 各是什么 / 出口）在错误 body 里——必须解出
+        # 来给上层，否则 build-status.json 只剩「HTTP Error 409」无从行动。
+        try:
+            detail = json.loads(exc.read().decode('utf-8')).get('error', {}).get('message', '')
+        except Exception:
+            detail = ''
+        raise RuntimeError(f"注册被服务端拒绝（HTTP {exc.code}）：{detail}") from exc
 
 
 def _canary_multi_body(body: dict, stage_id: str) -> dict:
@@ -431,11 +441,20 @@ def _safe_report_id(title: str) -> str:
 
     The server registry requires ``^[A-Za-z][A-Za-z0-9_-]{1,79}$`` — a raw
     Chinese title would fail registration with HTTP 400, forcing the model to
-    hand-write a reportId. Slug the title deterministically instead."""
+    hand-write a reportId. Slug the title deterministically instead.
+
+    NC-02 / 缺陷 #8（2026-10-23 拍板 D2）：标题提不出任何 ASCII 字母时**绝不
+    落通用 id ``report``**——纯中文标题曾经全部塌到同一个 ``report``，与注册表
+    已有 ``report`` 条目 upsert 撞车并静默覆盖别人的报告（2026-10-20 课程交付
+    破坏性实锤）。改为 ``r-<标题规范化 sha256 前 8 位>``：确定性（同标题重建
+    id 稳定 → h_register 同 id 同 title 视为正常重建放行）、不同标题不同 id、
+    且满足注册表正则。有字母时维持既有 slug 行为逐位不变。"""
     slug = re.sub(r"[^A-Za-z0-9]+", "-", (title or "")).strip("-")
     slug = re.sub(r"^[^A-Za-z]+", "", slug).strip("-")  # must start with a letter
     if not slug:
-        slug = "report"
+        import hashlib
+        norm = re.sub(r"\s+", "", title or "")
+        slug = f"r-{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:8]}"
     if len(slug) < 2:
         # registry 正则要求 ≥2 字符：单个字母的 slug（"C端…" → "C"）必然 400。
         slug = f"{slug}-report"
@@ -1088,15 +1107,23 @@ def _port_bindable(host: str, port: int) -> bool:
     （http.server ``allow_reuse_address = 1``）本就能绑回来，不该因此漂移；
     活动监听器在 macOS/Linux 上两次都失败（实测 SO_REUSEADDR 抢不占活监听）。
     Windows 的 SO_REUSEADDR 允许抢占活动监听，不能作为「空闲」证据——只信
-    严格试绑。"""
+    严格试绑。
+
+    IPv6 双栈通配探针（2026-10-24，ninth-review 真机实锤）：macOS 的
+    ``python -m http.server`` 默认 AF_INET6 + V6ONLY=0 双栈通配监听——只探
+    IPv4 会被 ``*:8766`` 形态的外来占口骗过（IPv4 严格试绑靠 SO_REUSEADDR
+    回退假绿），子进程 bind 照样 EADDRINUSE。空闲判定 = IPv4 与 IPv6 双栈
+    严格试绑都过；本机无 IPv6 栈时该探针安静跳过。"""
     import socket as _socket
 
-    def _try(reuse: bool) -> bool:
-        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    def _try(reuse: bool, family: int, addr: str) -> bool:
+        s = _socket.socket(family, _socket.SOCK_STREAM)
         try:
             if reuse and os.name != "nt":
                 s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            s.bind((host, int(port)))
+            if family == _socket.AF_INET6:
+                s.setsockopt(_socket.IPPROTO_IPV6, _socket.IPV6_V6ONLY, 0)
+            s.bind((addr, int(port)))
             return True
         except OSError:
             return False
@@ -1106,9 +1133,19 @@ def _port_bindable(host: str, port: int) -> bool:
             except OSError:
                 pass
 
-    if _try(False):
-        return True
-    return os.name != "nt" and _try(True)
+    def _family_ok(family: int, addr: str) -> bool:
+        if _try(False, family, addr):
+            return True
+        return os.name != "nt" and _try(True, family, addr)
+
+    if not _family_ok(_socket.AF_INET, host):
+        return False
+    try:
+        if not _family_ok(_socket.AF_INET6, "::"):
+            return False
+    except OSError:
+        pass  # 本机无 IPv6 栈：只信 IPv4 探针
+    return True
 
 
 def _allocate_free_port(host: str, preferred_port: int) -> int:
@@ -1440,6 +1477,10 @@ def main() -> int:
     ap.add_argument("--max-cardinality", type=int, default=DEFAULT_SINGLEFILE_CARDINALITY,
                     help="singlefile dimension cardinality limit (cannot exceed 2000)")
     ap.add_argument("--report-id", default=None, help="override request.reportId")
+    ap.add_argument("--force-register", action="store_true",
+                    help="注册冲突闸（NC-02：同 id 异 title 409）放行：确认要覆盖同 id 报告时"
+                         "在注册 payload 带 force=true（仅 mixed/multi 注册路径；单表 server 注册"
+                         "走 serve_report，撞闸请换 --report-id 或先在管理页注销旧报告）")
     ap.add_argument("--server", default=None, help="override request.runtime.serverUrl")
     ap.add_argument("--skip-audit", action="store_true")
     ap.add_argument("--audit-scope", default=None,
@@ -1917,6 +1958,9 @@ def main() -> int:
             payload_ds.append(item)
         body = {"reportId": report_id, "title": manifest.get("title") or title,
                 "manifest": manifest, "multi": True, "datasets": payload_ds}
+        if args.force_register:
+            # D2：冲突闸的显式覆盖出口（--force-register → payload.force=true）。
+            body["force"] = True
         # Multi-dataset canary: every dataset id in the manifest/payload is
         # namespaced to stage_id, never the live id. Persist the final payload
         # to disk and release the huge rows before launching Chrome; after a

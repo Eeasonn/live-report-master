@@ -160,6 +160,25 @@ def _rank_top1(table: dict[str, Any] | None, dim: str, measure: str | None,
     return max(acc.items(), key=lambda kv: _val(kv[1]))[0]
 
 
+def _fact_of(facts: list[dict[str, Any]], kind: str,
+             dim: str | None = None, measure: str | None = None,
+             columns: set[str] | None = None) -> dict[str, Any] | None:
+    """从 profile.facts 里挑一条匹配的事实（NA-01 消费端：suggest 的结论式标题
+    只从 facts 里挑真话——没有匹配事实就不写主张句，退回半结论式默认标题）。"""
+    for f in facts or []:
+        if not isinstance(f, dict) or f.get("kind") != kind:
+            continue
+        ev = f.get("evidence") or {}
+        if dim is not None and ev.get("dimension") != dim:
+            continue
+        if measure is not None and ev.get("measure") != measure:
+            continue
+        if columns is not None and set(f.get("columns") or []) != columns:
+            continue
+        return f
+    return None
+
+
 def suggest_charts(profile: dict[str, Any],
                    table: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Data-shape heuristics → a short, family-diverse chart list.
@@ -174,6 +193,10 @@ def suggest_charts(profile: dict[str, Any],
     Flint additive/intensive role). Without it, titles stay descriptive. The
     model is expected to overwrite titles with real findings in its patch; these
     are just better placeholders (SKILL.md「标题写发现句」).
+
+    ``profile.facts``（NA-01，六类确定性事实）是结论式标题的真话来源：有匹配事实
+    才把半结论升级成主张句（带上占比），并把分析主张写进 ``chart.question``
+    （指到 fact id）；无 facts 时零变化（现行半结论式默认标题，零回归）。
     """
     columns: list[dict[str, Any]] = profile.get("columns") or []
     by_name = {c.get("name"): c for c in columns}
@@ -183,6 +206,7 @@ def suggest_charts(profile: dict[str, Any],
     low_dims = [c.get("name") for c in _low_card_dims(columns)]
     stage_dims = [d for d in dims if _STAGE_HINT.search(d or "") and
                   (by_name.get(d) and 3 <= int(by_name[d].get("distinct", 0) or 0) <= 12)]
+    facts = [f for f in (profile.get("facts") or []) if isinstance(f, dict) and f.get("id")]
 
     has_measures = bool(measures)
     count_label = "记录数"
@@ -198,7 +222,8 @@ def suggest_charts(profile: dict[str, Any],
     family_used: dict[str, int] = {}
     charts: list[dict[str, Any]] = []
 
-    def add(preset: str, title: str, encoding: dict[str, Any] | None) -> None:
+    def add(preset: str, title: str, encoding: dict[str, Any] | None,
+            question: str | None = None) -> None:
         fam = _FAMILY.get(preset, "其他")
         if len(charts) >= _MAX_CHARTS:
             return
@@ -207,6 +232,8 @@ def suggest_charts(profile: dict[str, Any],
         family_used[fam] = family_used.get(fam, 0) + 1
         chart: dict[str, Any] = {"id": f"chart-{len(charts) + 1}", "presetId": preset,
                                  "title": title}
+        if question:
+            chart["question"] = question
         if encoding:
             chart["encoding"] = encoding
         charts.append(chart)
@@ -218,23 +245,49 @@ def suggest_charts(profile: dict[str, Any],
         m0 = measures[0] if has_measures else count_label
         span = _time_span(table, times[0])
         title = f"{m0}走势（{span[0]}→{span[1]}）" if span else f"{m0} 随时间趋势"
-        add("line.trend", title, bind(times[0], primary))
+        # 主张（有 top_mover 事实才写）：环比极值是这条趋势线的分析问题。
+        tm = _fact_of(facts, "top_mover")
+        q = None
+        if tm:
+            ev = tm.get("evidence") or {}
+            q = (f"最近一期 {ev.get('latest')} 对 {ev.get('previous')}，哪个"
+                 f"{ev.get('dimension')}的{ev.get('measure')}环比变化最大？（依据 {tm.get('id')}）")
+        add("line.trend", title, bind(times[0], primary), question=q)
 
     # 2) Rank/compare over a readable category.
     if low_dims:
+        rank_q: str | None = None
         if has_measures:
             intensive = _measure_hint(profile, measures[0]) in _INTENSIVE_HINTS
             top1 = _rank_top1(table, low_dims[0], measures[0], intensive)
             title = f"{top1}的{measures[0]}居首" if top1 else f"{low_dims[0]} 对比"
+            # 集中度事实与榜首同源时，标题升级成带占比的主张句（从事实里挑真话）。
+            conc = _fact_of(facts, "concentration", dim=low_dims[0], measure=measures[0]) if top1 else None
+            share = None
+            if conc:
+                share = next((t.get("share") for t in (conc.get("evidence") or {}).get("top3") or []
+                              if t.get("label") == top1), None)
+            if share is not None:
+                title = f"{top1}的{measures[0]}居首（占 {share * 100:.1f}%）"
+                rank_q = (f"「{top1}」以 {share * 100:.1f}% 的{measures[0]}份额领先"
+                          f"（依据 {conc.get('id')}）")
+            add("bar.rank", title, bind(low_dims[0], primary), question=rank_q)
         else:
             top1 = _rank_top1(table, low_dims[0], None, False)
             title = f"{top1}记录数最多" if top1 else f"{low_dims[0]} {count_label}"
-        add("bar.rank", title, bind(low_dims[0], primary))
+            add("bar.rank", title, bind(low_dims[0], primary))
 
     # 3) Two-measure relationship (real measures only).
     if len(measures) >= 2:
+        corr = _fact_of(facts, "correlation", columns=set(measures[:2]))
+        q = None
+        if corr:
+            r = (corr.get("evidence") or {}).get("r")
+            q = (f"{measures[0]} 与 {measures[1]} 的行级相关有多强"
+                 f"（r={r:.2f}，相关非因果；依据 {corr.get('id')}）" if isinstance(r, (int, float))
+                 else f"{measures[0]} 与 {measures[1]} 的行级相关有多强？（依据 {corr.get('id')}）")
         add("scatter.correlation", f"{measures[0]} × {measures[1]} 关联",
-            {"measures": measures[:2]})
+            {"measures": measures[:2]}, question=q)
 
     # 4) Two-category crosstab (grouped/stacked).
     if len(low_dims) >= 2:

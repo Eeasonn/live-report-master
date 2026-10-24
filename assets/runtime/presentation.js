@@ -227,7 +227,23 @@
     var b=document.querySelector('[data-pres-action="plaintext"]');
     if(b)b.classList.toggle('ai-pres-on',plainTextOn());
   }
-  function layoutRows(l,geo){return (l.page||0)*geo.pageRows+geo.titleRows+(l.slot||0);}
+  // O8：行位换算读页级 noTitle override —— noTitle 页 titleRows=0（卡区上移）。
+  // 分页几何三处同源之一（deck/buildDeckDOM 与 PPTX 离屏同源 derive 自这里）。
+  // 只读 manifest.presentation.layout（不经 presSpec()——那会往缺键 manifest 写
+  // 空对象，几何读取不得有副作用）。
+  function layoutRows(l,geo){
+    var m=manifest();
+    var lay=(m&&m.presentation&&m.presentation.layout)||null;
+    var firstMap=firstIdByPage(lay);
+    return (l.page||0)*geo.pageRows+pageCapRowsOffset(l.page|0,firstMap,geo)+(l.slot||0);
+  }
+  // 该页卡区顶部要跳过的行数（titleRows 或 noTitle 页的 0）。
+  function pageCapRowsOffset(page,firstMap,geo){
+    var m=manifest();
+    var nt=m&&m.presentation&&m.presentation.noTitle;
+    var id=firstMap&&firstMap[page];
+    return (nt&&id&&nt[id])?0:geo.titleRows;
+  }
   function seedPresentationLayout(){
     var geo=pageGeometry(gridWidth());
     var maxRows=Math.max(1,geo.contentRows|0);
@@ -254,13 +270,19 @@
   // 把「期望的 page/slot」变成**合法**的 page/slot：不落进标题带、不与已放置卡重叠
   // （同行但列不重叠是允许的）、放不下就顺延下一页。保留用户行偏移（不重排），
   // 冲突时向下推。语义与 GridStack 的碰撞解析一致，所以 DOM 与 layout 不会分叉。
-  function placeItems(items,geo){
+  // O8：opts.noTitlePages(page)（可选谓词）放行 noTitle 页的整页容量（pageRows）；
+  // 缺省/缺参 = 既有行为逐位不变（恒 contentRows）。
+  function placeItems(items,geo,opts){
     // 比一页内容区还高的卡必须夹到页高（否则 fit() 永远返回 -1，下面的 while
     // 会无限翻页把 byPage 撑爆）。真机踩过：表格卡自动高度后 = 18/39 行，
     // 而 1600px 窗宽下 contentRows 只有 ~13 → 点「汇报模式」直接卡死并抛
     // RangeError: Invalid array length（fit 里的 byPage）。
     // 夹页后仍不丢内容：卡片内部 .ai-report-table-wrap 自己滚（汇报页是定尺 16:9 帧）。
     var maxRows=Math.max(1,geo.contentRows|0);
+    function capOf(page){
+      return (opts&&typeof opts.noTitlePages==='function'&&opts.noTitlePages(page))
+        ?Math.max(1,geo.pageRows|0):maxRows;
+    }
     var saved=items.filter(function(it){return it.page!=null&&isFinite(it.page);});
     var lastPage=0,lastEnd=0;
     saved.forEach(function(it){var end=(it.page||0)*geo.pageRows+(it.slot||0)+(it.h||1);if(end>lastEnd)lastEnd=end;lastPage=Math.max(lastPage,it.page||0);});
@@ -282,19 +304,20 @@
         if(!hit)break;
         s=hit.end;
       }
-      if(s+h>geo.contentRows)return -1;
+      if(s+h>capOf(page))return -1;
       occ.push({start:s,end:s+h,x:x,w:w});
       return s;
     }
     ordered.forEach(function(it){
-      var h=Math.max(1,it.h||1);
-      if(h>maxRows)h=maxRows;             // 高于一页 → 夹页（不然 fit 永不成功）
       var x=Math.max(0,it.x||0), w=Math.max(1,it.w||12);
       var page=(it.page==null||!isFinite(it.page))?lastPage:(it.page|0);
       var slot=(it.slot==null||!isFinite(it.slot))?appendSlot:(it.slot|0);
+      var h=Math.max(1,it.h||1);
+      var cap=capOf(page);
+      if(h>cap)h=cap;                     // 高于一页容量 → 夹页（不然 fit 永不成功）
       var placed=fit(page,slot,h,x,w);
       var guard=0;
-      while(placed<0&&(guard+=1)<=PACK_MAX_PAGES){page+=1;slot=0;placed=fit(page,slot,h,x,w);}
+      while(placed<0&&(guard+=1)<=PACK_MAX_PAGES){page+=1;slot=0;cap=capOf(page);if(h>cap)h=cap;placed=fit(page,slot,h,x,w);}
       if(placed<0)placed=0;               // 纯守扩：绝不挂死
       out[it.id]={page:page,slot:placed,x:x,w:w,h:h};
     });
@@ -316,7 +339,9 @@
       items.push({id:id,h:Number(c.getAttribute('gs-h')||1),x:Number(c.getAttribute('gs-x')||0),w:Number(c.getAttribute('gs-w')||12),ord:i,
         page:l?l.page:null,slot:l?l.slot:null});
     });
-    var layout=placeItems(items,geo);
+    // O8：noTitle 页容量 = 整页（首卡 id 由 saved layout 推导，与写 override 的键一致）。
+    var firstMap=firstIdByPage(saved);
+    var layout=placeItems(items,geo,{noTitlePages:function(page){return presNoTitleFor([firstMap[page]]);}});
     presSpec().layout=layout;
     syncPresGrid(geo,layout);
   }
@@ -326,16 +351,19 @@
   function capturePresentationLayout(){
     if(applyingPresLayout)return;
     var geo=pageGeometry(gridWidth());
+    // O8：noTitle 页反向映射 slot 时少减 titleRows（该页卡区本就从第 0 行开始）。
+    var firstMap=firstIdByPage(presSpec().layout);
     var items=[];
     orderedCards().forEach(function(c,i){
       var id=c.getAttribute('data-report-block-id');if(!id)return;
       var h=Number(c.getAttribute('gs-h')||1);
       var y=Number(c.getAttribute('gs-y')||0);
       var page=Math.max(0,Math.floor(y/geo.pageRows));
-      var slot=Math.max(0,y-page*geo.pageRows-geo.titleRows);
+      var titleRows=presNoTitleFor([firstMap[page]])?0:geo.titleRows;
+      var slot=Math.max(0,y-page*geo.pageRows-titleRows);
       items.push({id:id,h:h,x:Number(c.getAttribute('gs-x')||0),w:Number(c.getAttribute('gs-w')||12),page:page,slot:slot,ord:i});
     });
-    var layout=placeItems(items,geo);
+    var layout=placeItems(items,geo,{noTitlePages:function(page){return presNoTitleFor([firstMap[page]]);}});
     presSpec().layout=layout;
     applyingPresLayout=true;
     try{syncPresGrid(geo,layout);}finally{applyingPresLayout=false;}
@@ -470,9 +498,58 @@
     if(active&&!playing)swapDeck(buildDeckDOM());
     return true;
   }
+  // O8 提交：编辑态「隐藏本页标题」勾选（与 commitPageTitle 同一写入口纪律）。
+  function commitPageNoTitle(cardIds,on){
+    var firstId=(cardIds||[])[0];if(!firstId)return false;
+    var spec=presSpec();
+    if(on){
+      if(!spec.noTitle||typeof spec.noTitle!=='object')spec.noTitle={};
+      spec.noTitle[firstId]=true;
+    }else if(spec.noTitle){
+      delete spec.noTitle[firstId];
+    }
+    if(global.AIReportRuntime&&global.AIReportRuntime.syncManifest)global.AIReportRuntime.syncManifest();
+    // 几何三处同源刷新：live grid 行位（titleRows=0 卡区上移）、deck（标题带消失）、
+    // 编辑态定位框（重画帧 + 勾选态）。
+    if(active){
+      applyingPresLayout=true;
+      try{applyPresentationLayout();}finally{applyingPresLayout=false;}
+      if(!playing)swapDeck(buildDeckDOM());
+      setTimeout(drawSlideFrames,30);
+    }
+    return true;
+  }
   // 返回页列表（与 grid 行坐标系一致）：[{pageIndex, top, height, titleH, title, cards:[el], cardIds:[...]}]
   // 分页真源 = manifest.presentation.layout（declared 行）；top = pageIndex*pageH（行对齐
   // 的页 pitch），所以定位框与卡片行逐页完全对齐。标题占 titleRows 行（= titleH）。
+  // O8 页级隐藏标题带（XU-02，docs/presentation-ppt-alignment-review-2026-09-26.md O8）：
+  // manifest.presentation.noTitle = { [该页首卡 id]: true }（与 D1 titles 同槽位命名法）。
+  // 命中页 titleRows=0、contentRows=pageRows、卡区上移——分页几何三处同源
+  // （layoutRows/syncPresGrid 行位、paginate/drawSlideFrames 定位框、PPTX 离屏 deck
+  // 的 createDeckDOM）都读同一份 override；PPTX 该页不出标题文本框（slide.noTitle）。
+  function presNoTitleFor(cardIds){
+    var nt=presSpec().noTitle;
+    var id=(cardIds||[])[0];
+    return !!(nt&&id&&nt[id]);
+  }
+  // 每页首卡 id（= slot 最小的卡）：noTitle 键的推导真源。placeItems/capture 反向
+  // 映射时布局还没落到 DOM，只能从 saved layout 推；pagesFromLayout 已按 (page,slot)
+  // 排序，两者的「首卡」是同一张卡（与 D1 titles 同一命名语义：换首卡 = override
+  // 失效，回落自动行为）。
+  function firstIdByPage(layout){
+    var map={};
+    Object.keys(layout||{}).forEach(function(id){
+      var l=layout[id];
+      if(!l||l.page==null||!isFinite(l.page))return;
+      var p=l.page|0;
+      if(!(p in map)||((l.slot||0)<(layout[map[p]].slot||0)))map[p]=id;
+    });
+    return map;
+  }
+  // 页容量（rows）：noTitle 页 = 整页 pageRows，常规页 = pageRows - titleRows。
+  function pageCapRows(page,firstMap,geo){
+    return presNoTitleFor([firstMap&&firstMap[page]])?geo.pageRows:geo.contentRows;
+  }
   function paginate(){
     var grid=cardsGrid();
     var cards=orderedCards();
@@ -483,7 +560,9 @@
     var pages=pagesRows.map(function(rows,pi){
       var els=[],ids=[];
       rows.forEach(function(r){r.cards.forEach(function(c){els.push(c);ids.push(c.getAttribute('data-report-block-id')||'');});});
-      return {pageIndex:pi,top:pi*geo.pageH,height:geo.pageH,titleH:geo.titleH,title:pageTitleForPage(ids),cards:els,cardIds:ids};
+      // O8：noTitle 页 titleH=0（drawSlideFrames 据此不渲染标题带；卡区上移已由
+      // layoutRows/syncPresGrid 落到 live grid）。
+      return {pageIndex:pi,top:pi*geo.pageH,height:geo.pageH,titleH:presNoTitleFor(ids)?0:geo.titleH,title:pageTitleForPage(ids),cards:els,cardIds:ids};
     });
     return pages;
   }
@@ -701,8 +780,14 @@
     pagesData.forEach(function(pgRows,pi){
       var firstId='';(pgRows[0]&&pgRows[0].cards[0])&&(firstId=pgRows[0].cards[0].getAttribute('data-report-block-id')||'');
       var ids=[];pgRows.forEach(function(r){r.cards.forEach(function(c){ids.push(c.getAttribute('data-report-block-id')||'');});});
-      var title=pageTitleForPage(ids)||PRES_BLANK_TITLE;
+      // O8：noTitle 页该页标题带整体退场——titleRows=0（卡区从页顶开始）、deck 标题
+      // 元素隐藏、slide.noTitle 透传给 PPTX（该页不出标题文本框）。标题带前页的
+      // 「真空白」（PRES_BLANK_TITLE）语义只管可见性；noTitle 是几何级退场。
+      var noTitle=presNoTitleFor(ids);
+      var effTitleH=noTitle?0:titleH;
+      var title=noTitle?PRES_BLANK_TITLE:(pageTitleForPage(ids)||PRES_BLANK_TITLE);
       var p=slideEl(title,geo,{n:pi+1,total:pagesData.length});
+      if(noTitle){var _tEl=p.slide.querySelector('.ai-pres-title');if(_tEl)_tEl.style.display='none';}
       container.appendChild(p.slide);
       var cardRecs=[];
       var pageH=geo.pageH;
@@ -721,7 +806,7 @@
           // 全部用百分比（相对页面），随浏览器缩放/页宽同步缩放：框和内容一起变。
           var left=(x/12*100)+'%';
           var width=(w/12*100)+'%';
-          var top=((titleH+rowTop)/pageH*100)+'%';
+          var top=((effTitleH+rowTop)/pageH*100)+'%';
           var height=(dH/pageH*100)+'%';
           var wrap=document.createElement('div');
           wrap.className='ai-pres-card';
@@ -760,7 +845,7 @@
           cardRecs.push({id:bid,kind:kindFor(bid),node:wrap});
         });
       });
-      slides.push({root:p.slide,title:title,cards:cardRecs});
+      slides.push({root:p.slide,title:title,cards:cardRecs,noTitle:noTitle});
     });
     if(!slides.length){var p2=slideEl(manifest().title||'报告',geo,{n:1,total:1});container.appendChild(p2.slide);slides.push({root:p2.slide,title:p2.slide.querySelector('.ai-pres-title').textContent,cards:[]});}
     return {container:container,slides:slides};
@@ -816,6 +901,7 @@
     var titleEditable=document.body.classList.contains('ai-report-presenting-edit');
     frames.forEach(function(f){
       var top=f.top,height=f.height,titleH=f.titleH||geo.titleH,idx=(f.pageIndex!=null?f.pageIndex+1:f.index)||1;
+      var noTitlePg=(f.pageIndex!=null&&f.titleH===0);   // O8：noTitle 页（paginate 带 titleH=0）
       var box=document.createElement('div');
       box.className='ai-pres-slide-frame';
       box.style.top=top+'px';
@@ -826,28 +912,48 @@
       chip.className='ai-pres-slide-frame-label';
       chip.textContent='第 '+idx+' / '+frames.length+' 页';
       box.appendChild(chip);
-      // 1/7 页签标题条（overlay，不占卡位）：高 = titleH，样式贴齐页签标题。
-      var titleBar=document.createElement('div');
-      titleBar.className='ai-pres-page-title';
-      titleBar.style.height=titleH+'px';
-      titleBar.setAttribute('data-page-title','1');
-      titleBar.textContent=f.title||'';
-      if(titleEditable&&f.cardIds&&f.cardIds.length){
-        // D1 页标题可编辑：以该页首卡 id 为键写 manifest.presentation.titles；
-        // 清空并失焦 = 删除覆盖，回落自动推导。
-        titleBar.classList.add('ai-pres-title-edit');
-        titleBar.setAttribute('contenteditable','true');
-        titleBar.setAttribute('spellcheck','false');
-        titleBar.title='点击编辑本页标题；清空恢复自动推导';
-        titleBar.addEventListener('keydown',function(ev){
-          if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();titleBar.blur();}
-          else if(ev.key==='Escape'){titleBar.textContent=f.title||'';titleBar.blur();}
-        });
-        titleBar.addEventListener('blur',function(){
-          if(commitPageTitle(f.cardIds,titleBar.textContent))setTimeout(drawSlideFrames,30);
-        });
+      // 1/7 页签标题条（overlay，不占卡位）：高 = titleH（noTitle 页 0 → 不渲染，
+      // 该页卡区本就从页顶开始——几何已由 layoutRows/syncPresGrid 同一 override 落位）。
+      if(!noTitlePg){
+        var titleBar=document.createElement('div');
+        titleBar.className='ai-pres-page-title';
+        titleBar.style.height=titleH+'px';
+        titleBar.setAttribute('data-page-title','1');
+        titleBar.textContent=f.title||'';
+        if(titleEditable&&f.cardIds&&f.cardIds.length){
+          // D1 页标题可编辑：以该页首卡 id 为键写 manifest.presentation.titles；
+          // 清空并失焦 = 删除覆盖，回落自动推导。
+          titleBar.classList.add('ai-pres-title-edit');
+          titleBar.setAttribute('contenteditable','true');
+          titleBar.setAttribute('spellcheck','false');
+          titleBar.title='点击编辑本页标题；清空恢复自动推导';
+          titleBar.addEventListener('keydown',function(ev){
+            if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();titleBar.blur();}
+            else if(ev.key==='Escape'){titleBar.textContent=f.title||'';titleBar.blur();}
+          });
+          titleBar.addEventListener('blur',function(){
+            if(commitPageTitle(f.cardIds,titleBar.textContent))setTimeout(drawSlideFrames,30);
+          });
+        }
+        box.appendChild(titleBar);
       }
-      box.appendChild(titleBar);
+      // O8：「隐藏本页标题」勾选（D1 入口旁，编辑布局态才挂）——右上角页码 chip
+      // 对侧的小徽章，键 = 该页首卡 id（与 D1 titles 同槽位命名法）。勾选即提交
+      // manifest.presentation.noTitle + 三处几何同源刷新（commitPageNoTitle 内）。
+      if(titleEditable&&f.cardIds&&f.cardIds.length){
+        var tg=document.createElement('label');
+        tg.className='ai-pres-notitle-toggle';
+        tg.setAttribute('data-page-notitle','1');
+        tg.title='隐藏本页标题带（卡片区占满整页）；取消勾选恢复';
+        tg.style.pointerEvents='auto';
+        var tgIn=document.createElement('input');
+        tgIn.type='checkbox';
+        tgIn.checked=noTitlePg;
+        tgIn.addEventListener('change',function(ev){commitPageNoTitle(f.cardIds,!!ev.target.checked);});
+        tg.appendChild(tgIn);
+        tg.appendChild(document.createTextNode('隐藏标题'));
+        box.appendChild(tg);
+      }
       slideFramesOverlay.appendChild(box);
     });
   }
@@ -1462,7 +1568,10 @@
       pagesFromLayout:pagesFromLayout,pageTitleFor:pageTitleFor,pageTitleForPage:pageTitleForPage,
       isCoverCardId:isCoverCardId,presDigitJump:presDigitJump,presIdleStop:presIdleStop,
       placeItems:placeItems,deckTextScale:deckTextScale,CELL_PX:CELL_PX,
-      deckTableTotalRowsOf:deckTableTotalRowsOf,deckTableShownRowsOf:deckTableShownRowsOf},
+      deckTableTotalRowsOf:deckTableTotalRowsOf,deckTableShownRowsOf:deckTableShownRowsOf,
+      // O8（XU-02）：noTitle 覆盖的读取/推导/提交与页容量（纯函数 + manifest 桩可测）。
+      presNoTitleFor:presNoTitleFor,firstIdByPage:firstIdByPage,pageCapRows:pageCapRows,
+      pageCapRowsOffset:pageCapRowsOffset,commitPageNoTitle:commitPageNoTitle},
     // TITLE_H = deck 页标题带的 1280 基准高：pageGeometry 里 titleRows=round((720/7)/48)=2
     // 行 → 96px（旧值 56 是 deck 早期几何的残留，PPTX 标题框曾因此比 deck 基线偏高）。
     // 消费方只有 pptx-exporter（页标题框高度）；宽档位下 deck 标题带随 pageH 变化，

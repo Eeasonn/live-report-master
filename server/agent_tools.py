@@ -168,6 +168,7 @@ def default_registry() -> ToolRegistry:
     proposal_tools = {
         "propose_chart_change", "propose_filter_change", "propose_multi_card_change",
         "propose_report_narrative", "propose_data_update", "propose_alias_confirmation",
+        "propose_derived_measure",
     }
     approval_tools = {"export_evidence", "export_large_evidence"}
     read_schema = {"type": "object", "additionalProperties": False}
@@ -244,6 +245,39 @@ def default_registry() -> ToolRegistry:
             "keyColumns": {"type": "array", "maxItems": 4, "items": text}, "calendar": calendar,
             "timeColumn": text}},
         "profile_dataset": {"type": "object", "additionalProperties": False, "required": ["datasetId"], "properties": {"datasetId": text}},
+        # NA-05 PSI domain pack (read-only). Column names are ALWAYS declared by
+        # the caller — the server never guesses which column is SI/SO/INV.
+        "psi_balance_check": {"type": "object", "additionalProperties": False,
+                               "required": ["datasetId", "timeColumn", "sellInColumn",
+                                             "sellOutColumn", "inventoryColumn"],
+                               "properties": {"datasetId": text, "timeColumn": text,
+                                               "sellInColumn": text, "sellOutColumn": text,
+                                               "inventoryColumn": text,
+                                               "tolerance": {"type": "number", "minimum": 0, "maximum": 1},
+                                               "absTolerance": {"type": "number", "minimum": 0, "maximum": 1000},
+                                               "filter": {"type": ["array", "object"]},
+                                               "maxScanRows": {"type": "integer", "minimum": 1, "maximum": 2000000},
+                                               "maxGroups": {"type": "integer", "minimum": 1, "maximum": 100000}}},
+        "inventory_weeks": {"type": "object", "additionalProperties": False,
+                             "required": ["datasetId", "timeColumn", "sellOutColumn", "inventoryColumn"],
+                             "properties": {"datasetId": text, "timeColumn": text,
+                                             "sellOutColumn": text, "inventoryColumn": text,
+                                             "grain": {"type": "string", "enum": ["week", "month", "quarter", "year"]},
+                                             "window": {"type": "integer", "minimum": 1, "maximum": 12},
+                                             "filter": {"type": ["array", "object"]},
+                                             "maxScanRows": {"type": "integer", "minimum": 1, "maximum": 2000000},
+                                             "maxGroups": {"type": "integer", "minimum": 1, "maximum": 100000}}},
+        "stockout_scan": {"type": "object", "additionalProperties": False,
+                           "required": ["datasetId", "timeColumn", "sellOutColumn",
+                                         "inventoryColumn", "groupBy"],
+                           "properties": {"datasetId": text, "timeColumn": text,
+                                           "sellOutColumn": text, "inventoryColumn": text,
+                                           "groupBy": text,
+                                           "granularity": {"type": "string", "enum": ["sum", "row"]},
+                                           "filter": {"type": ["array", "object"]},
+                                           "topMembers": {"type": "integer", "minimum": 1, "maximum": 50},
+                                           "maxScanRows": {"type": "integer", "minimum": 1, "maximum": 2000000},
+                                           "maxGroups": {"type": "integer", "minimum": 1, "maximum": 100000}}},
         "propose_chart_change": {"type": "object", "additionalProperties": False, "properties": {
             "chartId": text, "datasetId": text, "dimension": text, "measure": text,
             "breakdown": text, "aggregation": {"type": "string", "enum": ["sum", "average", "count", "min", "max"]},
@@ -257,6 +291,16 @@ def default_registry() -> ToolRegistry:
         "propose_data_update": {"type": "object", "additionalProperties": False, "properties": {
             "datasetId": text, "mode": {"type": "string", "enum": ["replace", "upsert", "append"]},
             "keyCols": {"type": "array", "items": text}}},
+        # NA-04: the measure node shape (formula/window/share/filtered) is NOT
+        # duplicated here as JSON-Schema — ``scripts/derived_model`` is the
+        # single validation source (unknown keys / DAG / window timeField /
+        # filtered predicate whitelist) and this schema only bounds the
+        # envelope before the typed seam runs. The schema validator only
+        # recurses into arrays, so deeper object checks would be a second,
+        # weaker copy of derived_model anyway.
+        "propose_derived_measure": {"type": "object", "additionalProperties": False,
+                                     "required": ["datasetId", "measure"],
+                                     "properties": {"datasetId": text, "measure": {"type": "object"}}},
         "export_evidence": {"type": "object", "additionalProperties": False, "properties": {
             "jobId": text, "format": {"type": "string", "enum": ["json", "csv", "markdown"]}}},
         "export_large_evidence": {"type": "object", "additionalProperties": False, "properties": {
@@ -288,10 +332,14 @@ def default_registry() -> ToolRegistry:
         ("propose_multi_card_change", "medium", 30),
         ("propose_report_narrative", "low", 20),
         ("propose_data_update", "medium", 30),
+        ("propose_derived_measure", "low", 20),
         ("export_evidence", "high", 180),
         ("export_large_evidence", "high", 180),
         ("profile_dataset", "medium", 60),
         ("create_monitor", "medium", 30),
+        ("psi_balance_check", "medium", 60),
+        ("inventory_weeks", "medium", 60),
+        ("stockout_scan", "high", 120),
     ):
         semantic_refs = {
             "resolve_card": ("refs/flint/src/core/field-semantics.ts",),
@@ -320,7 +368,34 @@ def default_registry() -> ToolRegistry:
             "data_quality": ("refs/flint/src/core/field-semantics.ts",),
             "profile_dataset": ("refs/flint/src/core/field-semantics.ts",),
             "what_if": (),
+            "propose_derived_measure": ("refs/flint/src/core/aggregate.ts",
+                                         "refs/flint/src/core/type-registry.ts"),
+            "psi_balance_check": ("refs/flint/src/core/aggregate.ts",
+                                   "refs/flint/src/core/type-registry.ts"),
+            "inventory_weeks": ("refs/flint/src/core/aggregate.ts",),
+            "stockout_scan": ("refs/flint/src/core/aggregate.ts",
+                               "refs/flint/src/core/filter-overflow.ts"),
         }.get(name, ("refs/flint/src/core/aggregate.ts",))
+        # NA-04/NA-05: tools with a domain contract carry their own acceptance
+        # tests; everything else keeps the generic bounded-evidence pair.
+        custom_acceptance = {
+            "propose_derived_measure": (
+                "服务端复用 derived_model 校验（重名/未知列/DAG/窗口绑定/filtered 谓词），非法声明 fail-closed",
+                "应用走 metadataOnly ProposalTransaction：snapshot/hash/rollback 齐备，回滚后 manifest 逐字节还原",
+            ),
+            "psi_balance_check": (
+                "恒等式逐期勾稽（相对+绝对容差分档，toleranceUsed 报告判定口径），首期标记 unverifiable 不编造期初；断档期显式报告",
+                "列名由调用方显式声明，敏感列 fail-closed；evidence 带 provenance 且 causalClaim=false",
+            ),
+            "inventory_weeks": (
+                "换算口径（期内周数）写进 description 与 evidence.assumptions",
+                "无销量期不编造周数（null），最新期与 N 期均值对比有界",
+            ),
+            "stockout_scan": (
+                "两类命中（有销无货/有货无销）bounded top-N；granularity=sum（缺省，组内相抵）/row（逐行判定+命中样本≤50），超限 fail-closed 不静默截断",
+                "列名由调用方显式声明，敏感列 fail-closed；evidence 带 provenance 且 causalClaim=false",
+            ),
+        }.get(name)
         if name == "create_monitor":
             registry.register(ToolSpec(name=name, estimated_cost=cost, timeout_seconds=timeout,
                                        permissions=frozenset({"editor", "admin"}),
@@ -336,7 +411,7 @@ def default_registry() -> ToolRegistry:
                                        output_schema={"type": "object"},
                                        side_effect=side_effect,
                                        semantic_references=semantic_refs,
-                                       acceptance_tests=(
+                                       acceptance_tests=custom_acceptance or (
                                            "服务端返回与工具 schema 相符的 bounded evidence",
                                            "取消/预算/权限边界不产生副作用",
                                        )))

@@ -2108,6 +2108,65 @@ def _static_total_row(raw_table: dict | None, filters: Any,
     return out
 
 
+def _derived_static_totals(measures: Any, derived_nodes: dict | None,
+                           raw_table: dict | None, filters: Any) -> dict[str, Any]:
+    """合计行派生列（NC-01 #6-PY，2026-10-23）：静态合计载体对公式派生列 =
+    「依赖列**全量过滤行**合计后重求公式」。
+
+    Grounded: refs/flint/src/core/aggregate.ts:16-20「派生列名即契约、调用方
+    预聚合」的合计行表达——客单价合计 = Σ销售额/Σ订单数（fixture
+    table_total_derived_ratio：1000+2000)/(10+40)=60；逐行比率求和 150 是错的，
+    type-registry.ts:111 Percentage 是 intensive，跨组 SUM 无业务意义）。
+    不可由依赖合计重求的（window/share/filtered/rank，或公式 ref 闭包含它们）
+    置 None（渲染「—」），绝不造数。求值复用 derived_eval.evaluate（依赖合计
+    作为单元素序列），零第二份算术。
+
+    消费契约（与 JS lane 共享）：烘进 ``option.totalRowDerived``（与 totalRow
+    平级的兄弟键，不动 totalRow 的既有键集——test_table_total_calc 钉住 exact
+    相等）；运行时 totalCalcRow 取值时派生名从本载体读，null 渲染「—」。"""
+    import derived_eval
+    if not derived_nodes or raw_table is None:
+        return {}
+    cols = raw_table.get("columns") or []
+    names = [m for m in (measures or []) if isinstance(m, str) and m in derived_nodes]
+    if not names:
+        return {}
+    out: dict[str, Any] = {}
+    for name in names:
+        node = derived_nodes.get(name)
+        if not isinstance(node, dict) or node.get("kind") != "formula":
+            out[name] = None
+            continue
+        closure = derived_eval.closure_nodes([node], derived_nodes)
+        if not closure or any(n.get("kind") != "formula" for n in closure):
+            out[name] = None     # 闭包含窗口/占比/筛选/排名 → 不可由依赖合计重求
+            continue
+        try:
+            deps = derived_eval.required_aggregations(closure, declared=set(derived_nodes),
+                                                      by_name=derived_nodes)
+        except Exception:
+            out[name] = None
+            continue
+        if any(str(d.get("key", "")).startswith(derived_eval.FM_KEY_PREFIX)
+               or d.get("col") not in cols for d in deps):
+            out[name] = None
+            continue
+        memo: dict[tuple, Any] = {}
+        series: dict[str, list] = {}
+        for d in deps:
+            key = d.get("key") or derived_eval.agg_key(d["agg"], d["col"])
+            mk = (d["agg"], d["col"])
+            if mk not in memo:
+                memo[mk] = _static_total_row(raw_table, filters, {d["col"]: d["agg"]}).get(d["col"])
+            series[key] = [memo[mk]]
+        try:
+            val = derived_eval.evaluate(closure, series, ["合计"]).get(name, [None])[0]
+        except Exception:
+            val = None
+        out[name] = val
+    return out
+
+
 def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
                           dataset_id: str = "primary",
                           derived_nodes: dict | None = None,
@@ -2134,6 +2193,9 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
                  "title": c.get("title", ""), "viewType": c.get("viewType"),
                  "option": _chart_option(c, rows),
                  "editor": {"editable": True, "data": entry_data}}
+        # 分析主张/问题（NA-02）：跨表图与单表图同一条透传契约。
+        if c.get("question"):
+            entry["question"] = str(c["question"])
         # 表格卡作者设置（批次一 + WP-3/WP-11/WP-14）：跨表图表与单表同一条透传
         # 契约——请求层 chart.table 原样落 editor.table（运行时 showTableBody 的
         # 唯一读取口），绝不静默丢设置。totalCalc 的静态合计按**合并后全量行**重算
@@ -2147,6 +2209,10 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
                 set(c.get("derivedMeasures") or []) | set(derived_nodes or {}))
             if _tc_effective:
                 entry["option"]["totalRow"] = _static_total_row(data, [], _tc_effective)
+                # NC-01 #6-PY：合计行派生列 = 依赖列合计后重求公式（不可重求 → null）。
+                _dt = _derived_static_totals(c.get("measures") or [], derived_nodes, data, [])
+                if _dt:
+                    entry["option"]["totalRowDerived"] = _dt
         if c.get("annotation"):
             entry["annotation"] = c["annotation"]
         if isinstance(c.get("style"), dict):
@@ -2358,6 +2424,10 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
         "option": _chart_option(c, option_rows),
         "editor": {"editable": True, "data": entry_data},
     }
+    # 分析主张/问题（NA-02）：有声明才落键，旧报告 manifest 零漂移。消费点 =
+    # lint L23「有图无主张」advisory + decision_ledger 图表行的「主张」。
+    if c.get("question"):
+        entry["question"] = str(c["question"])
     if c.get("densityAdjusted"):
         entry["densityAdjusted"] = c["densityAdjusted"]
     # 截断事实（读者可见的「已显示前 K 项（共 N 项）」）：编译期是唯一知道自己
@@ -2439,6 +2509,11 @@ def _chart_manifest_entry(c: dict, rows: list, raw_table: dict | None = None,
         if _tc_effective:
             entry["option"]["totalRow"] = _static_total_row(
                 total_calc_table or raw_table, c.get("filter"), _tc_effective)
+            # NC-01 #6-PY：合计行派生列 = 依赖列合计后重求公式（不可重求 → null）。
+            _dt = _derived_static_totals(c.get("measures") or [], derived_nodes,
+                                         total_calc_table or raw_table, c.get("filter"))
+            if _dt:
+                entry["option"]["totalRowDerived"] = _dt
     # Composite (混合图表): carry per-measure series type / Y-axis into editor.data
     # so the runtime renders bar+line with ≤2 value axes (intent DSL derived).
     if c.get("seriesType"):
@@ -2660,6 +2735,20 @@ def build_manifest(spec: dict, charts: list[dict], placed: list[tuple[dict, int,
     _anchor_checks = (spec.get("provenance") or {}).get("anchorChecks") or []
     if _anchor_checks:
         _quality_out["anchors"] = _anchor_checks
+    # XS-02：作者文本 × 敏感值 的 warn 记录随 quality 落 manifest（decision_ledger 渲染）。
+    _privacy_warns = (spec.get("provenance") or {}).get("privacyAuthorWarnings") or []
+    if _privacy_warns:
+        _quality_out["privacyAuthorWarnings"] = _privacy_warns
+    # 构建期 profile.facts（NA-01）：确定性事实随 quality 落 manifest——decision_ledger
+    # 的「数据事实（脚本计算）」节与 lint（L21 发散依据 / L23 有图无主张的上下文）
+    # 都从 manifest 现读（lint 只拿得到打包 HTML 里的 manifest，这是唯一通道）。
+    # quality 在 manifest schema 里 additionalProperties:true，无需改 schema。
+    _profile_facts = (spec.get("provenance") or {}).get("profileFacts") or []
+    if _profile_facts:
+        _quality_out["facts"] = _profile_facts
+    _facts_skipped = (spec.get("provenance") or {}).get("factsSkipped") or {}
+    if _facts_skipped:
+        _quality_out["factsSkipped"] = _facts_skipped
     manifest = {
         "schemaVersion": 3,
         "reportId": spec.get("reportId", "report"),
@@ -2903,8 +2992,18 @@ def _cover_article_html(cov: dict, cover_h: int) -> str:
 
 def _format_kpi(kp: dict, spec: dict | None = None, manifest: dict | None = None) -> tuple[str, str, str]:
     value = kp.get("rawValue", kp.get("value"))
-    kind = str(kp.get("semanticType") or kp.get("measureType") or "number")
-    if isinstance(kind, dict): kind = str(kind.get("type") or "number")
+    # 缺陷 #1（NC-01，2026-10-23 拍板批）：semanticType/measureType 可能是 dict
+    # （跨表比率 KPI 的编译产物写 {"type":"percent"}）——旧代码先 str() 再
+    # isinstance(dict)，判断恒不成立 → percent 档回退两位小数路径（0.99），
+    # 运行时再 ×100 → 「99.00%」（真值 99.07%）。isinstance 判断必须先于任何
+    # str 转换；dict 的 format='percent'（P5 归一形状）同样接管显示。
+    kind_raw: Any = kp.get("semanticType") or kp.get("measureType") or "number"
+    if isinstance(kind_raw, dict):
+        kind = str(kind_raw.get("type") or "number")
+        if kind_raw.get("format") == "percent":
+            kind = "percent"
+    else:
+        kind = str(kind_raw or "number")
     # P5: a number column with format='percent' (the canonical P1
     # normalised shape) renders as a percentage here too. Look up the
     # KPI's bound measure on either the top-level measureTypes or the
@@ -2931,7 +3030,10 @@ def _format_kpi(kp: dict, spec: dict | None = None, manifest: dict | None = None
     # 币种符号（拍板 1/6，docs/multidim-table-and-currency-design-2026-09-28.md §二）：
     # symbol > 内置币表 > ¥ 缺省（type_registry.currency_symbol 与运行时
     # adapter.currencySymbolOf 同一解析）。大数压缩单位恒中文「万/亿」（拍板 6）。
-    kpi_symbol = currency_symbol(kpi_mt)
+    # KPI 自带 dict semanticType 且绑定指标查不到时（跨表比率/静态 value 卡），
+    # 声明里的 currency/symbol 也要参与解析——符号跟声明走，不因查不到表而丢。
+    kpi_symbol = currency_symbol(kpi_mt if kpi_mt is not None
+                                 else (kind_raw if isinstance(kind_raw, dict) else None))
     unit = ""
     try:
         number = float(value)
@@ -3639,12 +3741,17 @@ def _band_card_color(b: dict) -> str:
 
 def _insight_paragraphs(insights: list) -> list:
     """Paragraph model for the 关键洞察 card: an h3 title + one body paragraph
-    per insight item (placeholder body when the report has no insights)."""
+    per insight item (placeholder body when the report has no insights).
+
+    一条洞察里的换行拆成独立正文段（NA-02）：证据绑定脚注「依据（脚本计算）：…」
+    以 ``\\n`` 追加在洞察文本后，拆段后渲染为洞察下方的独立脚注行。"""
     out: list = [{"level": "h3", "text": "关键洞察"}]
     for item in insights or []:
         text = _insight_text(item)
-        if text:
-            out.append({"level": "body", "text": text})
+        if not text:
+            continue
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        out.extend({"level": "body", "text": ln} for ln in lines)
     if len(out) == 1:
         out.append({"level": "body", "text": "暂未提供可验证的文字洞察，请结合图表和证据表阅读。"})
     return out
@@ -3956,14 +4063,77 @@ def _insight_h(insights: list) -> int:
     return _text_rows(px, 3, 8)
 
 
+def _mt_is_percent(mt: Any) -> bool:
+    """Effective percent DISPLAY on a measureTypes entry (dict or str form)."""
+    if isinstance(mt, dict):
+        return mt.get("format") == "percent" or mt.get("type") == "percent"
+    if isinstance(mt, str):
+        return mt == "percent"
+    return False
+
+
+def _formula_percent_units_ref(node: dict, by_name: dict | None = None) -> bool:
+    """公式节点的 ref 闭包是否含 share / window(rate)——那些值求值时已 ×100
+    （存百分数），以它们为操作数的公式值已在百分数域，显示层不得再乘。"""
+    if not isinstance(node, dict):
+        return False
+    nmap = {n.get("name"): n for n in (by_name or {}).values()
+            if isinstance(n, dict) and n.get("name")}
+    stack = [node.get("expr")]
+    visited_refs: set = set()
+    while stack:
+        cur = stack.pop()
+        if not isinstance(cur, dict):
+            continue
+        if "op" in cur:
+            stack.append(cur.get("left"))
+            stack.append(cur.get("right"))
+        elif cur.get("ref") is not None:
+            ref = cur["ref"]
+            target = nmap.get(ref)
+            if isinstance(target, dict):
+                if target.get("kind") == "share" or \
+                        (target.get("kind") == "window" and target.get("output") == "rate"):
+                    return True
+                if ref not in visited_refs:
+                    visited_refs.add(ref)
+                    stack.append(target.get("expr"))
+    return False
+
+
+def _formula_percent_scale(node: dict, mt_entry: Any = None, by_name: dict | None = None) -> bool:
+    """D1（NC-01 #4-PY，2026-10-23 拍板 §7.1）缩放判据（显示层 ×100 的唯一决定
+    函数，_rows_with_derived 与 _derived_percent_units 共用——两处漂移 = 二次
+    缩放（22.07% → 2207%）或漏缩放（0.22%））：
+
+    公式派生节点 + 显式 percent 显示格式（节点 measureType 或图表 measureTypes
+    覆盖）→ 显示层 ×100（公式存运算原值 0.2207，percent 声明 =「此列是比率」）。
+    既有契约不动：share 与 window(rate) 求值已 ×100 存百分数直显，公式 ref 闭包
+    含它们时值已在百分数域，不再乘。Grounded:
+    refs/flint/src/core/type-registry.ts:111,118（Percentage/PercentageChange =
+    intensive + percent 格式类，声明即「按百分数读」）。"""
+    if not isinstance(node, dict) or node.get("kind") != "formula":
+        return False
+    if _formula_percent_units_ref(node, by_name):
+        return False
+    mt = node.get("measureType")
+    node_pct = isinstance(mt, dict) and (mt.get("type") == "percent" or mt.get("format") == "percent")
+    return node_pct or _mt_is_percent(mt_entry)
+
+
 def _derived_percent_units(c: dict, col: str) -> bool:
     """PY mirror of ``chart-adapter.derivedPercentUnits``: True when the column
     is an aggregate-level derived measure whose stored values are ALREADY
     percent-scaled (share / window+rate) — ``_fmt_cell`` must not ×100 again
-    (the old "1.6% shows as 160%" export/runtime incident, compile side)."""
+    (the old "1.6% shows as 160%" export/runtime incident, compile side).
+    D1（#4-PY，2026-10-23）：公式节点 + percent 显示格式的静态行已烘显示值
+    （×100，_rows_with_derived 同判据缩放），同样豁免。"""
     n = (c.get("_derived_nodes") or {}).get(col)
-    return bool(n) and (n.get("kind") == "share"
-                        or (n.get("kind") == "window" and n.get("output") == "rate"))
+    if not n:
+        return False
+    if n.get("kind") == "share" or (n.get("kind") == "window" and n.get("output") == "rate"):
+        return True
+    return _formula_percent_scale(n, (c.get("measureTypes") or {}).get(col))
 
 
 def _fmt_cell(v, col, c):
@@ -4918,6 +5088,16 @@ def _rows_with_derived(table: dict, dimension: str | None, measures: list[str], 
                                     # 维度分区，环比/累计不跨系列取数（与运行时
                                     # applyDerivedNodes 的 partitionOf 同一批修复）。
                                     partition_of=(bds or None) if breakdown else None)
+    # D1（NC-01 #4-PY，2026-10-23 拍板）：公式节点 + percent 显示格式 → 显示层
+    # ×100。evaluate 存运算原值的契约不动；静态 option 序列/轴域/表格静态行全部
+    # 从这里的行取值，一处缩放全链一致——_derived_percent_units（_fmt_cell 豁免）
+    # 用同一判据，杜绝二次缩放。null 恒保持 null（空档不造 0）。
+    for _m in measures:
+        _node = by_name.get(_m)
+        if _node is not None and _formula_percent_scale(_node, (measure_types or {}).get(_m), by_name):
+            _vals = computed.get(_m)
+            if _vals is not None:
+                computed[_m] = [None if v is None else float(v) * 100 for v in _vals]
     out: list[list[Any]] = []
     for i, label in enumerate(labels):
         row: list[Any] = [label] + ([bds[i]] if breakdown else [])
@@ -5473,6 +5653,310 @@ def _ds_calendar(declared_ds: list, did: str, top_level: Any = None) -> dict | N
     return None
 
 
+# ════════ NS-01 privacy.sensitiveColumns：构建期物理剥离（2026-10-23 roadmap）════════
+# 声明入口 = datasets[].privacy.sensitiveColumns（validate_request 做形状闸；这里对
+# 真实表做存在性闸 + 引用闸）。语义：敏感列在编译期从 rows/columns **物理剔除、不可
+# 恢复**——singlefile 的内联 rows、mixed 的内联表、server/mixed 的 schema-only 表
+# 声明（_remote_typed_columns）都不再携带该列；manifest 保留 privacy 声明本身（server
+# Agent 链 agent_context / agent_tool_runner 的脱敏投影按列名消费它，S1 契约不变）。
+# 任何 chart/kpi/filter/derived/breakdown/锚点/合并键引用敏感列 = 可行动报错（指明
+# 槽位与列名，给两条出路），绝不静默渲染空列或悄悄丢筛选谓词。
+
+
+def _ds_privacy(declared_ds: list, did: Any) -> list[str]:
+    """datasets[].privacy.sensitiveColumns 的唯一读取口（id 对不上 = 无声明）。"""
+    for x in declared_ds or []:
+        if isinstance(x, dict) and x.get("id") == did:
+            sc = (x.get("privacy") or {}).get("sensitiveColumns")
+            if isinstance(sc, list):
+                return [c for c in sc if isinstance(c, str) and c]
+            return []
+    return []
+
+
+def _strip_sensitive_tables(spec: dict, tables_by_id: dict, datasets: list,
+                            declared_ds: list, value_sink: dict | None = None) -> dict[str, list[str]]:
+    """把各数据集声明的敏感列从真实表（columns/rows/meta.types/meta.stats）剔除。
+
+    就地修改 tables_by_id 的表对象（下游 ctx/静态 option/facts/KPI 全部拿到剥离后
+    的列宇宙）；返回 {raw_id: [被剥离的列名]}，无声明或无命中返回 {}。
+    「声明了表中不存在的列」给可行动报错（拼写错误不该被静默吞掉）——与 primaryKey
+    的编译期存在性校验（compile_spec 内 primaryKey 引用闸）同一先例。
+    ``value_sink``（XS-02）：剥离前把敏感列的有界取值样本写进 {raw: {col: set(str)}}，
+    供作者自由文本的「敏感值命中」warn 扫描使用——这是剥离前唯一能拿到值的时刻。
+    """
+    stripped: dict[str, list[str]] = {}
+    for d in datasets or []:
+        raw = d.get("raw") or d["id"]
+        table = tables_by_id.get(raw)
+        if not isinstance(table, dict):
+            continue
+        sensitive = _ds_privacy(declared_ds, raw)
+        if not sensitive:
+            continue
+        cols = list(table.get("columns") or [])
+        missing = [c for c in sensitive if c not in cols]
+        if missing:
+            raise ValueError(
+                f"dataset {raw} privacy.sensitiveColumns 引用了表中不存在的列：{'、'.join(missing)}"
+                f"（真实列：{'、'.join(cols[:20])}{'…' if len(cols) > 20 else ''}）——"
+                "请修正列名或移除该敏感列声明")
+        sens_set = set(sensitive)
+        hit = [c for c in cols if c in sens_set]
+        if not hit:
+            continue
+        keep_idx = [i for i, c in enumerate(cols) if c not in sens_set]
+        rows = table.get("rows") or []
+        ragged = [i for i, row in enumerate(rows) if not isinstance(row, list) or len(row) != len(cols)]
+        if ragged:
+            raise ValueError(
+                f"dataset {raw} 第 {ragged[0] + 1} 行与表头列数不一致，无法按位置安全剥离敏感列；"
+                "请先修复源数据（或构建时加 --sort 整理模式）再声明 privacy.sensitiveColumns")
+        if value_sink is not None:
+            value_sink[raw] = _collect_sensitive_values(cols, rows, hit)
+        table["columns"] = [cols[i] for i in keep_idx]
+        table["rows"] = [[row[i] for i in keep_idx] for row in rows]
+        meta = table.get("meta")
+        if isinstance(meta, dict):
+            for slot in ("types", "stats"):
+                slot_val = meta.get(slot)
+                if isinstance(slot_val, dict):
+                    meta[slot] = {k: v for k, v in slot_val.items() if k not in sens_set}
+        stripped[raw] = hit
+        print(f"[privacy] dataset {raw}: 已按 privacy.sensitiveColumns 剥离敏感列：{'、'.join(hit)}"
+              "（构建期物理剥离，编译产物不含该列的任何值）")
+    return stripped
+
+
+# ════════ XS-02 作者自由输入 × 敏感值：有界 warn（2026-10-24 第二阶段）════════
+# 隐私闸只覆盖「数据」面（剥离/引用闸/数据面投影）；作者手写的洞察、文本块、批注、
+# 封面摘要属于作者责任面，引擎不可能也不应该替作者改稿。能做的是在构建期用剥离前
+# 的敏感列取值做一次纯本地、有界的子串扫描：命中只报「哪个槽位命中了哪一列的几个值」，
+# **绝不回显值本身**；记进 provenance → manifest.quality.privacyAuthorWarnings →
+# decisions.md，不改 exit code。
+PRIVACY_SCAN_MAX_VALUES = 5000     # 每列最多采样这么多个去重取值
+PRIVACY_SCAN_MIN_VALUE_LEN = 4     # 过短的值（如 "1"/"北京"）子串命中几乎全是噪声
+PRIVACY_SCAN_MAX_TEXTS = 400       # 最多扫这么多段作者文本
+PRIVACY_SCAN_MAX_TEXT_LEN = 4000   # 每段只看前这么多字符
+
+
+def _collect_sensitive_values(cols: list, rows: list, sensitive_cols: list) -> dict[str, set]:
+    out: dict[str, set] = {}
+    idx = {c: i for i, c in enumerate(cols)}
+    for col in sensitive_cols:
+        i = idx[col]
+        vals: set = set()
+        for row in rows:
+            v = row[i]
+            if v is None:
+                continue
+            s = str(v).strip()
+            if isinstance(v, float) and v.is_integer():
+                s = str(int(v))
+            if len(s) < PRIVACY_SCAN_MIN_VALUE_LEN:
+                continue
+            vals.add(s)
+            if len(vals) >= PRIVACY_SCAN_MAX_VALUES:
+                break
+        out[col] = vals
+    return out
+
+
+def _author_free_texts(spec: dict) -> list[tuple[str, str]]:
+    """作者自由输入的全部文本槽位 → [(槽位名, 文本)]（有界）。"""
+    out: list[tuple[str, str]] = []
+
+    def push(slot: str, val: Any) -> None:
+        if len(out) >= PRIVACY_SCAN_MAX_TEXTS:
+            return
+        if isinstance(val, str) and val.strip():
+            out.append((slot, val[:PRIVACY_SCAN_MAX_TEXT_LEN]))
+        elif isinstance(val, dict):
+            for k, v in val.items():
+                if k in ("facts", "id", "kind", "layout", "style"):
+                    continue
+                push(f"{slot}.{k}", v)
+        elif isinstance(val, list):
+            for j, v in enumerate(val):
+                push(f"{slot}[{j}]", v)
+
+    cov = spec.get("cover") or {}
+    push("cover.title", cov.get("title"))
+    push("cover.summary", cov.get("summary"))
+    push("cover.meta", cov.get("meta"))
+    push("insights", spec.get("insights"))
+    push("texts", spec.get("texts"))
+    for i, c in enumerate(spec.get("charts") or []):
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id") or f"#{i}"
+        push(f"charts[{cid}].title", c.get("title"))
+        push(f"charts[{cid}].annotation", c.get("annotation"))
+        push(f"charts[{cid}].question", c.get("question"))
+    for i, k in enumerate(spec.get("kpis") or []):
+        if isinstance(k, dict):
+            push(f"kpis[{i}].label", k.get("label"))
+            push(f"kpis[{i}].note", k.get("note"))
+    for i, s in enumerate(spec.get("sections") or []):
+        if isinstance(s, dict):
+            push(f"sections[{i}].title", s.get("title"))
+            push(f"sections[{i}].summary", s.get("summary"))
+            push(f"sections[{i}].insight", s.get("insight"))
+    return out
+
+
+def _warn_author_text_sensitive(spec: dict, values_by_ds: dict) -> list[dict]:
+    """作者文本 × 敏感列取值 的有界子串扫描；命中 → warn（不回显值）+ provenance 记录。"""
+    records: list[dict] = []
+    texts = _author_free_texts(spec)
+    if not texts or not values_by_ds:
+        return records
+    for raw, by_col in values_by_ds.items():
+        for col, vals in (by_col or {}).items():
+            if not vals:
+                continue
+            for slot, text in texts:
+                hits = sum(1 for v in vals if v in text)
+                if hits:
+                    records.append({"slot": slot, "dataset": raw, "column": col, "hits": hits})
+    if records:
+        for r in records:
+            print(f"[privacy] WARN 作者文本「{r['slot']}」包含敏感列「{r['column']}」（dataset {r['dataset']}）"
+                  f"的 {r['hits']} 个取值——隐私闸不覆盖作者自由输入，请自查该段文字是否应当发布")
+        spec.setdefault("provenance", {})["privacyAuthorWarnings"] = records
+    return records
+
+
+def _assert_no_sensitive_refs(spec: dict, stripped: dict[str, list[str]],
+                              datasets: list, declared_ds: list) -> None:
+    """引用闸：任何声明槽位引用敏感列 → 一条可行动报错（指明槽位与列名）。
+
+    覆盖面 = goal 契约的 chart/kpi/filter/derived/breakdown 五族 + 同样会因剥离而
+    坏掉或泄密的声明槽位：请求级 facts、对账锚点、筛选候选、primaryKey、层级边、
+    维度值分组 source、relations 合并键。字段角色/语义声明（columnRoles/measureTypes）
+    只是元数据、剥离后无消费者——不算错误。
+    """
+    if not stripped:
+        return
+    sensitive_by_raw: dict[str, set] = {k: set(v) for k, v in stripped.items()}
+    sensitive_all: set = set()
+    for v in sensitive_by_raw.values():
+        sensitive_all |= v
+    raw_of_final: dict[str, str] = {}
+    for d in datasets or []:
+        raw_of_final[d.get("id")] = d.get("raw") or d["id"]
+    problems: list[str] = []
+
+    def _sens_for(dsid: Any) -> set:
+        raw = raw_of_final.get(dsid, dsid if isinstance(dsid, str) else None)
+        return sensitive_by_raw.get(raw, set()) if raw else set()
+
+    def _hit(where: str, dsid: Any, cols: Any) -> None:
+        sens = _sens_for(dsid) if dsid else sensitive_all
+        for c in cols:
+            if isinstance(c, str) and c in sens:
+                problems.append(f"{where} 引用了敏感列 '{c}'")
+
+    for c in spec.get("charts") or []:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id") or "?"
+        dsid = c.get("datasetId")
+        enc = c.get("encoding") if isinstance(c.get("encoding"), dict) else {}
+        _hit(f"图表 '{cid}' 的 dimension", dsid, [c.get("dimension") or enc.get("dimension")])
+        _hit(f"图表 '{cid}' 的 dimensions", dsid, list(c.get("dimensions") or enc.get("dimensions") or []))
+        _hit(f"图表 '{cid}' 的 measures", dsid, list(c.get("measures") or enc.get("measures") or []))
+        _hit(f"图表 '{cid}' 的 breakdown", dsid, [c.get("breakdown") or enc.get("breakdown")])
+        _hit(f"图表 '{cid}' 的 breakdowns", dsid, list(c.get("breakdowns") or enc.get("breakdowns") or []))
+        tbl = c.get("table") if isinstance(c.get("table"), dict) else {}
+        _hit(f"图表 '{cid}' 的 table.sortLevels", dsid,
+             [lv.get("col") for lv in (tbl.get("sortLevels") or []) if isinstance(lv, dict)])
+        cf = tbl.get("columnFilters")
+        if isinstance(cf, dict):
+            _hit(f"图表 '{cid}' 的 table.columnFilters", dsid, list(cf.keys()))
+        for sc in tbl.get("dimScopes") or []:
+            if isinstance(sc, dict):
+                _hit(f"图表 '{cid}' 的 table.dimScopes", dsid, [sc.get("col")])
+        if isinstance(tbl.get("dateScope"), dict):
+            _hit(f"图表 '{cid}' 的 table.dateScope", dsid, [tbl["dateScope"].get("col")])
+
+    for k in spec.get("kpis") or []:
+        if not isinstance(k, dict):
+            continue
+        kid = k.get("label") or k.get("id") or "?"
+        dsid = k.get("datasetId")
+        _hit(f"KPI '{kid}'", dsid,
+             [k.get("measure"), k.get("column"), k.get("field"), k.get("dimension")])
+        fct = k.get("fact") if isinstance(k.get("fact"), dict) else {}
+        _hit(f"KPI '{kid}' 的 fact", dsid, [fct.get("measure"), fct.get("dimension")])
+        dv = k.get("derived") if isinstance(k.get("derived"), dict) else {}
+        for side in ("numerator", "denominator"):
+            sd = dv.get(side)
+            if isinstance(sd, dict):
+                _hit(f"KPI '{kid}' 的 derived.{side}", sd.get("datasetId") or dsid, [sd.get("column")])
+
+    for f in spec.get("facts") or []:
+        if isinstance(f, dict):
+            _hit(f"事实 '{f.get('id') or '?'}'", f.get("datasetId"),
+                 [f.get("measure"), f.get("dimension")])
+
+    for f in spec.get("filters") or []:
+        if isinstance(f, dict):
+            _hit("报告筛选", None, [f.get("column")])
+    for fc in spec.get("filterCandidates") or []:
+        _hit("筛选候选列 filterCandidates", None, [fc])
+
+    for a in spec.get("anchors") or []:
+        if isinstance(a, dict):
+            _hit(f"对账锚点 '{a.get('label') or '?'}'", a.get("dataset"), [a.get("measure")])
+
+    for d in datasets or []:
+        raw = d.get("raw") or d["id"]
+        sens = sensitive_by_raw.get(raw)
+        if not sens:
+            continue
+        decl = next((x for x in (declared_ds or [])
+                     if isinstance(x, dict) and x.get("id") == raw), {}) or {}
+        der = decl.get("derived") if isinstance(decl.get("derived"), dict) else {}
+        for col_def in der.get("columns") or []:
+            if isinstance(col_def, dict):
+                _hit(f"数据集 '{raw}' 的计算列 '{col_def.get('name')}'", raw,
+                     [col_def.get("left"), col_def.get("right")])
+        meas = der.get("measures") or []
+        if meas:
+            import derived_model as _dm
+            for node in meas:
+                if not isinstance(node, dict):
+                    continue
+                nname = node.get("name") or node.get("id") or "?"
+                _hit(f"数据集 '{raw}' 的派生指标 '{nname}'", raw, _dm.node_columns(node))
+                if node.get("kind") == "window":
+                    _hit(f"数据集 '{raw}' 的派生指标 '{nname}' 的 timeField", raw, [node.get("timeField")])
+        for dg in decl.get("dimGroups") or []:
+            if isinstance(dg, dict):
+                _hit(f"数据集 '{raw}' 的维度值分组 '{dg.get('name')}'", raw, [dg.get("source")])
+        for edge in decl.get("hierarchy") or []:
+            if isinstance(edge, dict):
+                _hit(f"数据集 '{raw}' 的层级", raw, [edge.get("parent"), edge.get("child")])
+        _hit(f"数据集 '{raw}' 的 primaryKey", raw, decl.get("primaryKey") or [])
+
+    for rel in spec.get("relations") or []:
+        if not isinstance(rel, dict):
+            continue
+        for k in rel.get("keys") or []:
+            if not isinstance(k, dict):
+                continue
+            for side in ("a", "b"):
+                ep = k.get(side)
+                if isinstance(ep, dict):
+                    _hit(f"关系 '{rel.get('id')}' 的合并键 {side}", ep.get("ds"), [ep.get("col")])
+
+    if problems:
+        raise ValueError(
+            "privacy.sensitiveColumns 引用闸：以下声明槽位引用了构建期剥离的敏感列——"
+            "请从引用中移除该列，或把它移出敏感列声明后重建：\n  - " + "\n  - ".join(problems))
+
+
 def _normalize_ctx(spec: dict, table: dict, tables: dict | None = None) -> dict:
     """Per-dataset compilation context for P1 (unrelated tables in one report).
 
@@ -5592,7 +6076,8 @@ def _default_filter_candidates(table: dict, roles: dict) -> list[str]:
     return [col for col, _ in candidates[:4]]
 
 
-def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
+def normalize_request(spec: dict, table: dict, ctx: dict | None = None,
+                      profile_facts: list | None = None) -> dict:
     """Turn a validated request v1 into the compiler's internal shape.
 
     Single-dataset default: everything compiles against ``table`` exactly as v1.
@@ -5601,6 +6086,11 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
     (default: first dataset) so each table only aggregates its own rows. Report
     filters are projected per table. Report-level facts/insights/cover stay on
     the primary (first) dataset.
+
+    ``profile_facts``（NA-01，构建期 profile.facts）：compile_spec 从 profile.json /
+    canonical meta.facts 读出后传入。两个消费点——① insights[].facts 证据绑定的
+    「依据（脚本计算）」脚注（拿 statement）；② fact 引用存在性硬闸（把 id 宇宙
+    交给内部 validate_request，引用不存在的 id 构建失败，防幻觉）。
 
     P1 (repo repo docs/semantic-config-and-derived-redesign.md §5): before delegating
     to the per-dataset context we run two in-place normalisations so the rest
@@ -5616,8 +6106,9 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
     """
     # Keep direct invocations strict as well; report_build is not the only entry
     # point that can call this module.
-    from validate_request import validate_request
-    validate_request(spec)
+    from validate_request import validate_request, canon_kpi as _canon_kpi_fn
+    validate_request(spec, profile_fact_ids=[
+        f.get("id") for f in (profile_facts or []) if isinstance(f, dict) and f.get("id")])
     _normalize_percent_format(spec)
     _ensure_dataset_derived_slot(spec)
     ctx = ctx or _normalize_ctx(spec, table)
@@ -5674,22 +6165,20 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                            "theme": {"name": (style.get("theme") or "notion"), "tokens": {"accent": accent_map.get(style.get("accent"), "#5645d4")}}}
     out["provenance"].setdefault("facts", fact_values)
     out["provenance"].setdefault("quality", (table.get("meta") or {}).get("quality", {}))
+    # 构建期 profile.facts（NA-01）不在这里注入：compile_spec 在调用本函数前把它
+    # 写进 spec["provenance"]["profileFacts"]（provenance 上面的原样透传已携带），
+    # build_manifest 据此烘 manifest.quality.facts（decision_ledger「数据事实」节、
+    # lint L21/L23 的事实依据都从那里读）。请求级 facts（fact_values，可计算口径）
+    # 与它是两个槽位，不混用。
     measure_types = spec.get("measureTypes") or {}
 
     def _canon_kpi(kpi: dict) -> dict:
-        """Map author-friendly KPI keys to the compiler's canonical names so a
-        model that writes factType/column/title/format/basis still computes a
-        real value instead of silently rendering "—". Canonical keys that are
-        already present win; `basis` is no longer part of the contract and is
-        dropped. Unknown keys are left untouched (validated elsewhere)."""
-        out = dict(kpi)
-        aliases = {"factType": "type", "column": "measure", "field": "measure",
-                   "title": "label", "format": "measureType"}
-        for src, dst in aliases.items():
-            if src in out and dst not in out:
-                out[dst] = out[src]
-        out.pop("basis", None)
-        return out
+        """Thin delegate to ``validate_request.canon_kpi`` — the alias map and
+        the 两键并写（type + factType）让位规则 live THERE so the request-layer
+        不可求值闸 (NC-01 #5②) judges the exact shape the compiler will run.
+        Two copies of the alias table is precisely the drift that silently
+        dropped distinctCount KPIs (2026-10-20 课程交付实锤)."""
+        return _canon_kpi_fn(kpi)
 
     # KPI 规范化循环：free 12 / standard 4（2026-09-28「全部放开」——旧裸 [:4]
     # 把 free 第 5 张起的 KPI 在 normalize 就静默丢掉，渲染端放开了也看不见）。
@@ -5893,6 +6382,9 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
                 if mm:
                     measure_types[m["column"]] = mm
             out["charts"].append({"id": chart.get("id", f"chart-{index+1}"), "title": chart.get("title", ""),
+                                  # 分析主张/问题（NA-02）随 intent 产物走，_chart_manifest_entry
+                                  # 落 manifest chart entry（lint L23 与决策清单读它）。
+                                  **({"question": str(chart["question"])} if chart.get("question") else {}),
                                   "annotation": chart.get("annotation", ""),
                                   "annotationPlacement": chart.get("annotationPlacement", "below"),
                                   "style": dict(chart["style"]) if isinstance(chart.get("style"), dict) else None,
@@ -6078,6 +6570,8 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
         if authored_sort is None:
             authored_sort = default_sort
         out["charts"].append({"id": chart.get("id", f"chart-{index+1}"), "title": chart.get("title", ""),
+                              # 分析主张/问题（NA-02）：有声明才落键，旧报告 manifest 零漂移。
+                              **({"question": str(chart["question"])} if chart.get("question") else {}),
                               "annotation": chart.get("annotation", ""),
                               "annotationPlacement": chart.get("annotationPlacement", "below"),
                               "style": dict(chart["style"]) if isinstance(chart.get("style"), dict) else None,
@@ -6124,11 +6618,44 @@ def normalize_request(spec: dict, table: dict, ctx: dict | None = None) -> dict:
             body = insight.get("text") or insight.get("content") or insight.get("description") \
                 or insight.get("body") or insight.get("summary") or insight.get("finding") or ""
             title = insight.get("title") or insight.get("heading") or ""
-            text = f"{title}：{body}" if title and body else (title or body or str(insight))
+            # 只有 facts 绑定、没有正文的洞察：正文留空（不渲染 dict 原形），
+            # 让下面的证据脚注独立成段。
+            text = f"{title}：{body}" if title and body else (title or body or "")
+            if not text and not insight.get("facts"):
+                text = str(insight)
         else:
             text = str(insight)
-        for fid, value in fact_values.items():
-            text = text.replace("{{fact:" + fid + "}}", _format_fact(value, facts.get(fid)))
+        # {{fact:id}} 占位（free 档既有）与 standard 档 facts:[] 绑定共用同一解析
+        # （validate_request.fact_refs_in 单一真源，不许第二份正则）。解析顺序 =
+        # 请求级 facts（可计算口径，出数值）→ 构建期 profile.facts（出事实陈述）；
+        # 都不认识的时候保持原样（free 档的宽容语义，存在性闸在 validate 层）。
+        from validate_request import fact_refs_in as _fact_refs_in, fact_binding_ids as _fact_binding_ids
+        _pfacts = {f.get("id"): f for f in (profile_facts or [])
+                   if isinstance(f, dict) and f.get("id")}
+
+        def _resolve_fact_token(fid: str) -> str | None:
+            if fid in fact_values:
+                return _format_fact(fact_values[fid], facts.get(fid))
+            pf = _pfacts.get(fid)
+            if pf:
+                return str(pf.get("statement") or pf.get("id"))
+            return None
+
+        for fid in _fact_refs_in(text):
+            rep = _resolve_fact_token(fid)
+            if rep is not None:
+                text = text.replace("{{fact:" + fid + "}}", rep)
+        # 证据绑定脚注（NA-02）：insights[].facts 引用的 fact 渲染成洞察文本后的
+        # 「依据（脚本计算）」行（_insight_paragraphs 按行拆段，脚注独立成段）。
+        _notes = []
+        for fid in _fact_binding_ids(insight):
+            pf = _pfacts.get(fid)
+            if pf:
+                _notes.append(f"{fid} {str(pf.get('statement') or '').strip()}")
+            elif fid in fact_values:
+                _notes.append(f"{fid} {_format_fact(fact_values[fid], facts.get(fid))}")
+        if _notes:
+            text = text.rstrip() + "\n依据（脚本计算）：" + "；".join(_notes)
         out["insights"].append(text)
     return out
 
@@ -6189,6 +6716,11 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
     # （335k 行中间产物可达 GB 级），所以那份 profile 必须显式传进来；多数据集/合并
     # 宽表路径传的是 canonical JSON，``meta.stats`` 已随之携带，这里只是兜底。
     stats_by_id: dict = {}
+    # 构建期 profile.facts（NA-01）：与列统计同一条携带通道——profile.json 的
+    # facts 键优先，多数据集/合并路径回落 canonical 表的 meta.facts
+    # （profile_table.build_profile 两处都写）。
+    profile_facts: list = []
+    facts_skipped: dict = {}
     if column_stats_path:
         try:
             _prof = json.loads(Path(column_stats_path).read_text(encoding="utf-8"))
@@ -6197,6 +6729,11 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
         _stats = _prof.get("columnStats") if isinstance(_prof, dict) else None
         if isinstance(_stats, dict) and _stats:
             stats_by_id[dataset_id] = _stats
+        if isinstance(_prof, dict):
+            if isinstance(_prof.get("facts"), list):
+                profile_facts = [f for f in _prof["facts"] if isinstance(f, dict) and f.get("id")]
+            if isinstance(_prof.get("factsSkipped"), dict):
+                facts_skipped = dict(_prof["factsSkipped"])
 
     def _column_stats_for(raw_id: str, table_obj: dict) -> dict:
         got = stats_by_id.get(raw_id)
@@ -6217,6 +6754,26 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
             else:
                 from table_input import load_table_file
                 tables_by_id[raw] = load_table_file(fp, tidy=bool(sort_input))
+        # NS-01 privacy：表一落地立刻剥离敏感列（先于继承裁剪/物化/锚点/任何消费方），
+        # 再对声明槽位跑引用闸——引用敏感列的物化声明不会先算出一半再失败。
+        _stripped_values: dict = {}
+        _stripped = _strip_sensitive_tables(spec, tables_by_id, datasets, declared_ds,
+                                            value_sink=_stripped_values)
+        if _stripped:
+            _assert_no_sensitive_refs(spec, _stripped, datasets, declared_ds)
+            # XS-02：作者自由文本（洞察/文本块/批注/封面摘要…）含敏感列取值 → 有界 warn
+            # （不回显值、不改 exit code），记进 provenance → quality.privacyAuthorWarnings。
+            _warn_author_text_sensitive(spec, _stripped_values)
+            # profile 通道（--column-stats）同样可能携带敏感列的统计与事实：按同一
+            # 剥离宇宙剪掉，保证 columnStats/quality.facts 的证据引用不含敏感列。
+            for _rid, _scols in _stripped.items():
+                _sset = set(_scols)
+                _st = stats_by_id.get(_rid)
+                if isinstance(_st, dict) and _st:
+                    stats_by_id[_rid] = {k: v for k, v in _st.items() if k not in _sset}
+                if _rid == dataset_id and profile_facts:
+                    profile_facts = [f for f in profile_facts
+                                     if not (set(f.get("columns") or []) & _sset)]
         # P1: derive columns live under datasets[i].derived.columns. The
         # compile path reads from the first dataset's slot — multi-dataset
         # derived columns remain a P1.5 boundary (already noted in docs §2).
@@ -6290,6 +6847,24 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
             spec.setdefault("provenance", {})["anchorChecks"] = _anchor_records
         primary_raw = datasets[0].get("raw") or datasets[0]["id"]
         primary_table = tables_by_id[primary_raw]
+        # profile.facts 兜底：profile.json 缺席（多数据集/合并路径没传 --column-stats）
+        # 时从主数据集 canonical 表的 meta.facts 取（build_profile 落的两份之一）。
+        if not profile_facts:
+            _meta_facts = ((primary_table.get("meta") or {}).get("facts")) or []
+            if isinstance(_meta_facts, list):
+                profile_facts = [f for f in _meta_facts if isinstance(f, dict) and f.get("id")]
+                # NS-01：meta.facts 的证据列同样按剥离宇宙剪（主数据集的敏感列事实
+                # 不得落进 quality.facts）。
+                _pv_primary = set(_stripped.get(primary_raw) or [])
+                if _pv_primary:
+                    profile_facts = [f for f in profile_facts
+                                     if not (set(f.get("columns") or []) & _pv_primary)]
+        if profile_facts:
+            # 注入在 normalize_request 之前：provenance 原样透传（normalize 不重建
+            # 该键），build_manifest 从 provenance.profileFacts 烘 quality.facts。
+            spec.setdefault("provenance", {})["profileFacts"] = [dict(f) for f in profile_facts]
+            if facts_skipped:
+                spec["provenance"]["factsSkipped"] = dict(facts_skipped)
         authored_mt = dict(spec.get("measureTypes") or {})
         if not declared_ds and datasets:
             # Legacy single-table path may carry a non-default id (server register
@@ -6302,7 +6877,7 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
             ctx = _normalize_ctx(pseudo, primary_table, tables_by_id)
         else:
             ctx = _normalize_ctx(spec, primary_table, tables_by_id)
-        spec = normalize_request(spec, primary_table, ctx)
+        spec = normalize_request(spec, primary_table, ctx, profile_facts=profile_facts)
         # Mixed-mode (repo repo docs/mixed-mode-design.md §3): remote datasets are emitted
         # schema-only under their final (namespaced) id; charts/KPIs bound to
         # them are rewritten so the runtime fetches the namespaced dataset.
@@ -6363,6 +6938,11 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
                 _pk_decl = _ds_primary_key(declared_ds, d.get("raw") or d["id"])
                 if _pk_decl:
                     ds["primaryKey"] = _pk_decl
+                # NS-01：privacy 声明原样保留进 manifest（server Agent 链的脱敏投影
+                # 按列名消费它；列本身已被剥离，schema-only 表声明不再携带敏感列）。
+                _pv_decl = _ds_privacy(declared_ds, d.get("raw") or d["id"])
+                if _pv_decl:
+                    ds["privacy"] = {"sensitiveColumns": list(_pv_decl)}
                 spec.setdefault("datasets", []).append(ds)
                 continue
             ds = {"id": d["id"], "label": d.get("label", d["id"]),
@@ -6417,6 +6997,11 @@ def compile_spec(spec_path: str, out_path: str, dataset_path: str | None = None,
             _pk_decl = _ds_primary_key(declared_ds, d.get("raw") or d["id"])
             if _pk_decl:
                 ds["primaryKey"] = _pk_decl
+            # NS-01：privacy 声明保留进 manifest（singlefile 内联 rows 已不含敏感列，
+            # 声明本身供下游链路/server Agent 链按列名消费）。
+            _pv_decl = _ds_privacy(declared_ds, d.get("raw") or d["id"])
+            if _pv_decl:
+                ds["privacy"] = {"sensitiveColumns": list(_pv_decl)}
             spec.setdefault("datasets", []).append(ds)
     # C: cardinality-aware overflow filter — truncate comparison charts to a
     # readable top-N and note it in provenance (Flint filterOverflow pattern).

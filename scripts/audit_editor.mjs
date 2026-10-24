@@ -10,7 +10,7 @@
  *     duplicate actions, the drag surface must be the top strip only, and the
  *     text format bar must apply inline formatting.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import os from 'node:os';
@@ -46,6 +46,7 @@ function globRe(pat) {
 const flagSel = [];
 const flagSkip = [];
 let listOnly = false;
+let noReap = false;
 const positional = [];
 {
   const argv = process.argv.slice(2);
@@ -53,6 +54,7 @@ const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--list-checks') { listOnly = true; continue; }
+    if (a === '--no-reap') { noReap = true; continue; }
     let matched = null, val = null;
     for (const f of FLAGS) {
       if (a === f) { matched = f; val = argv[i += 1]; break; }
@@ -102,9 +104,42 @@ if (!arg) {
 // 范围门：每个检查都经 evalIf 执行 —— 未选中的检查记入 skipped 且不产出结果；
 // passed 只对**实际执行**的检查判定（全量语义不变）。
 const SKIPPED_CHECKS = [];
+// ---- infra/check 失败分类（NP-04 审计稳定性加固）---------------------------
+// CDP 超时 / 看门狗中止 / 页面重载或饿死丢 helper / socket 断开 = **环境失败**
+// （infra），不是产品失败：自动重试一次；仍失败该检查记 `infraFailed` 并使整体
+// exit 非 0（不静默放行）。检查自身的断言失败（返回 false / 失败串）是 check
+// 失败，照旧判红、不重试。高负载期（真机 load 7-26）的假红从此不再污染验收。
+// 判定用**窄签名**：只认「审计基础设施自己的失效形态」，普通页面异常（如检查
+// 表达式自身的 ReferenceError）不误判成 infra，仍走整体 aborted 语义。
+const INFRA_RE = /cdp-timeout|audit-deadline|socket-closed|WebSocket is not open|WebSocket is closed|__audit(BadFormatter|Painted) is not a function|echarts is not defined|AIReportRuntime is not defined|Target closed|Session closed|Cannot find context|connection closed/i;
+let infraRetries = 0;
+const infraFailed = [];
+const infraErrorOf = (e) => String((e && e.message) || e);
+// 名字直呼基础设施，供 tests/test_audit_fake_red.cjs 沙箱提取做行为级验证。
+async function withInfraRetry(name, run) {
+  try {
+    return await run();
+  } catch (e) {
+    const msg = infraErrorOf(e);
+    if (!INFRA_RE.test(msg)) throw e;   // 非 infra = 脚本自身/页面真实异常 → 整体 aborted（原语义）
+    infraRetries += 1;
+    console.error('[audit] infra-retry ' + name + ': ' + msg.slice(0, 160));
+    await wait(400);
+    // 页面重载会丢审计 helper —— 重试前幂等补注（其余如 echarts/runtime 无法
+    // 页内复活，重试会再次 infra 失败并如实记 infraFailed）。
+    try { await evaluate(RENDER_HELPERS); } catch (e2) {}
+    try {
+      return await run();
+    } catch (e2) {
+      const msg2 = infraErrorOf(e2);
+      infraFailed.push({ check: name, error: msg2.slice(0, 300) });
+      return 'infraFailed:' + name + ' ' + msg2.slice(0, 160);
+    }
+  }
+}
 async function evalIf(name, code) {
   if (!want(name)) { SKIPPED_CHECKS.push(name); return undefined; }
-  return evaluate(code);
+  return withInfraRetry(name, () => evaluate(code));
 }
 // Configurable for intranet machines. Prefer AI_REPORT_CHROME, then discover
 // the common Chrome/Chromium paths per OS so Windows audit runs without env
@@ -172,6 +207,35 @@ async function launchChrome() {
   }
   throw lastError || new Error('Chrome did not start');
 }
+// ---- 启动前置：收割历次遗留的孤儿 headless Chrome（NP-04，AGENTS.md 收割纪律）----
+// 泄漏实例抢内存推高负载（真机：~95 个实例把 load 打到 7-26，335k 行审计因此
+// 间歇性假红）。只清「--headless 且 --remote-debugging-port=19xxx/20xxx」双签名
+// 进程 —— 这是本脚本与 audit/探针的专属签名（本脚本端口段 19500+rand(1000)），
+// 用户真浏览器既不 headless 也不带调试端口，永不受影响；绝不无差别 pkill 用户浏览器。
+// 端口段正则名直呼基础设施，供 tests/test_audit_fake_red.cjs 沙箱提取验证。
+const AUDIT_DEBUG_PORT_RE = /--remote-debugging-port=((?:19|20)\d{3})\b/;
+const REAP_PS_LINE_RE = /^\s*(\d+)\s+(.+)$/;
+async function reapOrphanHeadless() {
+  const empty = { count: 0, ports: [] };
+  if (process.platform === 'win32') return empty;   // Windows 无 ps/pkill：诚实跳过（不假装清了）
+  const run = (cmd, args) => new Promise((ok) => execFile(cmd, args, { timeout: 15000 }, (err, stdout, stderr) => ok(String(err ? (stderr || err.message) : stdout))));
+  const psOut = await run('ps', ['-Ao', 'pid=,command=']);
+  const pids = []; const ports = [];
+  for (const line of psOut.split('\n')) {
+    const m = line.match(REAP_PS_LINE_RE);
+    if (!m) continue;
+    const cmd = m[2];
+    if (cmd.indexOf('--headless') < 0) continue;
+    const pm = cmd.match(AUDIT_DEBUG_PORT_RE);
+    if (!pm) continue;
+    if (pids.indexOf(Number(m[1])) < 0) pids.push(Number(m[1]));
+    if (ports.indexOf(pm[1]) < 0) ports.push(pm[1]);
+  }
+  if (!pids.length) return empty;
+  for (const p of ports) await run('pkill', ['-f', 'remote-debugging-port=' + p]);
+  return { count: pids.length, ports };
+}
+let reapInfo = { count: 0, ports: [] };
 // ---- 看门狗（验收绝不允许再挂死）-----------------------------------------
 // 渲染进程在内存/IO 饥饿时会**不再应答 CDP**（真机：evaluate / Debugger.resume 全部
 // 超时、CPU 0%、没有原生对话框）。原实现 command() 没有超时 → 一次卡住就等到外层
@@ -277,7 +341,21 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 
 const checks = {};
 try {
+  // 启动前置收割（--no-reap 跳过）：先清掉历次遗留的孤儿 headless Chrome 再起
+  // 自己的实例，内存/负载从干净基线开始（收割数打印进 stderr + scope.reaped）。
+  if (!noReap) {
+    try {
+      reapInfo = await reapOrphanHeadless();
+      if (reapInfo.count) console.error('[audit] reaped ' + reapInfo.count + ' orphan headless chrome (ports: ' + reapInfo.ports.join(', ') + ')');
+    } catch (e) { console.error('[audit] reap skipped: ' + String((e && e.message) || e)); }
+  }
   const page = await launchChrome(); socket = new WebSocket(page.webSocketDebuggerUrl); await new Promise((ok, no) => { socket.onopen = ok; socket.onerror = no; });
+  // socket 断开 = 环境失败（infra）：所有在途命令立即以 socket-closed 拒绝，
+  // 走 withInfraRetry 的重试/归类，而不是干等各自的 cdp-timeout。
+  socket.onclose = () => {
+    for (const entry of pending.values()) entry.no(new Error('socket-closed: CDP 连接断开（页面崩溃或 Chrome 被杀）'));
+    pending.clear();
+  };
   socket.onmessage = (event) => {
     const message = JSON.parse(event.data);
     // NEVER let a native dialog hang the audit. A page that registers a
@@ -1069,8 +1147,9 @@ try {
     }
     let result = null;
     if (want('chart:' + blockId + ':controls')) {
-      result = await evaluate(`(() => { const chart = AIReportRuntime.manifest.charts.find((c) => c.blockId === ${JSON.stringify(blockId)}); const view = document.querySelector('input[name="ai-chart-view"]:checked'); return { editable: chart.editor?.editable !== false, hasType: !!view, hasDimension: !!document.getElementById('ai-chart-dimension'), hasMeasures: document.querySelectorAll('[data-measure]').length > 0 }; })()`);
-      checks[`chart:${blockId}:controls`] = result.editable ? result.hasType && result.hasDimension && result.hasMeasures : true;
+      result = await withInfraRetry(`chart:${blockId}:controls`, () => evaluate(`(() => { const chart = AIReportRuntime.manifest.charts.find((c) => c.blockId === ${JSON.stringify(blockId)}); const view = document.querySelector('input[name="ai-chart-view"]:checked'); return { editable: chart.editor?.editable !== false, hasType: !!view, hasDimension: !!document.getElementById('ai-chart-dimension'), hasMeasures: document.querySelectorAll('[data-measure]').length > 0 }; })()`));
+      // infra 失败返回 'infraFailed:…' 字符串（非对象）：如实落值判红，不落 «editable undefined → true» 的假绿缝。
+      checks[`chart:${blockId}:controls`] = (result && typeof result === 'object') ? (result.editable ? result.hasType && result.hasDimension && result.hasMeasures : true) : result;
     }
     // Capture paintedContent BEFORE the controls loop mutates chart.viewType.
     // Otherwise the pie/donut 'painted' check would render the post-switch bar
@@ -1099,6 +1178,14 @@ try {
       }
       if (!share[vt]) return true;
       const host = document.getElementById(chart.elementId);
+      // 底部卡片采样前先滚进视口（NQ-01 假红修复）：视口外的 canvas 可能还没被
+      // 真正绘制/提交（懒渲染与合成器时序），getImageData 采到全透明 → 页面底部的
+      // 饼/环恒假红。与 dragLostGuard/buttonRowHeights 的 scrollIntoView({block:'center'})
+      // 是同一先例；滚进视口不影响像素真值（读的是 canvas 背板，不是合成结果）。
+      if (host && host.scrollIntoView) {
+        host.scrollIntoView({ block: 'center' });
+        await new Promise((r) => setTimeout(r, 400));
+      }
       const canvas = host && host.querySelector('canvas');
       if (!canvas || canvas.width === 0 || canvas.height === 0) return false;
       const ctx = canvas.getContext('2d');
@@ -1364,7 +1451,12 @@ try {
   }
   checks.accessibilityMatrix = await evalIf('accessibilityMatrix', `(() => {
     const root = document.querySelector('#ai-report-copilot');
-    if (!root) return true;
+    // NQ-01 假红修复：Copilot 是 server-only 能力 —— copilotRender 对非 server
+    // 模式 display:none 且从不填充内容（工具栏 boot 恒注入 <aside id="ai-report-copilot">
+    // 空壳，singlefile 也有）。抽屉内容（.ai-cp-head）不存在 = 该检查不适用 →
+    // skip 带因（记入 skipped，不判红）；server 模式（PSI 真检）抽屉 boot 即渲染，
+    // 照旧真检、executed 数不降。
+    if (!root || !root.querySelector('.ai-cp-head')) return 'skip:copilot-drawer-absent(非 server 模式无 Copilot，live-status 断言不适用)';
     const bad = [];
     root.querySelectorAll('button,input,textarea,select').forEach((node) => {
       const label = (node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent || '').trim();
@@ -2182,7 +2274,10 @@ try {
       const wrap = g.wp; const item = g.it;
       if (!wrap.hasAttribute('data-bounded')) return 'no-data-bounded';
       const maxPx = Number(wrap.getAttribute('data-bounded'));
-      if (!(maxPx >= 200 && maxPx <= 4000)) return 'bad-maxPx:' + maxPx;
+      // XU-01 行数口径：data-bounded 携带的是「实测行高校正后」的帽（N×行高+thead），
+      // 可超 maxPx 输入上限 4000（如 500 行×48px）——这里只核「合理帽」区间，输入
+      // 边界（200..4000 / 5..500）由 validate_request 管。
+      if (!(maxPx >= 100 && maxPx <= 60000)) return 'bad-maxPx:' + maxPx;
       if (wrap.offsetHeight > maxPx + 2) return 'wrap-taller-than-cap:' + wrap.offsetHeight + '>' + maxPx;
       const chrome = item.offsetHeight - wrap.offsetHeight;
       if (Number(item.getAttribute('gs-h')) * 48 < maxPx + chrome - 1) return 'reserve-too-small:' + item.getAttribute('gs-h') + '*48<' + (maxPx + chrome);
@@ -2836,18 +2931,45 @@ try {
       const caps = Array.from(w.querySelectorAll('[data-kpi-chip] .ai-report-chip-caption')).map((c) => c.textContent);
       if (caps.indexOf('指标处理') < 0 || caps.indexOf('小数位数') < 0 || caps.indexOf('单位') < 0) return 'chip-controls:' + caps.join('/');
       const card = () => item.querySelector('.kpi-card');
-      const uSel = w.querySelector('[data-kpi-bind="unitscale"]'); uSel.value = 'wan'; uSel.dispatchEvent(new Event('change', { bubbles: true }));
-      if (!await until(() => /万/.test(card().querySelector('.value').textContent), 25000)) {
-        const kp0u = ((window.AIReportRuntime.manifest.kpis || [])[0]) || {};
-        const liveU = document.querySelector('#ai-kpi-panel [data-kpi-bind="unitscale"]');
-        return 'unit-not-applied ' + JSON.stringify({
-          unitScale: kp0u.unitScale, measure: kp0u.measure,
-          valueShown: (card().querySelector('.value') || {}).textContent || null,
-          errBadge: !!card().querySelector('.kpi-err-badge'), cardConnected: !!(card() && card().isConnected),
-          itemConnected: item.isConnected,
-          unitInput: liveU ? { connected: liveU.isConnected, value: liveU.value } : null,
-          panelLive: !!document.getElementById('ai-kpi-panel'),
-        });
+      // 计数卡豁免（NQ-01 unit-not-applied 假红修复）：count/countd/记录数（'*'）
+      // 与 percent/比率语义的 KPI 不做「万」换算是正确行为——缩放断言只对可缩放
+      // 语义（currency/number 大数）生效。kind 判定镜像运行时 kpiKind（semanticType
+      // → measureType → factType 兜底 + percent 格式列提升）。
+      // tickets2026 真机实锤的两个补充形状（trio 门槛抓到批2修复的漏网）：
+      // ① semanticType:'number' + factType:'count' 并写——运行时**取值路径**
+      //    localKpiValue 的解析是 kind||factType||semanticType（factType 优先），
+      //    按 count 处理不换万；审计镜像必须同口径，不能让 semanticType 抢先。
+      // ② 静态值卡（factId:null + measure:null + value 烘死字符串）——unitScale
+      //    本就没有可重算的活聚合，选「万」不变显是正确行为。
+      const kp0m = ((window.AIReportRuntime.manifest.kpis || [])[0]) || {};
+      const countish0 = (kp0m.factType && /count/i.test(String(kp0m.factType)))
+        || kp0m.measure === '*'
+        || (kp0m.measure == null && kp0m.factId == null && kp0m.value != null);
+      let kind0 = kp0m.semanticType || kp0m.measureType || kp0m.factType || 'number';
+      if (kind0 && typeof kind0 === 'object') kind0 = kind0.type;
+      kind0 = String(kind0 || 'number');
+      try {
+        const dsAll = (window.AIReportRuntime.manifest.datasets || []);
+        const ds0 = dsAll.find((d) => d && d.id === (kp0m.datasetId || (dsAll[0] || {}).id));
+        const mt0 = ds0 && ds0.measureTypes ? ds0.measureTypes[kp0m.countDim || kp0m.measure] : null;
+        if ((mt0 && typeof mt0 === 'object' && mt0.format === 'percent') || mt0 === 'percent') kind0 = 'percent';
+      } catch (e) {}
+      const unitScalable = !kp0m.countDim && !countish0 && kp0m.measure !== '*'
+        && (kind0 === 'currency' || kind0 === 'number' || kind0 === 'integer' || kind0 === 'duration');
+      if (unitScalable) {
+        const uSel = w.querySelector('[data-kpi-bind="unitscale"]'); uSel.value = 'wan'; uSel.dispatchEvent(new Event('change', { bubbles: true }));
+        if (!await until(() => /万/.test(card().querySelector('.value').textContent), 25000)) {
+          const kp0u = kp0m;
+          const liveU = document.querySelector('#ai-kpi-panel [data-kpi-bind="unitscale"]');
+          return 'unit-not-applied ' + JSON.stringify({
+            unitScale: kp0u.unitScale, measure: kp0u.measure, kind: kind0,
+            valueShown: (card().querySelector('.value') || {}).textContent || null,
+            errBadge: !!card().querySelector('.kpi-err-badge'), cardConnected: !!(card() && card().isConnected),
+            itemConnected: item.isConnected,
+            unitInput: liveU ? { connected: liveU.isConnected, value: liveU.value } : null,
+            panelLive: !!document.getElementById('ai-kpi-panel'),
+          });
+        }
       }
       // 目标完成度条：setValue 走 /aggregate 异步回包才调 kpiFoot。全量审计跑到这里
       // 时前序检查可能留下**时点态**会话筛选（filterDefaults/sessionView 的恢复窗口），
@@ -2997,13 +3119,17 @@ try {
       })
     : [];
   const passed = executedVals.length > 0 && executedVals.every((v) => v === true) && unmatchedPatterns.length === 0;
-  const scope = { selected: SCOPE_DESC, executed: executedVals.length, skipped: new Set([...SKIPPED_CHECKS, ...selfSkipped]).size };
+  // scope 元信息（NP-04）：reaped = 启动前置收割的孤儿 headless Chrome 数；
+  // retried = infra 失败自动重试次数。infraFailed 非空时 passed 已为 false
+  //（infraFailed 串 ≠ true），整体 exit 非 0 —— 环境失败不静默放行。
+  const scope = { selected: SCOPE_DESC, executed: executedVals.length, skipped: new Set([...SKIPPED_CHECKS, ...selfSkipped]).size, reaped: reapInfo.count, retried: infraRetries };
+  if (reapInfo.ports && reapInfo.ports.length) scope.reapedPorts = reapInfo.ports;
   if (unmatchedPatterns.length) {
     scope.unmatchedPatterns = unmatchedPatterns;
     scope.hint = '选中的模式没有命中任何检查（executed/skipped 都没有）：' + unmatchedPatterns.join(', ')
       + '。每图检查名形如 chart:<blockId>:<suffix>，`*` 不跨冒号 —— 全套 per-chart 检查请用 chart:*:*（--list-checks 查看全部）。';
   }
-  console.log(JSON.stringify({ checks, scope, passed }, null, 2));
+  console.log(JSON.stringify({ checks, scope, passed, infraRetries, infraFailed }, null, 2));
   if (!passed) process.exitCode = 1;
 } catch (error) {
   // 看门狗触发/渲染进程无响应：给出**可诊断**的结果，而不是吊死到外层超时。
@@ -3015,6 +3141,9 @@ try {
     passed: false,
     aborted: true,
     error: why,
+    scope: { selected: SCOPE_DESC, executed: Object.keys(checks).filter((n) => checks[n] !== undefined).length, skipped: SKIPPED_CHECKS.length, reaped: reapInfo.count, retried: infraRetries },
+    infraRetries,
+    infraFailed,
     hint: /cdp-timeout|audit-deadline/.test(why)
       ? '渲染进程停止应答 CDP（通常是内存/IO 饥饿）。请关闭占内存的程序（Docker/Obsidian/多余 Chrome 标签）后重跑；' +
         '也可用 AI_AUDIT_CMD_TIMEOUT_MS / AI_AUDIT_DEADLINE_MS 调整看门狗，或用 --skip-audit 先交付再补验收。'

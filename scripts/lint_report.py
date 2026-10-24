@@ -820,6 +820,67 @@ def check_title_encoding_match(chart, findings):
     ))
 
 
+# ---------- L23: chart without a declared question/claim（NA-02） ----------
+
+# 「有图无主张」advisory：每张图应带一句 chart.question（这张卡回答什么分析问题/
+# 主张）。只查**有没有**，绝不查对错——主张的真伪由证据绑定（insights[].facts →
+# profile.facts）与读者对着数据核对，lint 无从判定语义。
+def check_chart_question(chart, findings):
+    if str(chart.get("question") or "").strip():
+        return
+    findings.append(_finding(
+        "L23", SEVERITY_INFO, chart.get("id"),
+        "chart declares no question/claim (chart.question) — readers cannot tell "
+        "what analytical question this card answers.",
+        "declare chart.question: one sentence stating the claim or question this "
+        "chart answers; back it with insights[].facts bound to profile.facts ids "
+        "(fact:<类>:<序号>) where possible.",
+        path="chart.question",
+    ))
+
+
+# ---------- L21 补充：以 profile.facts 符号结构事实为依据（server 报告） ----------
+
+# 行级 L21（check_diverging_measure）在 server 报告上诚实 skip——manifest 没有行
+# 数据，跨不跨零无从判定。NA-01 的符号结构事实（kind=sign）在构建期已经判过：
+# 命中 = 事实里的跨零列被某张图用作指标，而全报告没有任何 condFormat 以它为
+# target → 凭 fact id 给出建议（证据可回 decisions.md「数据事实」节复核）。
+def check_diverging_fact_coverage(manifest, findings):
+    facts = (manifest.get("quality") or {}).get("facts") or []
+    sign_cols: dict[str, str] = {}
+    for f in facts:
+        if isinstance(f, dict) and f.get("kind") == "sign":
+            for col in f.get("columns") or []:
+                sign_cols[str(col)] = str(f.get("id") or "")
+    if not sign_cols:
+        return
+    charts = manifest.get("charts") or []
+    cond_targets: set[str] = set()
+    for chart in charts:
+        tbl = ((chart.get("editor") or {}).get("table") or {})
+        for rule in (tbl.get("condFormat") or []):
+            if isinstance(rule, dict) and rule.get("target"):
+                cond_targets.add(str(rule["target"]))
+    flagged: list[str] = []
+    for chart in charts:
+        data = (chart.get("editor") or {}).get("data") or {}
+        for m in (data.get("measures") or []):
+            m = str(m)
+            if m in sign_cols and m not in cond_targets and m not in flagged:
+                flagged.append(m)
+    for m in flagged:
+        findings.append(_finding(
+            "L21", SEVERITY_INFO, "<report>",
+            f"measure '{m}' is sign-structured (positive/negative mix) per "
+            f"{sign_cols[m]} (script-computed fact) but no conditional format "
+            "treats the sign — server report ships no rows, so the fact layer is "
+            "the evidence for this diverging-capable column.",
+            "add a condFormat rule on basis 与0 with red-for-negative / "
+            "green-for-positive actions, or bind the insight to " + sign_cols[m] + ".",
+            path="editor.table.condFormat",
+        ))
+
+
 # ---------- orchestration ----------
 
 class _LintHTMLParser(HTMLParser):
@@ -886,6 +947,7 @@ def lint_html(html: str, packaged: bool = False) -> tuple[list[dict[str, Any]], 
         check_price_mix_average,
         check_diverging_measure,
         check_title_encoding_match,
+        check_chart_question,
     ]
     for chart in charts:
         for checker in chart_checkers:
@@ -898,6 +960,7 @@ def lint_html(html: str, packaged: bool = False) -> tuple[list[dict[str, Any]], 
     check_duplicate_columns(datasets, charts, findings)
     check_text_blank(html, findings)
     check_chart_theme(manifest, findings)
+    check_diverging_fact_coverage(manifest, findings)
 
     summary = {
         "reportId": manifest.get("reportId"),

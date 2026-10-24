@@ -627,6 +627,27 @@
             "minLength": 1
           },
           "description": "增量合并（按主键 upsert）的主键列；替换数据端点持久化，刷新向导据此预填"
+        },
+        "privacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sensitiveColumns"
+          ],
+          "properties": {
+            "sensitiveColumns": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 64,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "构建期已物理剥离的敏感列名（NS-01）：列不在 rows/columns 里，本声明供 server Agent 链（agent_context/agent_tool_runner 脱敏投影）按列名消费"
+            }
+          },
+          "description": "隐私声明：sensitiveColumns 列已在编译期剥离，manifest 保留声明供 server Agent 链消费"
         }
       }
     },

@@ -98,6 +98,10 @@
 **为什么**：比率必须声明为**聚合级派生指标**（SUM(毛利额)/SUM(销售额)，聚合后重算），
 绝不对行级比率列取平均；`measureType.percent` 接管格式与不可加闸。图表里它就是普通
 指标名，编译期把值烘进静态 option、运行时按同一求值器重算（WYSIWYG）。
+**percent 显示语义（2026-10-23 拍板 D1）**：公式节点存的是**运算原值**（0.2207 这种
+比率），`measureType.percent` =「此列按百分数读」——编译与运行时都在显示层 ×100
+（0.2207 → 22.07%，轴模板 `{value}%` 直显），声明里不要自己先 ×100；share 与
+window(rate)（示例 6/7）求值时已是百分数，直显、不重复缩放。
 
 ## 6. 环比：「给我看销售额的月环比」
 
@@ -199,6 +203,34 @@ count 可省 `col`（=条件计行数）；无命中行 count/countd=0、sum/ave
 
 ---
 
+## 10. 证据绑定 + 分析主张：「把洞察写得有据可查」
+
+构建日志的 `[fact]` 行（或 `profile.json` 的 `facts`）给出脚本算好的确定性事实
+（id 形如 `fact:concentration:1`）。洞察引用它们：主张句只说事实支持的话，
+`facts` 槽位绑定 id，报告里渲染成洞察下方的「依据（脚本计算）」脚注——
+
+```json
+"charts": [{
+  "id": "rank-region",
+  "presetId": "bar.rank",
+  "title": "欧洲终端业务部以 36.8% 的 Sell In 份额领先",
+  "question": "哪个大区的 Sell In 体量最大、集中度有多高？（依据 fact:concentration:1）",
+  "encoding": { "dimension": "Management Region", "measures": ["Sell In"] }
+}],
+"insights": [
+  { "text": "Sell In 高集中：前 3 个大区占 84.8%，头部市场波动即可显著改变大盘。",
+    "facts": ["fact:concentration:1"] }
+]
+```
+
+**为什么**：`chart.question` 声明这张卡回答的主张/问题（lint L23 只提醒「有图无主张」，
+不查对错）；`insights[].facts` 是证据绑定——**引用不存在的 fact id 构建失败**（报错会
+列出可用 id，防幻觉闸），合法引用则在洞察下方渲染「依据（脚本计算）：fact:… <事实
+陈述>」脚注，读者与复核者都能对回 `decisions.md`「数据事实（脚本计算）」节逐条核对。
+free 档的 `{{fact:id}}` 占位与 `facts:[]` 绑定走同一套解析校验。
+
+---
+
 ## 反例速查（写了就返工）
 
 - ❌ `"measures": ["毛利率"]` 但没在 `derived.measures` 声明 → 「指标不存在」构建失败。
@@ -206,3 +238,4 @@ count 可省 `col`（=条件计行数）；无命中行 count/countd=0、sum/ave
 - ❌ 窗口指标放到 `dimension` ≠ `timeField` 的图上 → 编译期可行动报错，不是静默空图。
 - ❌ KPI 硬编码 `"value": 1234` → 用户筛选后不重算、与图表矛盾（声明了 filters 还会吃 advisory）。
 - ❌ 「只看华东」写进 `dimension`/`breakdown` → 筛选语义不改道，落 `filters` 或 `columnFilters`。
+- ❌ `insights[].facts` / `{{fact:id}}` 引用编造的 id → 构建失败（防幻觉闸）；先读 `[fact]` 行再绑定。

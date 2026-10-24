@@ -372,6 +372,7 @@ _MANAGER_PAGE = """<!DOCTYPE html>
     <button type="button" class="btn" id="refresh">↻ 刷新</button></span>
   </div>
   <div id="list"></div>
+  <div class="note" id="disk-total" style="display:none"></div>
   <div class="note" id="foot-note">
     · <b>在线编辑</b>：关闭后任何人（含报告主人）都无法保存该报告，打开报告的人会看到「当前暂无法编辑保存报告，请联系管理员」；「设置口令」可随时改口令（改完请在报告页重新输入一次）。<br>
     · 「关闭服务」会停止该端口上的本地数据服务：其中的<b>所有报告（含副本）</b>都会下线，仅限在本机操作。全机共享同一服务时，该端口只有<b>第一个</b>报告族的族头有「关闭服务」，其余族头显示「共享服务」徽标；确认弹窗会点名列出全部受影响的报告。<br>
@@ -616,7 +617,9 @@ _MANAGER_PAGE = """<!DOCTYPE html>
         html+='<div class="rep"><div class="info">'
             +'<a class="title" href="'+esc(r.urlLocal)+'" target="_blank">'+esc(r.title||r.reportId)+'</a>'
             +'<div class="row2">'+typeBadge+'<span>ID <code>'+esc(r.reportId)+'</code></span>'
-            +(r.updatedAt?'<span>更新 '+esc(fmtTime(r.updatedAt))+'</span>':'')+'</div>'
+            +(r.updatedAt?'<span>更新 '+esc(fmtTime(r.updatedAt))+'</span>':'')
+            // XP-01 磁盘列：该报告全部数据集快照文件字节和（服务端 diskBytes）。
+            +((typeof r.diskBytes==='number')?'<span title="该报告全部数据集快照文件的磁盘占用（含 replaced/added 各代）">磁盘 '+(r.diskBytes/1048576).toFixed(2)+' MB</span>':'')+'</div>'
             +'<div class="row2">'+links+'</div>'
             +'<div class="row2"><span>'+(r.draft?'拼版画板 · 未转正':((r.chartCount||0)+' 个图表'))+'</span></div>'
             +'<div class="editbar">'
@@ -644,7 +647,19 @@ _MANAGER_PAGE = """<!DOCTYPE html>
     var snap=snapshotUserState();
     list.innerHTML=html;
     restoreUserState(snap);
+    // XP-01 页脚总量：全部报告磁盘占用合计 + 本机状态目录体量（data 快照 + db 表缓存）。
+    var foot=document.getElementById('disk-total');
+    if(foot){
+      var totalDisk=0;rows.forEach(function(r){if(typeof r.diskBytes==='number')totalDisk+=r.diskBytes;});
+      var sh=(data&&data.stateHome)||null;
+      var parts=['全部报告快照合计 '+fmtMb(totalDisk)];
+      if(sh&&typeof sh.dataBytes==='number')parts.push('data '+fmtMb(sh.dataBytes));
+      if(sh&&typeof sh.dbBytes==='number')parts.push('db 表缓存 '+fmtMb(sh.dbBytes));
+      foot.textContent='· 磁盘占用：'+parts.join(' · ')+'（治理：python scripts/run_server.py --prune 先看演练，确认后加 --prune-apply）';
+      foot.style.display='block';
+    }
   }
+  function fmtMb(n){n=Number(n)||0;return (n/1048576).toFixed(2)+' MB';}
   function load(){
     fetch('/api/reports/all',{headers:{'Accept':'application/json'}}).then(function(r){return r.json();}).then(render).catch(function(){
       list.innerHTML='<div class="empty">无法获取报告列表（/api/reports/all 请求失败）。</div>';

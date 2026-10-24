@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 import os
 import sqlite3
+import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-from .types import ColumnSchema, TableInfo
+from ._platform import ColumnSchema, TableInfo
 
 
 class TableSchemaError(ValueError):
@@ -292,6 +295,15 @@ class Engine:
         replacement changed values.
         """
         return int(getattr(self, "_revision", 0))
+
+    # XC-01 (2026-10-24): startup-scoped instance identity for aggregator
+    # cache/in-flight keys.  ``revision`` alone describes data state, not which
+    # engine holds it — two ``create_engine()`` instances can legitimately hold
+    # same-named tables at the same revision (report copies share dataset ids),
+    # so keys must carry a token that is unique per live instance.  Both
+    # concrete engines set this in ``__init__``; aggregator falls back to an
+    # id-prefixed marker for lightweight adapters that bypass this base class.
+    instance_token: str = ""
 
     def load_table(self, name: str, columns: list[str], rows: list[list[Any]],
                    index_columns: Optional[list[str]] = None) -> TableInfo:
@@ -623,16 +635,365 @@ def _register_date_check(conn: Any, dialect: str, module: Any = None) -> bool:
         return False
 
 
-# ---------------------- SQLite --------------------------------------------------
+# ---------------------- persistent table cache (NP-01) ---------------------------
+#
+# Boot reload (`run_server._reload_all`) DROP+CREATEs every dataset from its JSON
+# snapshot on EVERY server start — a 980k-row snapshot (282MB) costs ~15s per
+# boot while the aggregate itself runs in ~200ms. The persistent table cache
+# stores each loaded table in its own SQLite file under
+# ``<state-home>/db/<datasetId>.sqlite`` so a later boot whose snapshot content
+# AND derived-column declarations are unchanged can restore the table without
+# re-parsing the snapshot.
+#
+# Concurrency contract (probed, tests/test_persistent_engine.py):
+#   * Cache files are IMMUTABLE once published. They are written only through
+#     ``export_table_cache``: build a fresh ``*.tmp-<pid>`` file, then
+#     ``os.replace`` it into place (atomic on POSIX/Windows). No in-place DML
+#     ever targets a cache file — adoption COPIES the cached table into the
+#     engine's own main database and detaches immediately, so every runtime
+#     statement (index-advisor ``CREATE INDEX``, row deletes, wide-table joins,
+#     derived replay) keeps hitting the main db exactly as before.
+#     (Probe: ``CREATE INDEX`` cannot target a table living in an attached db —
+#     "no such table: main.<t>" — and an unqualified ``DROP`` with no main copy
+#     silently destroys the attached cache file. Copy-on-adopt neutralizes both.)
+#   * ``os.replace`` over a file another process is reading is safe: open
+#     readers keep the old inode, new openers see the new file, and the two
+#     contents are identical by construction (same snapshot fingerprint).
+#   * Thread model unchanged: adoption/export run under the engine lock during
+#     boot, before the HTTP server (or worker loop) starts;
+#     ``check_same_thread=False`` + per-method locking is untouched.
+#   * Fail-closed: adoption verifies the meta table (fingerprint + decl hash +
+#     cache version), ``PRAGMA quick_check``, table presence and ``COUNT(*)``
+#     against the recorded row count. ANY mismatch/exception → the caller falls
+#     back to the normal snapshot reload and the cache file is re-exported.
+#     A cache never serves data it did not verify.
+#   * ``LRM_NO_DB_CACHE=1`` (also true/yes) disables the whole layer in
+#     ``run_server`` — no reads, no writes, behavior byte-identical to the
+#     pre-NP-01 reload path.
+ENGINE_CACHE_VERSION = "1"
+
+
+def engine_supports_table_cache(engine: Any) -> bool:
+    """True when the engine implements the persistent table cache (SQLite only)."""
+    return getattr(engine, "supports_table_cache", False) is True
+
+
+def snapshot_fingerprint(path: str | os.PathLike[str]) -> str:
+    """Streamed sha256 hex of a snapshot file (content-addressed cache key).
+
+    Every dataset write path (replace/upsert/append/行删除/注册拷贝) lands the
+    authoritative data in ONE canonical snapshot file via temp+os.replace, so
+    the file's content hash advances on every data change — no registry hooks
+    needed for invalidation.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def table_cache_stem(ds_id: str) -> str:
+    """Filesystem-safe cache-file stem for a dataset id.
+
+    Mirrors ``app._snapshot_stem`` (slug + short sha1 when slugification changed
+    the id). store.py cannot import app.py (circular), so the rule is duplicated
+    deliberately; ``tests/test_persistent_engine.py`` asserts parity.
+    """
+    import re as _re
+    import hashlib as _hashlib
+    stem = _re.sub(r"[^A-Za-z0-9_-]+", "_", str(ds_id or "")).strip("_") or "dataset"
+    if stem != ds_id:
+        stem = f"{stem}-{_hashlib.sha1(str(ds_id).encode('utf-8')).hexdigest()[:8]}"
+    return stem
+
+
+_META_TABLE = "_ai_cache_meta"
+
+
+# ---------------------- dataset snapshots: dual format (XP-01, 2026-10-24) -------
+#
+# Dataset snapshots used to be JSON-only. XP-01 (E2 拍板) adds a SQLite snapshot
+# format and makes it the DEFAULT for server-written generations (.replaced/.added/
+# queued durable inputs), while old JSON snapshots stay PERMANENTLY readable
+# (dual-format read compatibility — no migration of existing files).
+#
+# Format spec (`.sqlite` snapshot):
+#   * table ``t`` — the data, DDL built from the SAME type inference as
+#     ``SQLiteEngine.load_table`` (one implementation: ``_ColAcc``);
+#   * meta table ``_lrm_snapshot`` (key/value):
+#       format    = "lrm-snapshot"
+#       version   = SNAPSHOT_FORMAT_VERSION ("1")
+#       columns   = JSON [{name, type(sql), inferred(dimension|measure|time|id)}]
+#                   — the writer's ``_ColAcc`` verdicts. SQL storage cannot see
+#                   Python bools (they are INTEGER on disk) or pre-affinity value
+#                   types, so the type/inferred verdicts MUST travel with the
+#                   file; everything else (non_null/distinct/min/max/sum/sample)
+#                   is recomputed by SQL at load time.
+#       rowCount  = matched row count (rectangular rows, same rule as load_table)
+#       createdAt = ISO timestamp
+#   * write path: temp file + executemany(generator) + os.replace (same atomic
+#     contract as the JSON writer).
+#
+# Fingerprint/cache note: ``snapshot_fingerprint`` is the file's sha256 —
+# format-agnostic by construction. Flipping a dataset's snapshot format changes
+# the bytes → the NP-01 table cache key changes → that dataset's cache is
+# rebuilt ONCE on the next boot (documented one-time cost, not a behavior
+# change). JSON→SQLite conversion of existing files is NEVER automatic.
+SNAPSHOT_FORMATS = ("json", "sqlite")
+SNAPSHOT_FORMAT_VERSION = "1"
+_SNAPSHOT_META_TABLE = "_lrm_snapshot"
+
+
+def snapshot_format() -> str:
+    """Snapshot write format: env ``LRM_SNAPSHOT_FORMAT``, default ``sqlite``.
+
+    Illegal values raise (fail-closed) — a typo must not silently flip the
+    durable data format of every future snapshot.
+    """
+    raw = (os.environ.get("LRM_SNAPSHOT_FORMAT") or "").strip().lower() or "sqlite"
+    if raw not in SNAPSHOT_FORMATS:
+        raise ValueError(
+            f"LRM_SNAPSHOT_FORMAT 非法：{raw!r}（可选：{'/'.join(SNAPSHOT_FORMATS)}）")
+    return raw
+
+
+def snapshot_suffix(fmt: str) -> str:
+    """File suffix for a snapshot format ('.json' / '.sqlite')."""
+    if fmt not in SNAPSHOT_FORMATS:
+        raise ValueError(f"未知快照格式：{fmt!r}（可选：{'/'.join(SNAPSHOT_FORMATS)}）")
+    return ".json" if fmt == "json" else ".sqlite"
+
+
+def is_snapshot_path(path: str | os.PathLike[str]) -> bool:
+    """True when the path names a dataset snapshot by suffix (.json/.sqlite)."""
+    return Path(path).suffix.lower() in tuple(snapshot_suffix(f) for f in SNAPSHOT_FORMATS)
+
+
+def write_snapshot(path: str | os.PathLike[str], columns: list, rows: Any,
+                   fmt: str | None = None) -> Path:
+    """Write a dataset snapshot in ``fmt`` (default ``snapshot_format()``).
+
+    ``path`` may carry either suffix (callers historically pass ``.json``); the
+    actual file is written at ``path`` with the format's suffix swapped in, and
+    the REAL path is returned — callers that record the path into the registry/
+    manifest MUST use the return value. JSON keeps the exact streaming writer
+    the server has used since 2026-09-25; SQLite writes through a temp file fed
+    by ``executemany`` over a generator, then ``os.replace`` (same atomic
+    contract). IO/SQLite failures surface as OSError so existing callers'
+    BadRequest conversion keeps working unchanged.
+    """
+    fmt = snapshot_format() if fmt is None else str(fmt).lower()
+    if fmt not in SNAPSHOT_FORMATS:
+        raise ValueError(f"未知快照格式：{fmt!r}（可选：{'/'.join(SNAPSHOT_FORMATS)}）")
+    target = Path(path)
+    suffix = snapshot_suffix(fmt)
+    if target.suffix.lower() != suffix:
+        target = target.with_suffix(suffix)
+    if fmt == "json":
+        _write_json_snapshot(target, columns, rows)
+    else:
+        _write_sqlite_snapshot(target, columns, rows)
+    return target
+
+
+def _write_json_snapshot(path: Path, columns: list, rows: Any) -> None:
+    """Streaming JSON snapshot writer (verbatim body of the 2026-09-25 P1)."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write('{"columns":')
+            f.write(json.dumps(list(columns), ensure_ascii=False))
+            f.write(',"rows":[')
+            first = True
+            for row in rows:
+                if first:
+                    first = False
+                else:
+                    f.write(",\n")
+                f.write(json.dumps(list(row), ensure_ascii=False))
+            f.write("]}")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _snapshot_rows_materialized(rows: Any) -> list[list[Any]]:
+    """Rows as a re-iterable list.
+
+    The SQLite writer needs TWO passes (type inference before CREATE TABLE,
+    insert after); a one-shot iterator (e.g. the row-delete rewrite's engine
+    generator) is drained exactly once into a list — same 1× memory the caller
+    already materialized to produce it. Lists/tuples iterate twice without a
+    copy.
+    """
+    if isinstance(rows, (list, tuple)):
+        return rows
+    return list(rows)
+
+
+def _write_sqlite_snapshot(path: Path, columns: list, rows: Any) -> None:
+    """SQLite snapshot writer: temp db + executemany(generator) + os.replace."""
+    cols = [str(c) for c in columns]
+    ncols = len(cols)
+    if len(set(cols)) != ncols:
+        _dupes = sorted({c for c in cols if cols.count(c) > 1})
+        raise OSError(f"快照列名重复，拒绝落盘：{', '.join(_dupes[:5])}")
+    materialized = _snapshot_rows_materialized(rows)
+    # Same single-pass type inference as load_table (one implementation: _ColAcc).
+    accs = [_ColAcc() for _ in range(ncols)]
+    matched = 0
+    for row in materialized:
+        if len(row) != ncols:
+            continue
+        matched += 1
+        for i in range(ncols):
+            accs[i].add(row[i])
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        conn = sqlite3.connect(str(tmp))
+        try:
+            col_defs = ", ".join(f'{_qcol(c)} {acc.sql_type}' for c, acc in zip(cols, accs))
+            conn.execute(f'CREATE TABLE "t" ({col_defs})')
+            placeholders = ", ".join("?" for _ in cols)
+            insert_sql = (f'INSERT INTO "t" ({", ".join(_qcol(c) for c in cols)}) '
+                          f'VALUES ({placeholders})')
+
+            def _serialized_rows() -> Iterator[list[Any]]:
+                for row in materialized:
+                    if len(row) != ncols:
+                        continue
+                    out = []
+                    for v in row:
+                        t = type(v)
+                        if t is str or t is int or t is float or v is None:
+                            out.append(v)
+                        elif t is bool:
+                            out.append(int(v))
+                        else:
+                            out.append(_serialize_for_sql(v))
+                    yield out
+            conn.executemany(insert_sql, _serialized_rows())
+            conn.execute(
+                f'CREATE TABLE {_SNAPSHOT_META_TABLE} (key TEXT PRIMARY KEY, value TEXT)')
+            meta = {
+                "format": "lrm-snapshot",
+                "version": SNAPSHOT_FORMAT_VERSION,
+                "columns": json.dumps(
+                    [{"name": c, "type": acc.sql_type, "inferred": acc.inferred_type}
+                     for c, acc in zip(cols, accs)], ensure_ascii=False),
+                "rowCount": str(matched),
+                "createdAt": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            conn.executemany(
+                f'INSERT INTO {_SNAPSHOT_META_TABLE} (key, value) VALUES (?, ?)',
+                list(meta.items()))
+            conn.commit()
+            check = conn.execute('PRAGMA quick_check(1)').fetchall()
+            if [str(r[0]) for r in check] != ["ok"]:
+                raise OSError(f"快照完整性自检失败：{path.name}")
+        finally:
+            conn.close()
+        os.replace(tmp, path)
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        # Callers convert OSError → BadRequest (fail-closed 不静默) — keep that
+        # contract across both formats.
+        if isinstance(exc, OSError):
+            raise
+        raise OSError(f"SQLite 快照写盘失败：{exc}") from exc
+
+
+def read_snapshot(path: str | os.PathLike[str]) -> tuple[list, Any]:
+    """Read a dataset snapshot in either format → (columns, rows-iterable).
+
+    ``.json`` → parsed via ``json.load`` (columns list + rows list) — the same
+    plain parse the warm register path has always used. ``.sqlite`` → columns
+    from the meta table, rows streamed from ``SELECT * ORDER BY rowid`` (insert
+    order); the rows generator holds a read-only connection and closes it when
+    exhausted, so consumers MUST drain it (or let it go out of scope).
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix == ".json":
+        with p.open("r", encoding="utf-8") as stream:
+            doc = json.load(stream)
+        if not isinstance(doc, dict):
+            raise ValueError(f"快照文档形状非法（非对象）：{p.name}")
+        return list(doc.get("columns") or []), list(doc.get("rows") or [])
+    if suffix == ".sqlite":
+        return _read_sqlite_snapshot(p)
+    raise ValueError(f"不是可识别的数据集快照（.json/.sqlite）：{p.name}")
+
+
+def _read_sqlite_snapshot(path: Path) -> tuple[list, Iterator[list[Any]]]:
+    uri = path.resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        try:
+            meta = dict(conn.execute(
+                f'SELECT key, value FROM {_SNAPSHOT_META_TABLE}').fetchall())
+        except sqlite3.Error as exc:
+            raise ValueError(f"SQLite 快照缺少元表：{path.name}") from exc
+        if str(meta.get("format")) != "lrm-snapshot":
+            raise ValueError(f"不是 LRM SQLite 快照：{path.name}")
+        columns = [str(c.get("name")) for c in json.loads(meta.get("columns") or "[]")]
+        if not columns:
+            raise ValueError(f"SQLite 快照元数据缺少列清单：{path.name}")
+        cur = conn.execute(f'SELECT * FROM "t" ORDER BY rowid')
+
+        def _rows() -> Iterator[list[Any]]:
+            try:
+                while True:
+                    batch = cur.fetchmany(4096)
+                    if not batch:
+                        return
+                    for r in batch:
+                        yield list(r)
+            finally:
+                conn.close()
+        return columns, _rows()
+    except Exception:
+        conn.close()
+        raise
+
+
+def _table_ddl(conn: sqlite3.Connection, schema: str, name: str) -> Optional[str]:
+    row = conn.execute(
+        f'SELECT sql FROM {schema}.sqlite_master WHERE type = \'table\' AND name = ?',
+        (name,)).fetchone()
+    return None if row is None else (row[0] or None)
+
+
+def _table_index_ddls(conn: sqlite3.Connection, schema: str, name: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT sql FROM {schema}.sqlite_master WHERE type = 'index' "
+        "AND tbl_name = ? AND sql IS NOT NULL".format(schema=schema), (name,)).fetchall()
+    return [r[0] for r in rows if r[0]]
+
 
 class SQLiteEngine(Engine):
+    # Persistent table cache (NP-01): see the block comment above
+    # ENGINE_CACHE_VERSION. DuckDB engines leave this False and run the
+    # legacy reload path untouched.
+    supports_table_cache = True
+
     def __init__(self, db_path: str | os.PathLike[str] = ":memory:"):
         # check_same_thread=False is required because ThreadingHTTPServer
         # dispatches across worker threads. The internal lock protects
         # every operation.
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        if str(db_path) != ":memory:":
+        self._db_path = str(db_path)
+        self._file_backed = str(db_path) != ":memory:"
+        if self._file_backed:
             # File-backed reports are read-heavy and may serve concurrent chart
             # requests. WAL keeps readers non-blocking while the registry reloads
             # a dataset; NORMAL is the balanced durability setting for a local
@@ -642,6 +1003,9 @@ class SQLiteEngine(Engine):
         self._lock = threading.Lock()
         self._tables: dict[str, TableInfo] = {}
         self._revision = 0
+        # XC-01: unique per-instance identity for aggregator cache keys and
+        # in-flight markers (never reuse ``id()`` — CPython recycles ids).
+        self.instance_token = uuid.uuid4().hex
         self.supports_date_norm = _register_date_norm(self._conn, dialect="sqlite")
         self.supports_num_norm = _register_num_norm(self._conn, dialect="sqlite")
         self.supports_week_norm = _register_week_norm(self._conn, dialect="sqlite")
@@ -701,14 +1065,7 @@ class SQLiteEngine(Engine):
             self._conn.executemany(insert_sql, _serialized_rows())
             # Deterministic, bounded index set.  Indexes are selected from
             # profile/request columns by the caller; never from model SQL.
-            for index, column in enumerate(dict.fromkeys(index_columns or [])):
-                if column not in columns:
-                    continue
-                digest = hashlib.sha1(f"{name}\x00{column}".encode("utf-8")).hexdigest()[:12]
-                index_name = f"idx_{digest}"
-                self._conn.execute(
-                    f'CREATE INDEX IF NOT EXISTS {_qcol(index_name)} ON {_qcol(name)} ({_qcol(column)})'
-                )
+            self._create_indexes_locked(name, columns, index_columns)
             self._conn.commit()
 
             schema = [acc.schema(col) for col, acc in zip(columns, accs)]
@@ -716,6 +1073,204 @@ class SQLiteEngine(Engine):
             self._tables[name] = info
             self._revision += 1
             return info
+
+    def _create_indexes_locked(self, name: str, columns: list[str],
+                               index_columns: Optional[list[str]]) -> None:
+        """The deterministic index set of ``load_table`` (caller holds the lock).
+
+        Shared verbatim by ``load_table_from_snapshot`` so a snapshot-loaded
+        table carries the same bounded indexes as a row-fed one (重载是
+        DROP+CREATE，不带回 = 索引悄悄消失 —— 两条装载路径同一条契约).
+        """
+        for index, column in enumerate(dict.fromkeys(index_columns or [])):
+            if column not in columns:
+                continue
+            digest = hashlib.sha1(f"{name}\x00{column}".encode("utf-8")).hexdigest()[:12]
+            index_name = f"idx_{digest}"
+            self._conn.execute(
+                f'CREATE INDEX IF NOT EXISTS {_qcol(index_name)} ON {_qcol(name)} ({_qcol(column)})'
+            )
+
+    # ------------------------ snapshot loading (XP-01) -----------------------
+
+    def load_table_from_snapshot(self, name: str, path: str | os.PathLike[str],
+                                 index_columns: Optional[list[str]] = None) -> TableInfo:
+        """Materialise a dataset from its on-disk snapshot/source into the engine.
+
+        Dispatch by suffix:
+          * ``.json``  → the canonical loader (``server.registry.load`` →
+            ``table_input.load_table_file``) then ``load_table`` — the EXACT
+            pre-XP-01 reload path, so validation/rename semantics cannot drift;
+          * ``.sqlite`` → ATTACH + ``INSERT INTO main SELECT`` (DDL rebuilt from
+            the meta table's column types), column statistics recomputed by SQL
+            to bit parity with ``load_table(rows)``'s ``table_info`` (locked by
+            tests/test_snapshot_sqlite.py);
+          * anything else → the canonical loader too (构建期 canonical 快照是
+            源文件拷贝：csv/xlsx 的装载语义与历史行为一致).
+
+        NP-01 adopt/export logic is untouched (the cache fingerprint is still
+        the snapshot FILE's sha256 — format-agnostic). A format flip therefore
+        rebuilds that dataset's table cache once (fingerprint changed).
+        """
+        p = Path(path)
+        suffix = p.suffix.lower()
+        if suffix == ".sqlite":
+            return self._load_sqlite_snapshot(name, p, index_columns)
+        # .json（含历史快照与构建期 canonical 表 JSON）与 csv/xlsx 源拷贝：
+        # 全部走 canonical 装载器（validate_table 同一真源），再 load_table。
+        from .registry import load as _registry_load
+        table = _registry_load(p)
+        return self.load_table(name, list(table.get("columns") or []),
+                               list(table.get("rows") or []),
+                               index_columns=index_columns)
+
+    def _snapshot_column_stats(self, table: str, col: str, sql_type: str,
+                               inferred: str) -> ColumnSchema:
+        """Recompute one column's stats by SQL, bit-parity with ``_ColAcc.schema``.
+
+        ``_ColAcc`` computes on the PYTHON values BEFORE storage affinity:
+        - it skips None and "" (empty string) values;
+        - an INTEGER/REAL column's counted values were ALL numeric (that is what
+          the type inference means), so after storage any leftover TEXT value in
+          such a column came from a skipped "" (TEXT junk in a numeric column)
+          and must not enter the stats — hence the numeric-storage-class filter;
+        - a TEXT column's counted values are stored verbatim (TEXT affinity),
+          so the plain non-empty filter reproduces ``non_null``/``distinct`` and
+          lexicographic MIN/MAX reproduce the time ``sample_min/max``.
+
+        MEASURE min/max/sum are accumulated in PYTHON over a rowid-ordered scan
+        (one ordered pass per measure column): ``_ColAcc`` does a left-assoc
+        float accumulation in row order, while SQLite ≥3.44 SUM uses
+        Kahan-Babuška compensation — the two agree numerically but differ in
+        the last bits on wide-magnitude columns (980k-row tickets2026 实测
+        sum 尾差 ~1e-6 相对)，逐位 parity 必须走同一条累加路径。``float(v)``
+        of the stored value is exact (IEEE double round-trip), so the
+        accumulation is bit-identical to the row-fed path. Type/inferred
+        verdicts come from the writer's meta — SQL storage cannot see Python
+        bools (they are INTEGER on disk).
+
+        Known lossy edge (documented): a Python float ``nan`` is stored as NULL
+        by SQLite, so ``non_null`` can drop by the nan count — the engine table
+        content is equally NULL (identical to ``load_table``'s own storage), so
+        query results agree; only the schema stat could differ.
+        """
+        q = _qcol(col)
+        if sql_type in ("INTEGER", "REAL"):
+            guard = f'CASE WHEN typeof({q}) IN (\'integer\',\'real\') THEN 1 END'
+            d_guard = f'CASE WHEN typeof({q}) IN (\'integer\',\'real\') THEN {q} END'
+            num = f'CASE WHEN typeof({q}) IN (\'integer\',\'real\') THEN CAST({q} AS REAL) END'
+            numeric_typed = True
+        else:
+            guard = f'CASE WHEN {q} IS NOT NULL AND {q} <> \'\' THEN 1 END'
+            d_guard = f'CASE WHEN {q} IS NOT NULL AND {q} <> \'\' THEN {q} END'
+            num = d_guard
+            numeric_typed = False
+        if inferred == "measure":
+            # min/max/sum/mean：Python 行序累加（_ColAcc 同一路径），distinct
+            # 仍由 SQL 现算（顺序无关，COUNT(DISTINCT) 精确）。
+            num_min: float | None = None
+            num_max: float | None = None
+            total = 0.0
+            non_null = 0
+            for (v,) in self._conn.execute(f'SELECT {q} FROM {_qcol(table)}'):
+                if v is None:
+                    continue
+                if numeric_typed and not isinstance(v, (int, float)):
+                    continue  # 存储类过滤（数值列里的 TEXT 垃圾 = 被跳过的 ""）
+                if not numeric_typed and v == "":
+                    continue
+                f = v if isinstance(v, float) else float(v)
+                non_null += 1
+                if num_min is None or f < num_min:
+                    num_min = f
+                if num_max is None or f > num_max:
+                    num_max = f
+                total += f
+            distinct = int(self._conn.execute(
+                f'SELECT COUNT(DISTINCT {d_guard}) FROM {_qcol(table)}').fetchone()[0] or 0)
+            col_schema = ColumnSchema(
+                name=col, sql_type=sql_type, inferred_type=inferred,
+                non_null=non_null, distinct=distinct)
+            if non_null:
+                col_schema.min = num_min
+                col_schema.max = num_max
+                col_schema.sum = total
+                col_schema.mean = total / non_null
+            return col_schema
+        row = self._conn.execute(
+            f'SELECT COUNT({guard}) AS nn, COUNT(DISTINCT {d_guard}) AS d, '
+            f'MIN({num}) AS mn, MAX({num}) AS mx '
+            f'FROM {_qcol(table)}').fetchone()
+        col_schema = ColumnSchema(
+            name=col, sql_type=sql_type, inferred_type=inferred,
+            non_null=int(row["nn"] or 0), distinct=int(row["d"] or 0))
+        if inferred == "time" and col_schema.non_null:
+            col_schema.sample_min = str(row["mn"] or "")[:10]
+            col_schema.sample_max = str(row["mx"] or "")[:10]
+        return col_schema
+
+    def _load_sqlite_snapshot(self, name: str, path: Path,
+                              index_columns: Optional[list[str]]) -> TableInfo:
+        """ATTACH a SQLite snapshot, copy ``t`` into MAIN, recompute stats by SQL.
+
+        Fail-closed: any meta/shape/count mismatch raises (the caller's reload
+        loop surfaces it as a per-dataset WARN — a snapshot never silently
+        loads as something else). Partial copies are rolled back before the
+        error propagates (DROP main copy + DETACH).
+        """
+        alias = f"ai_snap_{int(time.time() * 1000) % 1_000_000}"
+        with self._lock:
+            attached = False
+            copied = False
+            try:
+                self._conn.execute(f'ATTACH DATABASE ? AS {alias}', (str(path),))
+                attached = True
+                meta = dict(self._conn.execute(
+                    f'SELECT key, value FROM {alias}.{_SNAPSHOT_META_TABLE}').fetchall())
+                if str(meta.get("format")) != "lrm-snapshot":
+                    raise ValueError(f"不是 LRM SQLite 快照：{path.name}")
+                colmeta = json.loads(meta.get("columns") or "[]")
+                if not isinstance(colmeta, list) or not colmeta:
+                    raise ValueError(f"快照元数据缺少列清单：{path.name}")
+                cols = [str(c["name"]) for c in colmeta]
+                types = {str(c["name"]): str(c.get("type") or "TEXT").upper()
+                         for c in colmeta}
+                inferred = {str(c["name"]): str(c.get("inferred") or "dimension")
+                            for c in colmeta}
+                declared_rows = int(meta.get("rowCount") or 0)
+                ddl_cols = ", ".join(f'{_qcol(c)} {types[c]}' for c in cols)
+                self._conn.execute(f'DROP TABLE IF EXISTS main.{_qcol(name)}')
+                self._conn.execute(f'CREATE TABLE main.{_qcol(name)} ({ddl_cols})')
+                copied = True
+                self._conn.execute(
+                    f'INSERT INTO main.{_qcol(name)} SELECT * FROM {alias}."t"')
+                self._create_indexes_locked(name, cols, index_columns)
+                count = int(self._conn.execute(
+                    f'SELECT COUNT(*) FROM main.{_qcol(name)}').fetchone()[0])
+                if declared_rows and count != declared_rows:
+                    raise ValueError(
+                        f"快照行数不符（meta {declared_rows} ≠ 表 {count}）：{path.name}")
+                self._conn.commit()
+                schema = [self._snapshot_column_stats(name, c, types[c], inferred[c])
+                          for c in cols]
+                info = TableInfo(name=name, columns=cols, schema=schema, row_count=count)
+                self._tables[name] = info
+                self._revision += 1
+                self._conn.execute(f'DETACH DATABASE {alias}')
+                attached = False
+                return info
+            except (sqlite3.Error, KeyError, ValueError, TypeError) as exc:
+                try:
+                    if copied:
+                        self._conn.execute(f'DROP TABLE IF EXISTS main.{_qcol(name)}')
+                    if attached:
+                        self._conn.commit()
+                        self._conn.execute(f'DETACH DATABASE {alias}')
+                except sqlite3.Error:
+                    pass
+                if isinstance(exc, sqlite3.Error):
+                    raise OSError(f"SQLite 快照装载失败：{path.name}: {exc}") from exc
+                raise
 
     def execute(self, sql: str, params: tuple = (), *, cancel_check=None,
                 timeout_seconds: float | None = None) -> list[dict[str, Any]]:
@@ -766,6 +1321,177 @@ class SQLiteEngine(Engine):
             self._tables.pop(name, None)
             self._revision += 1
 
+    # ---------------- persistent table cache (NP-01) -------------------------
+
+    def _info_payload(self, name: str) -> dict[str, Any]:
+        """Full dataclass round-trip of a TableInfo (to_dict drops None fields)."""
+        import dataclasses
+        info = self._tables[name]
+        return {"name": info.name, "columns": list(info.columns),
+                "schema": [dataclasses.asdict(c) for c in info.schema],
+                "row_count": info.row_count}
+
+    @staticmethod
+    def _info_from_payload(payload: dict[str, Any]) -> "TableInfo":
+        schema = [ColumnSchema(**{k: v for k, v in item.items()})
+                  for item in (payload.get("schema") or [])]
+        return TableInfo(name=str(payload.get("name") or ""),
+                         columns=[str(c) for c in (payload.get("columns") or [])],
+                         schema=schema,
+                         row_count=int(payload.get("row_count") or 0))
+
+    def adopt_table_cache(self, name: str, cache_file: str | os.PathLike[str],
+                          fingerprint: str, decl_hash: str,
+                          cache_version: str = ENGINE_CACHE_VERSION) -> Optional[TableInfo]:
+        """Restore ``name`` from a verified cache file instead of a snapshot reload.
+
+        Verifies the embedded meta (fingerprint / decl hash / cache version),
+        ``PRAGMA quick_check``, table presence and row count, then copies the
+        table into the engine's MAIN database (verbatim DDL + C-level
+        ``INSERT … SELECT`` + verbatim index DDL) and detaches. Returns the
+        restored TableInfo, or None when the cache is absent/stale/corrupt —
+        the caller then reloads from the snapshot (fail-closed, never serves
+        an unverified cache).
+        """
+        path = Path(cache_file)
+        if not path.exists():
+            return None
+        alias = f"ai_adopt_{int(time.time() * 1000) % 1_000_000}"
+        with self._lock:
+            copied = False
+            attached = False
+            restored: Optional[TableInfo] = None
+            try:
+                self._conn.execute(f'ATTACH DATABASE ? AS {alias}', (str(path),))
+                attached = True
+                meta = dict(self._conn.execute(
+                    f'SELECT key, value FROM {alias}.{_META_TABLE}').fetchall())
+                verified = (
+                    str(meta.get("cache_version")) == str(cache_version)
+                    and str(meta.get("fingerprint")) == str(fingerprint)
+                    and str(meta.get("decl_hash")) == str(decl_hash)
+                    and str(meta.get("table")) == str(name))
+                if verified:
+                    ddl = _table_ddl(self._conn, alias, name)
+                    check = self._conn.execute(
+                        f'PRAGMA {alias}.quick_check(1)').fetchall()
+                    info = None
+                    try:
+                        info = self._info_from_payload(json.loads(meta["info"]))
+                    except (KeyError, ValueError, TypeError):
+                        verified = False
+                    verified = bool(
+                        verified and ddl and info is not None
+                        and [str(r[0]) for r in check] == ["ok"]
+                        and info.name == name)
+                if verified:
+                    # Copy into MAIN so every downstream consumer (unqualified
+                    # reads, index-advisor CREATE INDEX, row deletes, cross-table
+                    # joins, derived replay) keeps the exact pre-NP-01 semantics.
+                    self._conn.execute(f'DROP TABLE IF EXISTS main.{_qcol(name)}')
+                    self._conn.execute(ddl)  # verbatim: affinities/quoting preserved
+                    copied = True
+                    self._conn.execute(
+                        f'INSERT INTO main.{_qcol(name)} '
+                        f'SELECT * FROM {alias}.{_qcol(name)}')
+                    for index_ddl in _table_index_ddls(self._conn, alias, name):
+                        self._conn.execute(index_ddl)
+                    count = self._conn.execute(
+                        f'SELECT COUNT(*) FROM main.{_qcol(name)}').fetchone()[0]
+                    if int(count) != int(info.row_count):
+                        raise ValueError("cached row count mismatch")
+                    self._conn.commit()
+                    self._conn.execute(f'DETACH DATABASE {alias}')
+                    attached = False
+                    self._tables[name] = info
+                    self._revision += 1
+                    restored = info
+            except (sqlite3.Error, KeyError, ValueError, TypeError):
+                restored = None
+            if restored is None and (attached or copied):
+                # Fail-closed tail: drop any partial main copy, detach the alias.
+                try:
+                    if copied:
+                        self._conn.execute(f'DROP TABLE IF EXISTS main.{_qcol(name)}')
+                    if attached:
+                        self._conn.commit()
+                        self._conn.execute(f'DETACH DATABASE {alias}')
+                except sqlite3.Error:
+                    pass
+            return restored
+
+    def export_table_cache(self, name: str, cache_file: str | os.PathLike[str],
+                           fingerprint: str, decl_hash: str,
+                           cache_version: str = ENGINE_CACHE_VERSION) -> bool:
+        """Atomically publish ``name`` (post-replay content) as a cache file.
+
+        Builds a fresh ``<file>.tmp-<pid>`` database on its own connection
+        (``CREATE TABLE`` cannot be schema-qualified, so the tmp file's main db
+        is the writer and the engine's db file is ATTACHed read-only as the
+        source), copies the table + indexes + meta, sanity-checks it, then
+        ``os.replace``s it into place. Returns False (cache simply absent this
+        boot) on any failure — the loaded table in the engine is untouched.
+        """
+        if name not in self._tables:
+            return False
+        if not self._file_backed:
+            # A ``:memory:`` engine db cannot be ATTACHed by the tmp writer
+            # connection; skip caching (behavior falls back to plain reload).
+            return False
+        path = Path(cache_file)
+        # tmp 名带 time_ns：pid 唯一只隔离进程，同进程两个引擎实例（测试/未来
+        # 多引擎）并发导出时也绝不互踩对方的临时文件。
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{time.time_ns()}")
+        with self._lock:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+                writer = sqlite3.connect(str(tmp))
+                try:
+                    writer.execute("ATTACH DATABASE ? AS engine_main",
+                                   (str(self._db_path),))
+                    ddl = _table_ddl(writer, "engine_main", name)
+                    if not ddl:
+                        return False
+                    writer.execute(ddl)
+                    writer.execute(
+                        f'INSERT INTO {_qcol(name)} '
+                        f'SELECT * FROM engine_main.{_qcol(name)}')
+                    for index_ddl in _table_index_ddls(writer, "engine_main", name):
+                        writer.execute(index_ddl)
+                    writer.execute(
+                        f'CREATE TABLE {_META_TABLE} '
+                        f'(key TEXT PRIMARY KEY, value TEXT)')
+                    meta = {
+                        "cache_version": str(cache_version),
+                        "table": str(name),
+                        "fingerprint": str(fingerprint),
+                        "decl_hash": str(decl_hash),
+                        "row_count": str(self._tables[name].row_count),
+                        "info": json.dumps(self._info_payload(name), ensure_ascii=False),
+                        "exported_at": str(time.time()),
+                    }
+                    writer.executemany(
+                        f'INSERT INTO {_META_TABLE} (key, value) VALUES (?, ?)',
+                        list(meta.items()))
+                    writer.commit()
+                    check = writer.execute('PRAGMA quick_check(1)').fetchall()
+                    if [str(r[0]) for r in check] != ["ok"]:
+                        return False
+                finally:
+                    writer.close()  # release the tmp handle before os.replace
+                os.replace(tmp, path)
+                return True
+            except (sqlite3.Error, OSError, ValueError, TypeError):
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return False
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -778,9 +1504,14 @@ class SQLiteEngine(Engine):
         return "sqlite"
 
 
+
 # ---------------------- DuckDB (optional) ---------------------------------------
 
 class DuckDBEngine(Engine):
+    # Persistent table cache is SQLite-only (NP-01): duckdb keeps the legacy
+    # reload path; run_server consults engine_supports_table_cache().
+    supports_table_cache = False
+
     def __init__(self, db_path: str | os.PathLike[str] = ":memory:"):
         import duckdb  # type: ignore[import-not-found]
         self._duckdb = duckdb
@@ -790,6 +1521,9 @@ class DuckDBEngine(Engine):
         self._lock = threading.RLock()
         self._tables: dict[str, TableInfo] = {}
         self._revision = 0
+        # XC-01: unique per-instance identity for aggregator cache keys and
+        # in-flight markers (never reuse ``id()`` — CPython recycles ids).
+        self.instance_token = uuid.uuid4().hex
         self.supports_date_norm = _register_date_norm(self._conn, dialect="duckdb", module=duckdb)
         self.supports_num_norm = _register_num_norm(self._conn, dialect="duckdb", module=duckdb)
         self.supports_week_norm = _register_week_norm(self._conn, dialect="duckdb", module=duckdb)
@@ -924,3 +1658,326 @@ def reset_engine() -> None:
     if _engine_singleton is not None:
         _engine_singleton.close()
     _engine_singleton = None
+
+
+def engine_load_from_snapshot(engine: Engine, name: str, path: str | os.PathLike[str],
+                              index_columns: Optional[list[str]] = None) -> TableInfo:
+    """Reload one dataset from its snapshot file into ``engine``.
+
+    The single entry the reload paths share (``run_server._reload_all`` /
+    ``app._reload_dataset`` / cold ``--register-report`` via the boot reload).
+    Engines implementing ``load_table_from_snapshot`` (SQLiteEngine) dispatch
+    by snapshot suffix (json → canonical loader, sqlite → ATTACH copy); legacy
+    engines (DuckDB) keep the untouched pre-XP-01 read-then-``load_table`` path.
+
+    Ordering contract: READ FIRST, then DROP+CREATE inside ``load_table`` — a
+    snapshot that fails to PARSE leaves the engine's existing table intact
+    (历史行为；解析失败绝不能放大成「连旧表一起丢」).
+    """
+    loader = getattr(engine, "load_table_from_snapshot", None)
+    if loader is not None:
+        return loader(name, path, index_columns=index_columns)
+    from .registry import load as _registry_load
+    table = _registry_load(path)
+    engine.drop_table(name)
+    return engine.load_table(name, list(table.get("columns") or []),
+                             list(table.get("rows") or []),
+                             index_columns=index_columns)
+
+
+# ---------------------- derived columns (former server/derived_columns.py) -------
+#
+# Merged NQ-02 wave 2, zero behavior change: the module's public names
+# (DERIVED_KIND, columns_decl, is_derived_columns, apply_dataset_derived,
+# table_defs, ensure_table_defs, ensure_dim_groups, replay_all, dim_groups_defs,
+# dim_group_table_defs, apply_dim_groups) and their bodies are unchanged — only
+# the module shell is absorbed. The former module's sys.path bootstrap for
+# scripts/ is redundant here (store.py already inserts scripts/ at import, and
+# the lazy ``from derived_eval import …`` below relies on exactly that), and the
+# lazy ``from .store import _qcol`` self-imports inside ensure_table_defs /
+# ensure_dim_groups resolve to this module's own _qcol.
+
+"""Server-side row-level derived columns (数据集「计算列」).
+
+A server report serves a SCHEMA-ONLY manifest, so the browser never sees the
+rows — but the server holds every source table in SQLite (``h_register`` /
+``h_dataset_add`` both go through ``store.Engine.load_table``), so a row-level
+derived column is materialised HERE. Without it, a request declaring
+``datasets[].derived.columns`` produced a manifest whose column list contained
+e.g. ``净流入`` while the SQLite table did not → every aggregate on it died with
+``no such column``. Server mode used to reject such requests outright
+(``report_build.py`` / ``serve_report.py``), which made "派生统一到数据源管理"
+impossible for server reports.
+
+Design constraint: ZERO parity risk
+-----------------------------------
+This module reuses ``scripts/derived_eval.materialize`` — the very function
+``spec_to_report._materialize_derived`` calls. There is exactly ONE
+implementation, so the SQLite column is byte-identical to the compiled/static
+one. Do NOT re-implement the arithmetic here (or as generated SQL).
+
+Where the declaration lives — and why it is a TABLE-level union
+----------------------------------------------------------------
+The registry entry records it (``datasets[i].derived = {kind:'columns', defs}``)
+and the snapshot ``source`` file stays RAW (it is a copy of the user's upload),
+so the declaration must be replayed on every load/reload — mirroring
+``server/relations.py``'s replay for wide tables.
+
+BUT report copies (保存为副本 / 版本) inherit their parent's ``datasets[]``:
+several reports can therefore share ONE dataset id — and the engine table is
+keyed by that id, while ``load_table`` is DROP+CREATE. Loading per entry is
+last-writer-wins, so a copy WITHOUT a declaration silently erased the base
+report's derived column on the next boot (reproduced on the real 335k-row PSI
+report: 6 copies reloaded the same ``PSI__primary`` table). Hence the rule:
+
+  * the file-backed pass loads tables only;
+  * a SECOND pass applies the UNION of the declarations that point at each
+    table id — exactly the two-pass doctrine already used for relations.
+
+A name declared twice with different formulas resolves to the first registered
+report (registry order); a column is never dropped from a shared table.
+"""
+
+# Registry/payload marker. ``kind`` distinguishes this from the wide-table
+# 'relation' marker so ``app._is_derived_ds`` / ``_prune_derived_datasets``
+# (which are about relation datasets that have NO source file) never touch a
+# columns-derived dataset — those DO have a source and reload normally.
+DERIVED_KIND = "columns"
+
+
+def columns_decl(value: Any) -> dict | None:
+    """Normalise a ``derived`` payload into ``{kind:'columns', defs:[...]}``.
+
+    Returns ``None`` when the payload is absent/empty or is another kind
+    ('relation'), so callers can use it as a plain guard. Tolerates the
+    manifest slot shape ``{columns:[...]}`` so a manifest dataset's ``derived``
+    object can be passed straight through.
+
+    **Only the row-level ``columns`` slot is materialised here** — the
+    aggregate-level ``derived.measures`` are NOT the server's business: they are
+    evaluated after aggregation by the SAME evaluator on the compile side and in
+    the client (``scripts/derived_eval.evaluate`` / ``chart-adapter.derivedEvaluate``),
+    so persisting them as a registry *table* declaration would be dead data that
+    could drift. They still survive a restart / report copy because the served
+    manifest (registry entry ``manifest.datasets[].derived``) carries them
+    verbatim — see ``tests/test_server_derived_columns.py::test_manifest_keeps_measures``.
+    """
+    if not isinstance(value, dict):
+        return None
+    if value.get("kind") not in (None, DERIVED_KIND):
+        return None
+    defs = value.get("defs")
+    if defs is None:
+        defs = value.get("columns")
+    defs = [d for d in (defs or []) if isinstance(d, dict) and d.get("name")]
+    if not defs:
+        return None
+    return {"kind": DERIVED_KIND, "defs": [dict(d) for d in defs]}
+
+
+def is_derived_columns(d: Any) -> bool:
+    return isinstance(d, dict) and (d.get("derived") or {}).get("kind") == DERIVED_KIND
+
+
+def apply_dataset_derived(table: dict, derived: Any) -> dict:
+    """Materialise declared 计算列 onto a freshly built ``{columns, rows}`` table.
+
+    Idempotent: a def whose column already exists is skipped, so a payload that
+    already carries the column (or a double apply) cannot double-append. Broken
+    declarations still raise — they must surface, not vanish.
+    """
+    decl = columns_decl(derived)
+    if not decl or not isinstance(table, dict):
+        return table
+    present = set(table.get("columns") or [])
+    pending = [d for d in decl["defs"] if d.get("name") not in present]
+    if not pending:
+        return table
+    from derived_eval import materialize  # noqa: PLC0415  (scripts/ on sys.path above)
+
+    return materialize(table, pending)
+
+
+def table_defs(entries: Iterable[dict], ds_id: str, extra: Any = None) -> list[dict]:
+    """Union of 计算列 defs declared for ONE table id across every registry entry.
+
+    ``entries`` may be registry entries (``{datasets:[...]}``) or dataset dicts
+    directly. First declaration wins per column name — deterministic because
+    registry order is insertion order (base report registered before its
+    copies).
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def feed(value: Any) -> None:
+        decl = columns_decl(value)
+        if not decl:
+            return
+        for item in decl["defs"]:
+            name = item["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(item)
+
+    feed(extra)
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        datasets = entry.get("datasets") if "datasets" in entry else [entry]
+        for d in datasets or []:
+            if isinstance(d, dict) and d.get("id") == ds_id:
+                feed(d.get("derived"))
+    return out
+
+
+def ensure_table_defs(engine, ds_id: str, defs: list[dict],
+                      index_columns: list[str] | None = None) -> int:
+    # index_columns 透传给 load_table：补列走 drop+load 重建，不把原表索引带回
+    # 的话，大表的筛选/分组索引会在一次 replay 后静默消失。
+    """Materialise any of ``defs`` still missing from a loaded engine table.
+
+    Returns the number of columns added (0 = nothing to do). Reads the table
+    back through the engine so a table shared by several reports converges to
+    the union of their declarations instead of the last writer's shape.
+    """
+    if not defs:
+        return 0
+    info = engine.table_info(ds_id)
+    if info is None:
+        return 0
+    have = set(info.columns)
+    missing = [d for d in defs if d.get("name") not in have]
+    if not missing:
+        return 0
+    from derived_eval import materialize  # noqa: PLC0415
+
+    cols = list(info.columns)
+    raw = engine.execute(f'SELECT {", ".join(_qcol(c) for c in cols)} FROM {_qcol(ds_id)}')
+    table = {"columns": cols, "rows": [[r[c] for c in cols] for r in raw]}
+    out = materialize(table, missing)
+    engine.drop_table(ds_id)
+    engine.load_table(ds_id, out["columns"], out["rows"], index_columns=list(index_columns or []))
+    return len(missing)
+
+
+def ensure_dim_groups(engine, ds_id: str, defs: list[dict],
+                      index_columns: Optional[list[str]] = None) -> int:
+    """Materialise any 维度值分组 defs still missing from a loaded engine table."""
+    if not defs:
+        return 0
+    info = engine.table_info(ds_id)
+    if info is None:
+        return 0
+    have = set(info.columns)
+    missing = [d for d in defs if d.get("name") not in have]
+    if not missing:
+        return 0
+    from derived_eval import materialize_dim_groups  # noqa: PLC0415
+
+    cols = list(info.columns)
+    raw = engine.execute(f'SELECT {", ".join(_qcol(c) for c in cols)} FROM {_qcol(ds_id)}')
+    table = {"columns": cols, "rows": [[r[c] for c in cols] for r in raw]}
+    out = materialize_dim_groups(table, missing)
+    engine.drop_table(ds_id)
+    engine.load_table(ds_id, out["columns"], out["rows"], index_columns=list(index_columns or []))
+    return len(missing)
+
+
+def replay_all(engine, registry, verbose: bool = False) -> list[str]:
+    """Apply the UNION of 计算列 declarations to every loaded table.
+
+    Call AFTER the file-backed load pass (the sources must exist first) and
+    before relations are replayed — same ordering rule as
+    ``server/relations.replay_entry``.
+
+    Deliberately table-centric rather than entry-centric: report copies share
+    dataset ids, so replaying one entry would leave a table reloaded by another
+    report without its column. Returns the dataset ids it touched.
+    """
+    entries = registry.raw_entries() if hasattr(registry, "raw_entries") else list(registry or [])
+    ds_ids = sorted({d["id"] for e in entries if isinstance(e, dict)
+                     for d in (e.get("datasets") or []) if isinstance(d, dict) and d.get("id")})
+    touched: list[str] = []
+    for ds_id in ds_ids:
+        defs = table_defs(entries, ds_id)
+        gdefs = dim_group_table_defs(entries, ds_id)
+        if not defs and not gdefs:
+            continue
+        # 该表在注册表里声明的索引列（h_register/h_dataset_replace 写进 meta）：
+        # 重建时带回，索引不因 replay 消失。
+        idx_cols: list[str] = []
+        for e2 in entries:
+            if not isinstance(e2, dict):
+                continue
+            for d2 in (e2.get("datasets") or []):
+                if isinstance(d2, dict) and d2.get("id") == ds_id:
+                    for c in (d2.get("indexColumns") or []):
+                        if c not in idx_cols:
+                            idx_cols.append(c)
+        try:
+            if ensure_table_defs(engine, ds_id, defs, index_columns=idx_cols):
+                touched.append(ds_id)
+        except Exception as e:  # noqa: BLE001  (best-effort boot/reload path)
+            if verbose:
+                print(f"[ai-report-server] WARN 计算列 replay {ds_id!r} failed: {e}",
+                      file=sys.stderr)
+        try:
+            if ensure_dim_groups(engine, ds_id, gdefs, index_columns=idx_cols):
+                touched.append(ds_id)
+        except Exception as e:  # noqa: BLE001
+            if verbose:
+                print(f"[ai-report-server] WARN 维度分组 replay {ds_id!r} failed: {e}",
+                      file=sys.stderr)
+    return touched
+
+
+def dim_groups_defs(value: Any) -> list[dict] | None:
+    """Normalise a ``ds.dimGroups`` payload into a plain list (None = absent)."""
+    if not isinstance(value, list) or not value:
+        return None
+    defs = [d for d in value if isinstance(d, dict) and d.get("name") and d.get("source")]
+    return defs or None
+
+
+def dim_group_table_defs(entries: Iterable[dict], ds_id: str, extra: Any = None) -> list[dict]:
+    """Union of 维度值分组 defs for ONE table id across registry entries（先到先得）。
+
+    与 table_defs 同一条并集语义：副本共享表，只补缺失列、永不删列。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def feed(value: Any) -> None:
+        defs = dim_groups_defs(value)
+        if not defs:
+            return
+        for item in defs:
+            name = item["name"]
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(item)
+
+    feed(extra)
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        datasets = entry.get("datasets") if "datasets" in entry else [entry]
+        for d in datasets or []:
+            if isinstance(d, dict) and d.get("id") == ds_id:
+                feed(d.get("dimGroups"))
+    return out
+
+
+def apply_dim_groups(table: dict, defs: list[dict]) -> dict:
+    """Materialise 维度值分组 defs onto a freshly built table (idempotent)."""
+    if not defs or not isinstance(table, dict):
+        return table
+    present = set(table.get("columns") or [])
+    pending = [d for d in defs if d.get("name") not in present]
+    if not pending:
+        return table
+    from derived_eval import materialize_dim_groups  # noqa: PLC0415
+
+    return materialize_dim_groups(table, pending)

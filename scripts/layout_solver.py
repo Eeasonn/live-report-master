@@ -38,6 +38,7 @@ HEADER_PX = 88        # fixed chrome above the table body: card chrome 60 (valid
                       # (h*48-60)//28 >= n; at 78 the remainder could fall one row
                       # short and n=9/16/21-row tables failed validate_report.
 TABLE_ROW_PX = 28     # px per table row (matches render_grid_html body row height)
+TABLE_HEADER_PX = 28  # px per thead row (validate_report.HEADER_HEIGHT_PX 同源；XU-01 行数换算的表头项)
 
 # Chrome-aware height (Step 1 of row-pattern layout): the card chrome eats a
 # fixed slice (padding 28+12, block title ~32, ds-chip row ~30, legend ~28) and
@@ -128,13 +129,32 @@ def bounded_table_rows(max_px: int, chrome_px: int = 60, row_px: int = ROW_PX) -
     return max(1, math.ceil((int(max_px) + int(chrome_px)) / row_px))
 
 
+def max_body_rows_px(n: int, row_px: int = TABLE_ROW_PX, head_px: int = TABLE_HEADER_PX) -> int:
+    """XU-01 行数口径换算：maxBodyRows → px = N×行高 + thead 高。缺省行高/表头与
+    validate_report.ROW_HEIGHT_PX / HEADER_HEIGHT_PX 同源（28/28）。运行时镜像 =
+    editor-runtime.js boundedRowsMaxPx（TABLE_ROW_HEIGHT_PX/TABLE_HEADER_HEIGHT_PX），
+    同一张期望表由 tests/test_bounded_table.{cjs,py} 双端锁。真实渲染行高随密度档
+    （32/40/48），运行时 autoFitTableCards 用实测 tbody tr 高度校正重写 max-height
+    （自愈）；编译侧恒用缺省行高，保证 parity 确定。falsy/非正参数落缺省（与 JS
+    boundedRowsMaxPx 的 `Number(rowPx)>0` 判定逐位一致）。"""
+    rp = int(row_px) if row_px and int(row_px) > 0 else TABLE_ROW_PX
+    hp = int(head_px) if head_px and int(head_px) > 0 else TABLE_HEADER_PX
+    return int(n) * rp + hp
+
+
 def _bounded_max_px(height_mode: Any) -> int | None:
     """chart.table.heightMode 三态（WP-3 冻结形状：grow|fixed|{'bounded':{'maxPx'}}）
     → bounded 档的 maxPx；非 bounded/形状非法一律 None（与 validate_request 同口径，
-    未知值收敛缺省）。运行时镜像 = editor-runtime.js heightModeOf。"""
+    未知值收敛缺省）。XU-01 行数口径：{'bounded':{'maxBodyRows': int 5..500}} 按
+    max_body_rows_px 换算；与 maxPx 同给时**行数优先**（运行时同规则并 warn 一次，
+    请求层 validate_request 对双键直接报错——这里兜的是手写 manifest）。
+    运行时镜像 = editor-runtime.js heightModeOf。"""
     if isinstance(height_mode, dict):
         b = height_mode.get("bounded")
         if isinstance(b, dict):
+            n = b.get("maxBodyRows")
+            if isinstance(n, int) and not isinstance(n, bool) and 5 <= n <= 500:
+                return max_body_rows_px(n)
             mx = b.get("maxPx")
             if isinstance(mx, int) and not isinstance(mx, bool) and 200 <= mx <= 4000:
                 return mx

@@ -1548,3 +1548,254 @@ def _diagnostic(bucket: dict[str, list[dict[str, Any]]], name: str,
                                                  for key in ("kind", "reportId", "chartId", "field", "reason")))
 
 
+# =============================================================================
+# SOURCE SECTION: server/psi_domain.py
+# =============================================================================
+"""Pure PSI domain rules: balance identity, weeks-of-supply, stockout classes.
+
+PSI is the flagship report domain, and its readers constantly ask three
+questions the model must never free-style numbers for (evidence discipline):
+
+* 「期末库存 = 期初库存 + Sell In − Sell Out」 holds per period — the FIRST
+  period has no declared opening stock, so it is honestly ``unverifiable``
+  instead of inventing a zero opening;
+* 在库周数 (weeks of supply) = inventory ÷ weekly sell-out, where the weekly
+  rate is the period sell-out spread over the WEEKS IN THAT PERIOD (a month is
+  52/12 weeks — a month is not 4 weeks);
+* 断销有货/有货无销 are two explicit bucket classes over member × period.
+
+This section is deliberately PURE: it takes aligned per-period numbers and
+returns plain dicts. Engine access, sensitive-column policy and aggregation
+stay in ``agent_tool_runner`` on the existing aggregate seam
+(``refs/flint/src/core/aggregate.ts:7-20``). Calendar positions reuse the one
+shared ``date_parse``-backed ``position`` helper from the business-calendar
+section above — no second period arithmetic.
+"""
+
+# Weeks contained in one period, per grain. Grounded in the window-grain rule
+# that 52 weeks ≠ 1 year is handled explicitly elsewhere; months use 52/12
+# (average weeks per month), never a rounded 4.
+PSI_GRAIN_WEEKS = {"day": 1.0 / 7.0, "week": 1.0, "month": 52.0 / 12.0,
+                   "quarter": 13.0, "year": 52.0}
+
+_PSI_GRAINS = frozenset(PSI_GRAIN_WEEKS)
+
+
+class PsiDomainError(ValueError):
+    """A PSI domain rule received an out-of-contract input."""
+
+
+def psi_normalize_grain(grain_name: Any) -> str:
+    """Validate an explicit (or inferred) PSI time grain."""
+    if grain_name not in _PSI_GRAINS:
+        raise PsiDomainError(
+            f"PSI 工具只支持 {'/'.join(sorted(_PSI_GRAINS))} 粒度；收到 {grain_name!r}")
+    return grain_name
+
+
+def psi_balance_periods(series: list[Mapping[str, Any]], *, grain: str | None = None,
+                        tolerance: float = 1e-6, abs_tolerance: float = 0.5
+                        ) -> dict[str, Any]:
+    """Reconcile 「期末库存 = 期初 + Sell In − Sell Out」 over ordered periods.
+
+    ``series`` must already be in calendar order with aligned numeric fields
+    (``period``/``sellIn``/``sellOut``/``inventory``).  The first period has no
+    declared opening stock → ``status: "unverifiable"`` with ``expected`` and
+    ``delta`` left ``null``; a period with no observed inventory is likewise
+    unverifiable.  The opening of period N is the last OBSERVED closing stock,
+    so a data gap degrades coverage honestly instead of compounding a guess.
+
+    XC-02 tolerance tiers (2026-10-24): a period is ``balanced`` when
+    ``abs(delta) <= max(tolerance * scale, abs_tolerance)`` with
+    ``scale = max(|期初|, |期末|, |流入|, |流出|)`` — the relative tier keeps the
+    legacy ``1e-6`` default, the absolute tier (default ``0.5``, half a unit of
+    integer stock) catches sub-unit rounding jitter that a pure relative
+    tolerance would misreport as ``mismatched``.  The applied pair is reported
+    as ``toleranceUsed: {relative, absolute}`` so a caller can audit the
+    verdict rule, not just the verdict.
+    """
+    records: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    opening: float | None = None
+    previous_position: int | None = None
+    previous_period: Any = None
+    for item in series:
+        period = item.get("period")
+        sell_in = item.get("sellIn")
+        sell_out = item.get("sellOut")
+        inventory = item.get("inventory")
+        record: dict[str, Any] = {"period": period, "sellIn": sell_in,
+                                   "sellOut": sell_out, "inventory": inventory}
+        if opening is None or inventory is None:
+            record.update({"opening": None, "expected": None, "observed": inventory,
+                            "delta": None, "deltaRate": None, "status": "unverifiable"})
+        else:
+            expected = opening + (sell_in or 0.0) - (sell_out or 0.0)
+            delta = inventory - expected
+            scale = max(abs(opening), abs(inventory),
+                        abs(sell_in or 0.0), abs(sell_out or 0.0))
+            epsilon = max(tolerance * scale, abs_tolerance)
+            record.update({
+                "opening": opening, "expected": expected, "observed": inventory,
+                "delta": delta,
+                "deltaRate": (round(delta / abs(expected), 6) if expected else None),
+                "status": "balanced" if abs(delta) <= epsilon else "mismatched",
+            })
+        records.append(record)
+        if inventory is not None:
+            opening = float(inventory)
+        if grain:
+            pos = position(period, grain)
+            if pos is not None and previous_position is not None and pos - previous_position > 1:
+                gaps.append({"after": previous_period, "resumedAt": period,
+                             "missingPeriods": pos - previous_position - 1})
+            if pos is not None:
+                previous_position, previous_period = pos, period
+    checked = [r for r in records if r["status"] != "unverifiable"]
+    summary: dict[str, Any] = {
+        "periods": len(records),
+        "unverifiable": len(records) - len(checked),
+        "balanced": sum(1 for r in checked if r["status"] == "balanced"),
+        "mismatched": sum(1 for r in checked if r["status"] == "mismatched"),
+    }
+    if checked:
+        summary["maxAbsDelta"] = max(abs(r["delta"]) for r in checked)
+    return {"records": records, "gaps": gaps, "summary": summary,
+            "toleranceUsed": {"relative": tolerance, "absolute": abs_tolerance}}
+
+
+def psi_weeks_of_supply(series: list[Mapping[str, Any]], *, grain: str,
+                        window: int = 3) -> dict[str, Any]:
+    """在库周数 per period plus latest-vs-window-average comparison.
+
+    weeks = inventory ÷ (period sell-out ÷ weeks-in-period).  A period with
+    zero/missing sell-out has NO weeks-of-supply value (``null``) — inventing
+    ∞ or 0 would both be a fabricated number.  ``window`` averages the most
+    recent N computable periods (bounded 1-12 by the tool schema).
+    """
+    weeks_in_period = PSI_GRAIN_WEEKS[psi_normalize_grain(grain)]
+    records: list[dict[str, Any]] = []
+    for item in series:
+        inventory = item.get("inventory")
+        sell_out = item.get("sellOut")
+        weekly = sell_out / weeks_in_period if isinstance(sell_out, (int, float)) else None
+        weeks = (inventory / weekly) if (weekly and weekly > 0
+                                         and isinstance(inventory, (int, float))) else None
+        records.append({
+            "period": item.get("period"), "inventory": inventory, "sellOut": sell_out,
+            "weeklySellOut": round(weekly, 6) if weekly is not None else None,
+            "weeksOfSupply": round(weeks, 6) if weeks is not None else None,
+        })
+    computable = [r["weeksOfSupply"] for r in records if r["weeksOfSupply"] is not None]
+    span = max(1, min(int(window or 3), 12))
+    window_values = computable[-span:]
+    average = sum(window_values) / len(window_values) if window_values else None
+    latest = records[-1] if records else None
+    comparison: dict[str, Any] = {"window": len(window_values), "average": average,
+                                   "latestWeeks": (latest or {}).get("weeksOfSupply")}
+    if average and comparison["latestWeeks"] is not None:
+        comparison["delta"] = round(comparison["latestWeeks"] - average, 6)
+        comparison["deltaRate"] = round((comparison["latestWeeks"] - average) / average, 6)
+    return {"periods": records, "latest": latest, "average": comparison,
+            "grainWeeks": weeks_in_period}
+
+
+def psi_stockout_classes(rows: list[Mapping[str, Any]], *, top_members: int = 20,
+                         granularity: str = "sum"
+                         ) -> dict[str, Any]:
+    """Classify member × period buckets into the two stockout directions.
+
+    ``rows`` are aligned ``{member, period, sellOut, inventory}`` buckets:
+
+    * ``soldNoStock`` — Sell Out > 0 且库存 ≤ 0/缺失（有销无货，断销风险）；
+    * ``stockedNoSales`` — 库存 > 0 且 Sell Out ≤ 0（有货无销，滞销风险）。
+
+    ``granularity`` (XC-02, 2026-10-24) selects the judgment unit:
+
+    * ``"sum"`` (default, legacy) — each row is an already SUM-aggregated
+      member × period bucket; positive and negative inventory net out inside
+      the group before the verdict.  Output shape is unchanged.
+    * ``"row"`` — each row is an independent raw-table observation; hits are
+      counted per row (no netting), so a group carrying ``+5/−5`` rows reports
+      hits where the SUM view sees a healthy zero.  Row mode adds a per-class
+      ``rowRatio`` over all scanned rows and bounded hit ``samples`` (≤50, with
+      a truncation flag) so the verdict stays auditable; member ``periods``
+      become distinct-period lists.
+
+    Output is bounded: per-member period lists are capped and the member list
+    is a ranked top-N (by hit count, then name) — never the full cross product.
+    """
+    if granularity not in ("sum", "row"):
+        raise PsiDomainError(f"stockout granularity must be 'sum' or 'row'; got {granularity!r}")
+    row_mode = granularity == "row"
+    max_periods = 12
+    max_samples = 50
+    classes = {
+        "soldNoStock": {"label": "有销无货（Sell Out>0 且库存≤0/缺失）"},
+        "stockedNoSales": {"label": "有货无销（库存>0 且 Sell Out≤0）"},
+    }
+    members: dict[str, dict[str, list]] = {key: {} for key in classes}
+    totals: dict[str, dict[str, int]] = {key: {} for key in classes}
+    counts = {key: 0 for key in classes}
+    samples: dict[str, list] = {key: [] for key in classes}
+    # Row mode only: full distinct-period count per member, so ``periodsTruncated``
+    # measures DISTINCT periods even though raw rows repeat a period.
+    distinct_periods: dict[str, dict[str, dict]] = {key: {} for key in classes}
+    for row in rows:
+        sell_out = row.get("sellOut")
+        inventory = row.get("inventory")
+        member = str(row.get("member"))
+        hits = []
+        if isinstance(sell_out, (int, float)) and sell_out > 0 and \
+                (inventory is None or (isinstance(inventory, (int, float)) and inventory <= 0)):
+            hits.append("soldNoStock")
+        if isinstance(inventory, (int, float)) and inventory > 0 and \
+                (sell_out is None or (isinstance(sell_out, (int, float)) and sell_out <= 0)):
+            hits.append("stockedNoSales")
+        for key in hits:
+            counts[key] += 1
+            totals[key][member] = totals[key].get(member, 0) + 1
+            bucket = members[key].setdefault(member, [])
+            if row_mode:
+                period = row.get("period")
+                seen = distinct_periods[key].setdefault(member, {})
+                if period not in seen:
+                    seen[period] = True
+                    if len(bucket) < max_periods:
+                        bucket.append(period)
+                if len(samples[key]) < max_samples:
+                    samples[key].append({"member": row.get("member"), "period": period,
+                                         "sellOut": sell_out, "inventory": inventory})
+            elif len(bucket) < max_periods:
+                bucket.append(row.get("period"))
+    out: dict[str, Any] = {"bucketCount": len(rows)}
+    if row_mode:
+        out["granularity"] = "row"
+        out["scannedRows"] = len(rows)
+    for key, meta in classes.items():
+        # Rank by the TRUE hit count (kept separately — the period list is
+        # capped in place and can never measure its own truncation).
+        ranked = sorted(totals[key].items(), key=lambda kv: (-kv[1], kv[0]))
+        cap = max(1, min(int(top_members or 20), 50))
+        entry: dict[str, Any] = {
+            "label": meta["label"], "bucketCount": counts[key],
+            "memberCount": len(totals[key]),
+            "members": [{"member": name, "bucketCount": count,
+                          "periods": members[key].get(name, []),
+                          "periodsTruncated": count > len(members[key].get(name, []))}
+                         for name, count in ranked[:cap]],
+        }
+        if row_mode:
+            entry["rowRatio"] = (round(counts[key] / len(rows), 6) if rows else None)
+            entry["samples"] = samples[key]
+            entry["samplesTruncated"] = counts[key] > len(samples[key])
+            for item in entry["members"]:
+                # In row mode ``count`` is raw hit ROWS; truncation of the
+                # distinct-period list is measured against distinct periods.
+                item["periodsTruncated"] = (
+                    len(distinct_periods[key].get(item["member"], {}))
+                    > len(item["periods"]))
+        out[key] = entry
+    return out
+
+

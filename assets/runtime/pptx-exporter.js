@@ -350,7 +350,99 @@
     return '<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="'+(nativeTableGraphic._id=(nativeTableGraphic._id||3000)+1)+'" name="Table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="'+x+'" y="'+y+'"/><a:ext cx="'+w+'" cy="'+h+'"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">'+tableXml(columns,rows,noteText)+'</a:graphicData></a:graphic></p:graphicFrame>';
   }
 
-  function chartXml(type,categories,series,palette){
+  // ---------------- XU-02 原生表完整化（矩阵/3D/嵌套平铺两级/三级表头）----------------
+  // TABLE_HEADERS 纯函数区已为 XLSX 产出同一份计划（chart.__tblExport：
+  // headerRows/headerRowsToXlsx 的 {skip} 占位 + merges[{r,c,rs,cs}] 锚点 + total +
+  // totalPos）——PPTX 按同一计划发 gridSpan/rowSpan 锚点 + hMerge/vMerge 占位格与
+  // 合计行底色，不再压成简化长表。列数 > PPTX_TABLE_MAX_COLS(14) 或无计划/无行 →
+  // 回退简化长表（tableData 旧路，明细/平表/ND 不受影响）。
+  // OOXML 合并语义：锚点格带 gridSpan/rowSpan；被覆盖格写 hMerge（与左格合并）/
+  // vMerge（与上格合并）/两者（矩形内域）。
+  var PPTX_TABLE_MAX_COLS=14;
+  function planUsableForPptx(plan){
+    return !!(plan&&Array.isArray(plan.headerRows)&&plan.headerRows.length
+      &&Array.isArray(plan.headerRows[0])&&plan.headerRows[0].length>0
+      &&plan.headerRows[0].length<=PPTX_TABLE_MAX_COLS);
+  }
+  function planCellText(c){return (c&&c.text!=null)?String(c.text):'';}
+  function planTableXml(plan,noteText){
+    var headerRows=plan.headerRows,ncols=headerRows[0].length;
+    var cover={},anchor={};
+    (plan.merges||[]).forEach(function(m){
+      if(!m)return;
+      var rs=m.rs||1,cs=m.cs||1;
+      if(rs>1||cs>1)anchor[m.r+':'+m.c]={rs:rs,cs:cs};
+      for(var i=0;i<rs;i++)for(var j=0;j<cs;j++){
+        if(i===0&&j===0)continue;
+        cover[(m.r+i)+':'+(m.c+j)]={h:j>0,v:i>0};
+      }
+    });
+    // 合计行底色 = accent 6% 混白（SNAPSHOT_CSS .ai-table-total 同一派生、同一
+    // --accent 实换通道 hexVar；解析失败落 default 首色混白，绝不破文件）。
+    var totalFill='<a:solidFill><a:srgbClr val="'+(mixWhiteHex(hexVar('--accent','5645D4'),0.94)||'F1F4FC')+'"/></a:solidFill>';
+    function tc(cell,kind,r,c){
+      var head=kind==='header';
+      var attrs='';
+      if(cell&&cell.skip){
+        var cv=cover[r+':'+c]||{};
+        if(cv.h)attrs+=' hMerge="1"';
+        if(cv.v)attrs+=' vMerge="1"';
+      }else{
+        var an=anchor[r+':'+c];
+        if(an){if(an.cs>1)attrs+=' gridSpan="'+an.cs+'"';if(an.rs>1)attrs+=' rowSpan="'+an.rs+'"';}
+      }
+      var fill=head?'<a:tcPr><a:solidFill><a:srgbClr val="F6F5F4"/></a:solidFill></a:tcPr>'
+        :(kind==='total'?'<a:tcPr>'+totalFill+'</a:tcPr>':'<a:tcPr/>');
+      var body=(cell&&cell.skip)
+        ?'<a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></a:txBody>'
+        :'<a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="zh-CN" sz="'+(head?'1400':'1200')+'" b="'+((head||kind==='total')?1:0)+'">'+(kind==='total'?'<a:solidFill><a:srgbClr val="1A1A1A"/></a:solidFill>':'')+'<a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/></a:rPr><a:t>'+escapeXml(planCellText(cell))+'</a:t></a:r></a:p></a:txBody>';
+      return '<a:tc'+attrs+'>'+body+fill+'</a:tc>';
+    }
+    function pad(row){var out=(row||[]).slice(0,ncols);while(out.length<ncols)out.push(undefined);return out;}
+    function rowXml(cells,kind,ri){
+      var h=kind==='header'?380000:350000;
+      return '<a:tr h="'+h+'">'+pad(cells).map(function(c,ci){return tc(c,kind,ri,ci);}).join('')+'</a:tr>';
+    }
+    var grid='<a:tblGrid>'+headerRows[0].map(function(){return '<a:gridCol w="'+Math.round(9144000/ncols)+'" />';}).join('')+'</a:tblGrid>';
+    var specs=headerRows.map(function(row){return {cells:row,kind:'header'};});
+    var totalRow=(plan.total&&plan.total.length)?pad(plan.total):null;
+    var bodyRows=(plan.rows||[]).slice(0,20).map(function(r){return {cells:r,kind:'body'};});
+    if(totalRow&&plan.totalPos==='top')specs.push({cells:totalRow,kind:'total'});
+    specs=specs.concat(bodyRows);
+    if(totalRow&&plan.totalPos!=='top')specs.push({cells:totalRow,kind:'total'});
+    var xml='<a:tbl><a:tblPr firstRow="1" bandRow="0"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr>'+grid;
+    specs.forEach(function(s,ri){xml+=rowXml(s.cells,s.kind,ri);});
+    // 截断徽章（O6 同一读者信任口径）：gridSpan 跨全列、9pt 灰字。
+    var note=noteText?'<a:tr h="230000"><a:tc gridSpan="'+ncols+'"><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="zh-CN" sz="900"><a:solidFill><a:srgbClr val="787671"/></a:solidFill><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/></a:rPr><a:t>'+escapeXml(noteText)+'</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc></a:tr>':'';
+    return xml+note+'</a:tbl>';
+  }
+  function nativeTablePlanGraphic(x,y,w,h,plan,noteText){
+    return '<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="'+(nativeTableGraphic._id=(nativeTableGraphic._id||3000)+1)+'" name="Table"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="'+x+'" y="'+y+'"/><a:ext cx="'+w+'" cy="'+h+'"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">'+planTableXml(plan,noteText)+'</a:graphicData></a:graphic></p:graphicFrame>';
+  }
+
+  // O9 轴/图例文字（XU-02，docs/presentation-ppt-alignment-review-2026-09-26.md O9）：
+  // catAx/valAx/legend 共用 9pt 微软雅黑 txPr（旧版无 txPr → 查看器默认字号/字体）。
+  function axisTxPr(){
+    return '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900"><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/></a:defRPr></a:pPr><a:endParaRPr lang="zh-CN"/></a:p></c:txPr>';
+  }
+  // 图例位置映射：ECharts option legend.top/bottom/left/right → c:legendPos
+  // （缺省 bottom——旧版恒 right）。数值坐标也认（shareLegendLayout 的 right:4 → r，
+  // 与旧行为一致）；字面量优先，命中即返回。
+  function legendPosOf(legend){
+    var lg=Array.isArray(legend)?legend[0]:legend;
+    if(!lg||typeof lg!=='object')return 'b';
+    if(lg.top==='top')return 't';
+    if(lg.bottom==='bottom')return 'b';
+    if(lg.left==='left')return 'l';
+    if(lg.right==='right')return 'r';
+    if(typeof lg.right==='number')return 'r';
+    if(typeof lg.left==='number')return 'l';
+    if(typeof lg.top==='number')return 't';
+    if(typeof lg.bottom==='number')return 'b';
+    return 'b';
+  }
+
+  function chartXml(type,categories,series,palette,legend){
     // 图表语义保真（B4）：stackedBar 必须写 grouping=stacked（旧版恒 clustered →
     // 堆叠柱被导成簇状柱）；area 用真正的 areaChart（旧分支的 extra 是死变量，
     // 面积图被导成普通折线）；lineChart 的合法 grouping 是 standard（不是 clustered）。
@@ -408,7 +500,10 @@
     // standard 的语义默认就是 0，不写（lineChart/areaChart 的 grouping 也是
     // standard，同样不加）。
     var overlapXml=(chartType==='barChart'&&grouping==='stacked')?'<c:overlap val="100"/>':'';
-    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart><c:plotArea><c:layout/>'+'<c:'+chartType+'>'+barDir+groupingXml+ser+overlapXml+ax+'</c:'+chartType+'>'+((type!=='pie'&&type!=='donut')?'<c:catAx><c:axId val="100"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="101"/></c:catAx><c:valAx><c:axId val="101"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:crossAx val="100"/></c:valAx>':'')+'</c:plotArea><c:legend><c:legendPos val="r"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/></c:chart></c:chartSpace>';
+    // O9：多系列柱图显式 gapWidth 150（观感对齐 deck 的 barGap；单系列省略 =
+    // PowerPoint 缺省同为 150，产物不变）。位次 = ser 之后、overlap 之前。
+    var gapXml=(chartType==='barChart'&&series.length>1)?'<c:gapWidth val="150"/>':'';
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><c:chart><c:plotArea><c:layout/>'+'<c:'+chartType+'>'+barDir+groupingXml+ser+gapXml+overlapXml+ax+'</c:'+chartType+'>'+((type!=='pie'&&type!=='donut')?'<c:catAx><c:axId val="100"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/>'+axisTxPr()+'<c:crossAx val="101"/></c:catAx><c:valAx><c:axId val="101"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:majorGridlines><c:spPr><a:ln w="9525"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></c:spPr></c:majorGridlines>'+axisTxPr()+'<c:crossAx val="100"/></c:valAx>':'')+'</c:plotArea><c:legend><c:legendPos val="'+legendPosOf(legend)+'"/><c:overlay val="0"/>'+axisTxPr()+'</c:legend><c:plotVisOnly val="1"/></c:chart></c:chartSpace>';
   }
 
   function chartData(item){
@@ -419,12 +514,14 @@
     // O3：主题色板（opt.color 由 chart-adapter setChartTheme 烘入）与系列级显式
     // itemStyle.color 随数据透传给 chartXml——原生图表颜色=报告主题色。
     var palette=Array.isArray(opt.color)?opt.color:null;
+    // O9：legend 配置随数据透传（legendPosOf 映射到 c:legendPos；缺省 bottom）。
+    var legend=opt.legend||null;
     if(vt==='table'||vt==='table.detail')return null;
     // chartXml 不支持的类型（funnel 等）返回 null：调用方回退为图片，
     // 绝不把未识别类型静默编造成柱状图（B4）。
     if(vt==='funnel')return null;
-    if(vt==='pie'||vt==='donut'){var s=(opt.series&&opt.series[0])||{};var data=(s.data||[]).filter(function(d){return d!=null;}).map(function(d){return (d&&typeof d==='object')?{name:d.name,value:(d.value==null?null:d.value),pc:(d.itemStyle&&d.itemStyle.color)||null}:{name:String(d),value:0,pc:null};});return {type:vt,categories:[],series:[{name:s.name||'值',data:data.map(function(d){return d.value;}),pointColors:data.map(function(d){return d.pc;})}],labels:data.map(function(d){return d.name;}),palette:palette};}
-    if(vt==='scatter'){var ss=(opt.series||[]).map(function(s){return {name:s.name||'',color:s.itemStyle&&s.itemStyle.color,data:(s.data||[]).map(function(d){return Array.isArray(d)?d[1]:0;})};});return {type:'scatter',categories:[],series:ss,palette:palette};}
+    if(vt==='pie'||vt==='donut'){var s=(opt.series&&opt.series[0])||{};var data=(s.data||[]).filter(function(d){return d!=null;}).map(function(d){return (d&&typeof d==='object')?{name:d.name,value:(d.value==null?null:d.value),pc:(d.itemStyle&&d.itemStyle.color)||null}:{name:String(d),value:0,pc:null};});return {type:vt,categories:[],series:[{name:s.name||'值',data:data.map(function(d){return d.value;}),pointColors:data.map(function(d){return d.pc;})}],labels:data.map(function(d){return d.name;}),palette:palette,legend:legend};}
+    if(vt==='scatter'){var ss=(opt.series||[]).map(function(s){return {name:s.name||'',color:s.itemStyle&&s.itemStyle.color,data:(s.data||[]).map(function(d){return Array.isArray(d)?d[1]:0;})};});return {type:'scatter',categories:[],series:ss,palette:palette,legend:legend};}
     var cats=(opt.xAxis&&opt.xAxis[0]&&opt.xAxis[0].data)||(opt.xAxis&&opt.xAxis.data)||[];
     // ``typeof null === 'object'`` — a derived measure legitimately produces
     // null/empty points (no previous period), and a missing point must stay
@@ -439,7 +536,7 @@
     // 其余未识别类型（composite 等）返回 null → 回退图片，不硬编造成 bar。
     var type=vt==='stackedBar'?'stackedBar':vt==='area'?'area':vt==='line'?'line':vt==='bar'?'bar':null;
     if(!type)return null;
-    return {type:type,categories:cats.map(String),series:series,palette:palette};
+    return {type:type,categories:cats.map(String),series:series,palette:palette,legend:legend};
   }
 
   // 段落文本 → 纯文本（B6）：fmt:true 段落是序列化 HTML（<b>/<mark>），与
@@ -689,6 +786,107 @@
       // O10：bodyPr inset 对齐 Web 卡 padding（tx-card 12px 16px），文本起点与 deck 同位。
       '<p:txBody><a:bodyPr wrap="square" rtlCol="0" anchor="t" lIns="152400" tIns="114300" rIns="152400"><a:normAutofit/></a:bodyPr><a:lstStyle/>'+bodyXml+'</p:txBody></p:sp>';
   }
+  // ---------------- O5 KPI 原生形状（XU-02，docs/presentation-ppt-alignment-review-2026-09-26.md O5）----------------
+  // KPI 是汇报页视觉锚点，旧纯文本降级（label+value 两行）丢单位/对比副行/涨跌
+  // 微条/目标进度条。原生版输出**可编辑形状组**：roundRect 卡底 + 三段文本
+  // （label / value / unit+对比副行）+ has-cmp/cmp-up/cmp-down 三态 4px 涨跌微条
+  // + 目标进度条。颜色与 snapshotCss()/cardFillInk 同源：documentElement 的
+  // --accent/--ink 实换（native XML 装不下 CSS 占位符，hexVar 就是同一解析通道、
+  // 同一缺省回退）；涨跌状态色镜像 SNAPSHOT_CSS 的 #1a7f4b/#c62f2f。字体全 run
+  // 微软雅黑（O4 契约）。段落拿不到就整段省略；全部为空返回 null → 调用方回退
+  // 纯文本/快照，绝不空卡。
+  var KPI_SHAPE_COLORS={label:'787671',ink:'1A1A1A',muted:'787671',track:'EDE9E4',cardLine:'E5E3DF',up:'1A7F4B',down:'C62F2F'};
+  function kpiShapeId(){kpiNativeShape._id=(kpiNativeShape._id||0)+1;textBody._id=kpiNativeShape._id;return kpiNativeShape._id;}
+  // .value 拆值/单位：unit 是 value 内的 <span class="unit">，遍历子节点拆开
+  //（防 String.replace 撞显示文本）；kpi-err-val 等其余元素按文本并入值。
+  function kpiValueParts(vEl){
+    var txt='',unit='';
+    if(vEl){for(var n=vEl.firstChild;n;n=n.nextSibling){
+      if(n.nodeType===3)txt+=n.nodeValue||'';
+      else if(n.nodeType===1&&/(^|\s)unit(\s|$)/.test(String(n.className||'')))unit+=n.textContent||'';
+      else txt+=(n.textContent||'');
+    }}
+    return {text:txt.replace(/\s+/g,' ').trim(),unit:unit.replace(/\s+/g,' ').trim()};
+  }
+  function kpiFontPx(el,d){
+    var px=0;try{px=parseFloat(global.getComputedStyle(el).fontSize)||0;}catch(_e){}
+    return px>0?px:d;
+  }
+  // 单 run 段落文本框（固定框位，不 autofit——KPI 段是按卡片盒比例摆放的）。
+  function kpiSegText(x,y,w,h,runs,anchor){
+    return '<p:sp><p:nvSpPr><p:cNvPr id="'+kpiShapeId()+'" name="KPI Text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="'+x+'" y="'+y+'"/><a:ext cx="'+w+'" cy="'+h+'"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr wrap="square" rtlCol="0"'+(anchor?' anchor="'+anchor+'"':'')+'/><a:lstStyle/><a:p>'+runs.join('')+'</a:p></p:txBody></p:sp>';
+  }
+  function kpiRunXml(text,size,color,bold){
+    if(!text)return '';
+    return '<a:r><a:rPr lang="zh-CN" sz="'+size+'"'+(bold?' b="1"':'')+'><a:solidFill><a:srgbClr val="'+color+'"/></a:solidFill><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/></a:rPr><a:t>'+escapeXml(text)+'</a:t></a:r>';
+  }
+  function kpiRectShape(name,x,y,w,h,fillXml){
+    return '<p:sp><p:nvSpPr><p:cNvPr id="'+kpiShapeId()+'" name="'+name+'"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="'+x+'" y="'+y+'"/><a:ext cx="'+Math.max(0,Math.round(w))+'" cy="'+Math.max(0,Math.round(h))+'"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'+fillXml+'<a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>';
+  }
+  function kpiNativeShape(item,x,y,w,h){
+    try{
+      var node=item&&item.node;if(!node||!node.querySelector)return null;
+      var kc=node.querySelector('.kpi-card');if(!kc)return null;
+      // px→EMU 比例：卡 EMU 宽 / 卡实测 px 宽（deck 宽档缩放/放映缩放一次折算）。
+      var rect=node.getBoundingClientRect();
+      var scale=(rect&&rect.width>0)?(w/(rect.width*EMU_PER_PX)):1;
+      if(!(scale>0)||!isFinite(scale))scale=1;
+      function px2emu(px){return Math.round(px*scale*EMU_PER_PX);}
+      var lblEl=kc.querySelector('.label');
+      var valEl=kc.querySelector('.value');
+      var parts=kpiValueParts(valEl);
+      var cmpEl=kc.querySelector('.kpi-compare');
+      var baseEl=kc.querySelector('.kpi-compare-base');
+      var progEl=kc.querySelector('.kpi-progress');
+      var trkFill=progEl&&progEl.querySelector('.kpi-track i');
+      var pctEl=progEl?progEl.querySelector('em'):null;
+      var label=lblEl?String(lblEl.textContent||'').replace(/\s+/g,' ').trim():'';
+      if(!label&&!parts.text&&!parts.unit&&!cmpEl)return null;
+      var ink=hexVar('--ink',KPI_SHAPE_COLORS.ink);
+      var accent=hexVar('--accent','5645D4');
+      var padX=Math.round(w*0.06),innerW=w-2*padX;
+      var out='<p:sp><p:nvSpPr><p:cNvPr id="'+kpiShapeId()+'" name="KPI Card"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'+
+        '<p:spPr><a:xfrm><a:off x="'+x+'" y="'+y+'"/><a:ext cx="'+w+'" cy="'+h+'"/></a:xfrm>'+
+        '<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val '+roundRectAdj(w,h)+'"/></a:avLst></a:prstGeom>'+
+        '<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:ln w="9525"><a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.cardLine+'"/></a:solidFill></a:ln></p:spPr>'+
+        '<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>';
+      // ① label（小灰字）
+      if(label)out+=kpiSegText(x+padX,y+Math.round(h*0.09),innerW,Math.round(h*0.17),
+        [kpiRunXml(label,Math.round(kpiFontPx(lblEl,12)*scale*75),KPI_SHAPE_COLORS.label,false)],'t');
+      // ② value（大字加粗）
+      if(parts.text)out+=kpiSegText(x+padX,y+Math.round(h*0.26),innerW,Math.round(h*0.38),
+        [kpiRunXml(parts.text,Math.round(kpiFontPx(valEl,25)*scale*75),ink,true)],'ctr');
+      // ③ 涨跌微条：has-cmp（有 kpi-compare）出轨道 + cmp-up 右半 1A7F4B /
+      //    cmp-down 左半 C62F2F / 中点刻痕（中性灰 40% 透明）。
+      if(cmpEl){
+        var barY=y+Math.round(h*0.66),barH=Math.max(38100,px2emu(4)),barW=Math.round(w*0.15);
+        var midX=x+padX+Math.round(barW/2);
+        out+=kpiRectShape('KPI Bar Track',x+padX,barY,barW,barH,'<a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.track+'"/></a:solidFill>');
+        var up=cmpEl.classList&&cmpEl.classList.contains('is-up');
+        var down=cmpEl.classList&&cmpEl.classList.contains('is-down');
+        if(up)out+=kpiRectShape('KPI Bar Up',midX,barY,barW-Math.round(barW/2),barH,'<a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.up+'"/></a:solidFill>');
+        else if(down)out+=kpiRectShape('KPI Bar Down',x+padX,barY,Math.round(barW/2),barH,'<a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.down+'"/></a:solidFill>');
+        out+=kpiRectShape('KPI Bar Tick',midX-px2emu(0.5),barY,Math.max(9525,px2emu(1)),barH,'<a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.muted+'"><a:alpha val="40000"/></a:srgbClr></a:solidFill>');
+      }
+      // ④ unit+对比副行（unit 灰 / compare 三态色 / 基期值灰 / 达成率灰，同一段多 run）。
+      var footRuns=[];
+      var cmpTxt=cmpEl?String(cmpEl.textContent||'').replace(/\s+/g,' ').trim():'';
+      if(parts.unit)footRuns.push(kpiRunXml(parts.unit,Math.round(kpiFontPx(valEl,11)*scale*75),KPI_SHAPE_COLORS.muted,false));
+      if(cmpTxt)footRuns.push(kpiRunXml((footRuns.length?'  ':'')+cmpTxt,Math.round(kpiFontPx(cmpEl,11)*scale*75),cmpEl.classList&&cmpEl.classList.contains('is-up')?KPI_SHAPE_COLORS.up:(cmpEl.classList&&cmpEl.classList.contains('is-down')?KPI_SHAPE_COLORS.down:KPI_SHAPE_COLORS.muted),false));
+      if(baseEl){var bt=String(baseEl.textContent||'').replace(/\s+/g,' ').trim();if(bt)footRuns.push(kpiRunXml('  '+bt,Math.round(kpiFontPx(baseEl,11)*scale*75),KPI_SHAPE_COLORS.muted,false));}
+      if(pctEl){var pt=String(pctEl.textContent||'').replace(/\s+/g,' ').trim();if(pt)footRuns.push(kpiRunXml('  达成 '+pt,Math.round(kpiFontPx(pctEl,10)*scale*75),KPI_SHAPE_COLORS.muted,false));}
+      if(footRuns.length)out+=kpiSegText(x+padX,y+Math.round(h*0.73),innerW,Math.round(h*0.22),footRuns,'t');
+      // ⑤ 目标进度条（track + accent 填充，宽按 width% ）。
+      if(trkFill&&progEl){
+        var pct=Math.max(0,Math.min(100,parseFloat(trkFill.style&&trkFill.style.width)||0));
+        var tgY=y+Math.round(h*0.73),tgH=Math.max(38100,px2emu(4)),tgW=Math.round(innerW*0.32),tgX=x+padX+innerW-Math.round(innerW*0.34);
+        out+=kpiRectShape('KPI Target Track',tgX,tgY,tgW,tgH,'<a:solidFill><a:srgbClr val="'+KPI_SHAPE_COLORS.track+'"/></a:solidFill>');
+        if(pct>0)out+=kpiRectShape('KPI Target Fill',tgX,tgY,Math.max(9525,Math.round(tgW*pct/100)),tgH,'<a:solidFill><a:srgbClr val="'+accent+'"/></a:solidFill>');
+      }
+      return out;
+    }catch(e){return null;}
+  }
+
   // server 报告（schema-only，editor.data 无行）的表格卡：先经 adapter 拉数再生成
   // 原生表格（B6）——明细走 fetchDetailRows、聚合走 aggregate；拉不到返回 null，
   // 由调用方回退图片（绝不导出只剩表头的空表）。
@@ -742,8 +940,10 @@
       // O7 页标题（2026-09-26）：TITLE_H 已对齐 deck 实际标题带（1280 基准
       // titleRows=2×48=96px），标题框占满整带 anchor=ctr 垂直居中——旧版 56px
       // 框顶在 y≈10px，比 deck 标题基线偏高。
+      // O8 页级隐藏标题带（XU-02）：noTitle 页不出标题文本框（卡片坐标已经 deck
+      // 按 titleRows=0 实测缩放，本就落在全页画布上）。
       var titleH=Math.round(pres.constants.TITLE_H*EMU_PER_PX);
-      spTree+=textBody(slide.title||'报告页',100000,0,11172000,titleH,null,true,null,null,'ctr');
+      if(!slide.noTitle)spTree+=textBody(slide.title||'报告页',100000,0,11172000,titleH,null,true,null,null,'ctr');
       for(var ci=0;ci<slide.cards.length;ci++){
         var item=slide.cards[ci],node=item.node,rect=node.getBoundingClientRect(),slideRect=slide.root.getBoundingClientRect();
         // 宽档位（pageWidth 1440/1600/1920）下 deck 页比 1280×720px 画布宽：
@@ -755,29 +955,50 @@
           var data=chartData(item);
           if(data&&(data.type==='bar'||data.type==='stackedBar'||data.type==='line'||data.type==='area'||data.type==='pie'||data.type==='donut')){
             var idx=chartParts.length+1;chartParts.push({id:item.id,data:data});rels.push({Id:'rId'+(rels.length+1),Type:'http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart',Target:'../charts/chart'+idx+'.xml'});spTree+=chartGraphic(x,y,w,h,'rId'+(rels.length));
-          }else if(item.kind==='table'){
-            var td=await tableData(item);
-            if(td&&td.columns.length){
-              // O6 截断徽章：总数真源 = deck 克隆 DOM 的分页器/命中徽标
-              // （presentation.js deckTableTotalRowsOf，与 deck 降级徽章同一取法）；
-              // 拿不到总数且确实截满 20 行时只报「显示前 20 行」——绝不把服务端
-              // 拉数上限（pageSize 30）当总行数编「共 N 行」。
-              var shown=Math.min(20,td.rows.length);
-              var totalN=null;
-              try{totalN=(pres._internals&&pres._internals.deckTableTotalRowsOf)?pres._internals.deckTableTotalRowsOf(item.node,item.id):null;}catch(_tne){}
-              var noteTxt='';
-              if(totalN&&totalN>shown)noteTxt='共 '+totalN+' 行（显示前 '+shown+' 行）';
-              else if(!totalN&&td.rows.length>shown)noteTxt='显示前 '+shown+' 行';
-              spTree+=nativeTableGraphic(x,y,w,h,td.columns,td.rows.slice(0,20),noteTxt);
+          }
+          else if(item.kind==='table'){
+            // XU-02 原生表完整化：矩阵/3D/嵌套平铺有 __tblExport 计划（TABLE_HEADERS
+            // 与 XLSX 同一份）且列数 ≤14、至少一行数据或合计 → 完整两级/三级表头原生表；
+            // 其余（明细/平表/ND/超宽/无计划）走简化长表旧路（O6 截断徽章不变）。
+            var tplan=chartFor(item.id)&&chartFor(item.id).__tblExport||null;
+            var tRows=null;
+            try{tRows=(tplan&&tplan.rows)||[];}catch(_re){tRows=[];}
+            var totalN=null;
+            try{totalN=(pres._internals&&pres._internals.deckTableTotalRowsOf)?pres._internals.deckTableTotalRowsOf(item.node,item.id):null;}catch(_tne){}
+            if(planUsableForPptx(tplan)&&(((tRows&&tRows.length)>0)||(tplan.total&&tplan.total.length))){
+              var tShown=Math.min(20,(tRows||[]).length);
+              var tNote='';
+              if(totalN&&totalN>tShown)tNote='共 '+totalN+' 行（显示前 '+tShown+' 行）';
+              else if(!totalN&&(tRows||[]).length>tShown)tNote='显示前 '+tShown+' 行';
+              spTree+=nativeTablePlanGraphic(x,y,w,h,tplan,tNote);
             }
             else{
-              // 拉不到数（server 报告无行且聚合失败）：回退图片，不导出空表头表。
-              try{console.warn('[pptx] 原生版：表格卡拉数失败，已回退为图片：'+item.id);}catch(_e){}
-              var tfimg=await imageFor(item);if(tfimg){var tfid=images.length+1;images.push(tfimg);rels.push({Id:'rId'+(rels.length+1),Type:'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',Target:'../media/image'+tfid+'.png'});spTree+=picture(x,y,w,h,'rId'+(rels.length));}
+              var td=await tableData(item);
+              if(td&&td.columns.length){
+                // O6 截断徽章：总数真源 = deck 克隆 DOM 的分页器/命中徽标
+                // （presentation.js deckTableTotalRowsOf，与 deck 降级徽章同一取法）；
+                // 拿不到总数且确实截满 20 行时只报「显示前 20 行」——绝不把服务端
+                // 拉数上限（pageSize 30）当总行数编「共 N 行」。
+                var shown=Math.min(20,td.rows.length);
+                var noteTxt='';
+                if(totalN&&totalN>shown)noteTxt='共 '+totalN+' 行（显示前 '+shown+' 行）';
+                else if(!totalN&&td.rows.length>shown)noteTxt='显示前 '+shown+' 行';
+                spTree+=nativeTableGraphic(x,y,w,h,td.columns,td.rows.slice(0,20),noteTxt);
+              }
+              else{
+                // 拉不到数（server 报告无行且聚合失败）：回退图片，不导出空表头表。
+                try{console.warn('[pptx] 原生版：表格卡拉数失败，已回退为图片：'+item.id);}catch(_e){}
+                var tfimg=await imageFor(item);if(tfimg){var tfid=images.length+1;images.push(tfimg);rels.push({Id:'rId'+(rels.length+1),Type:'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',Target:'../media/image'+tfid+'.png'});spTree+=picture(x,y,w,h,'rId'+(rels.length));}
+              }
             }
           }
           else{
             if(item.kind==='chart'){try{console.warn('[pptx] 原生版不支持的图表类型（'+(((chartFor(item.id)||{}).viewType)||'?')+'），已回退为图片：'+item.id);}catch(_e2){}}
+            // O5：KPI 卡原生形状（roundRect + 三段文本 + 涨跌微条 + 目标进度条）；
+            // live DOM 缺 .kpi-card/全空时返回 null，回落纯文本/快照旧路。
+            var kshp=(item.kind==='kpi')?kpiNativeShape(item,x,y,w,h):null;
+            if(kshp){spTree+=kshp;}
+            else{
             // C2：文本卡走段落保真（level 阶梯/加粗/列表/对齐/底色）；其余（筛选卡徽章、
             // KPI、无段落卡）走纯文本行。
             var rich=richCardShape(item,x,y,w,h);
@@ -786,6 +1007,7 @@
               var ps=cardTextParagraphs(item);
               if(ps.length){spTree+=textBody(ps.join('\n'),x,y,w,h,null,false);}
               else{var img=await imageFor(item);if(img){var iid=images.length+1;images.push(img);rels.push({Id:'rId'+(rels.length+1),Type:'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',Target:'../media/image'+iid+'.png'});spTree+=picture(x,y,w,h,'rId'+(rels.length));}}
+            }
             }
           }
         }else{
@@ -820,7 +1042,7 @@
     files.push({name:'ppt/slideMasters/_rels/slideMaster1.xml.rels',data:masterRels()});
     files.push({name:'ppt/slideLayouts/slideLayout1.xml',data:layoutXml()});
     files.push({name:'ppt/theme/theme1.xml',data:themeXml()});
-    chartParts.forEach(function(cp,i){var cats=(cp.data.type==='pie'||cp.data.type==='donut')?cp.data.labels:cp.data.categories;files.push({name:'ppt/charts/chart'+(i+1)+'.xml',data:chartXml(cp.data.type,cats||[],cp.data.series,cp.data.palette)});});
+    chartParts.forEach(function(cp,i){var cats=(cp.data.type==='pie'||cp.data.type==='donut')?cp.data.labels:cp.data.categories;files.push({name:'ppt/charts/chart'+(i+1)+'.xml',data:chartXml(cp.data.type,cats||[],cp.data.series,cp.data.palette,cp.data.legend)});});
     images.forEach(function(img,i){files.push({name:'ppt/media/image'+(i+1)+'.png',data:dataUrlToBytes(img)});});
     return files;
     }finally{
@@ -833,5 +1055,5 @@
   async function exportImage(){var files=await buildFiles('image');download(await buildZip(files),(manifest().reportId||'report')+'-图片版.pptx');}
   async function exportNative(){var files=await buildFiles('native');download(await buildZip(files),(manifest().reportId||'report')+'-原生版.pptx');}
 
-  global.AIReportPPTX={exportImage:exportImage,exportNative:exportNative,_buildFiles:buildFiles,_buildZip:buildZip,_chartXml:chartXml,_chartData:chartData,_plainText:plainText,_snapshotCss:SNAPSHOT_CSS,_richCardShape:richCardShape,_htmlToRuns:htmlToRuns,_normColor:normColor,_paraSize:PARA_SIZE};
+  global.AIReportPPTX={exportImage:exportImage,exportNative:exportNative,_buildFiles:buildFiles,_buildZip:buildZip,_chartXml:chartXml,_chartData:chartData,_plainText:plainText,_snapshotCss:SNAPSHOT_CSS,_richCardShape:richCardShape,_htmlToRuns:htmlToRuns,_normColor:normColor,_paraSize:PARA_SIZE,_legendPosOf:legendPosOf,_kpiNativeShape:kpiNativeShape,_planUsableForPptx:planUsableForPptx,_planTableXml:planTableXml,_pptxTableMaxCols:PPTX_TABLE_MAX_COLS};
 })(typeof window!=='undefined'?window:this);

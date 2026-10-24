@@ -48,11 +48,31 @@ def _with_dataset(source: str, table: dict, dataset_id: str, label: str) -> str:
     if not match:
         raise ReportContractError("Draft HTML is missing #ai-report-manifest")
     manifest = json.loads(match.group(1))
-    dataset = {"id": dataset_id, "label": label, "columns": table["columns"], "rows": table["rows"]}
     # Carry semantic types forward: the draft may have declared dataset-level
     # measureTypes (inferred or authored); the packager rebuilds the dataset
     # entry from the canonical table, so preserve them for BI inheritance.
     existing = next((d for d in manifest.get("datasets", []) if d.get("id") == dataset_id), None)
+    # privacy.sensitiveColumns（NS-01 主修，2026-10-24）：编译产物里的数据集已经
+    # 物理剥离敏感列，而本函数从 canonical 原表重建 rows/columns——不投影就会把
+    # 敏感值重新内联进终稿（E0 泄漏复活）。按草稿 manifest 的声明把敏感列投影掉；
+    # 声明本体经下方 keep-list 随 dataset 前进（server Agent 链继续消费）。
+    if existing and isinstance(existing, dict):
+        declared = existing.get("privacy") or {}
+        sensitive = [c for c in (declared.get("sensitiveColumns") or [])
+                     if isinstance(c, str)] if isinstance(declared, dict) else []
+        if sensitive:
+            cols = table.get("columns") or []
+
+            def _name(c):
+                return c if isinstance(c, str) else (c or {}).get("name")
+
+            keep_idx = [i for i, c in enumerate(cols) if _name(c) not in sensitive]
+            if len(keep_idx) < len(cols):
+                rows = [row for row in (table.get("rows") or [])
+                        if isinstance(row, list) and len(row) >= len(cols)]
+                table = {"columns": [cols[i] for i in keep_idx],
+                         "rows": [[row[i] for i in keep_idx] for row in rows]}
+    dataset = {"id": dataset_id, "label": label, "columns": table["columns"], "rows": table["rows"]}
     if existing and isinstance(existing, dict):
         # columnAliases = 字段显示名（editor-only 状态）；fieldNotes = 字段说明
         # （「这列是什么 / 怎么算的」，同样只在编辑器里编辑/展示）；derived = 计算列 /
@@ -64,7 +84,7 @@ def _with_dataset(source: str, table: dict, dataset_id: str, label: str) -> str:
         # 丢了「替换数据→增量合并」向导就失去预填主键，用户得重选 7 列复合键。
         for keep in ("measureTypes", "fieldRoles", "hierarchy", "columnTypes", "columnRoles",
                      "columnAliases", "fieldNotes", "derived", "hierarchyOrder", "columnStats",
-                     "hiddenCols", "valueAliases", "dimGroups", "primaryKey"):
+                     "hiddenCols", "valueAliases", "dimGroups", "primaryKey", "privacy"):
             if isinstance(existing.get(keep), (dict, list)) and keep not in dataset:
                 dataset[keep] = existing[keep]
         # v3 table role (primary/lookup) + the single default primary: the

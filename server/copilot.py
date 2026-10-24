@@ -33,7 +33,7 @@ from typing import Any, Callable, Mapping
 
 from .aggregator import aggregate, parse_request
 from .agent_context import safe_derived_measures
-from .loopback import _is_loopback_host, urlopen_loopback
+from ._platform import _is_loopback_host, urlopen_loopback
 
 
 class CopilotError(ValueError):
